@@ -1,0 +1,141 @@
+[ui]
+listen = "0.0.0.0:9090"
+secret = "admin"
+serve_path = "/jffs/anywhere/ui"
+
+[common]
+cache_dir = "/jffs/anywhere"
+
+# [dns]
+# dns server ip used for direct out, default setted
+# direct = "223.5.5.5"
+# dns server ip used for others out, default setted
+# remote = "8.8.8.8"
+
+[[inbounds]]
+type = "tun" #only support in linux with ip & iptables, run as root.
+tag = "tun-in"
+# name = "tun0"
+# addr = "10.0.0.1/24"
+# mtu = 1500
+# Auto set iptables for dns
+# auto_hijack = true
+# WAN ifaces are monitored dynamically and only get `from <wan_ip>` rules.
+# No effect when auto_hijack=false, linux desktop no need this
+monitor_wan_ifaces = ["ppp0"]
+# LAN ifaces get startup `from <lan_ip>` / `to <lan_subnet>` bypass rules and DNAT mangle marks. 
+# No effect when auto_hijack=false, linux desktop no need this
+bypass_lan_ifaces = ["br0", "eth0"]
+# All local query direct out, default true for router, linux desktop must set false
+# local_direct = true
+
+[[inbounds]]
+type = "socks5"
+listen = "127.0.0.1:1080"
+
+[[outbounds]]
+type = "anytls"
+tag = "A1"
+server = "001.top:423"
+password = "15e023sae"
+sni = "fafeg.qq.com"
+fp = true
+
+[[outbounds]]
+type = "anytls"
+tag = "A2"
+server = "001.top:438"
+password = "15e023sae"
+sni = "fafeg.qq.com"
+fp = true
+
+[[outbounds]]
+type = "anytls"
+tag = "A3"
+server = "001.top:439"
+password = "15e023sae"
+sni = "fafeg.qq.com"
+fp = true
+
+[[outbounds]]
+type = "vless"
+tag = "CF"
+server = "11.11.1.11:2083"
+password = "xxxxx"
+sni = "h.p.dev"
+fp = true
+transport_type = "ws"
+transport_path = "/"
+transport_headers.Host = "h.p.dev"
+
+[[outbounds]]
+type = "ssh"
+tag = "mac"
+cmd = "ssh -o ExitOnForwardFailure=yes -K 10 -i /jffs/anywhere/id_dropbear -N -L {PORT}:127.0.0.1:6518 192.168.1.30"
+server = "127.0.0.1:{PORT}"
+
+[[outbounds]]
+type = "urltest"
+tag = "auto"
+outbounds = ["A1", "A2", "A3", "CF"]
+# outbounds = ["mac"]
+#interval = 600
+#url = "www.google.com"
+
+[[rules]]
+# protocol examples: "both:1232" "tcp:123,1132" "udp:123,2222"
+protocol = "stun"  # both:3748,3749
+outbound = "none" # drop the traffic
+
+[[rules]]
+# some software use other ports such as Xunlei, recommend set direct mode in ui when download.
+protocol = "bittorrent" # tcp:6881,6889 && udp:6881,
+outbound = "direct"
+
+[[rules]]
+domain_suffix = [
+    "lmstudio.ai",
+    "rust-lang.org",
+    "microsoft.com",
+    "npmjs.org",
+    "apple.com",
+    "cdn-apple.com",
+    "synologyupdate.com",
+    "synology.com",
+    "hf-mirror.com",
+    "xethub.hf.co",
+    "pythonhosted.org",
+    "pytorch.org",
+    "pypi.org",
+    "wireshark.org"
+]
+outbound = "direct"
+
+[[rules]]
+geo_url = "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/private.srs"
+# update_interval = "3d"
+# on router is none, linux desktop set direct
+outbound = "none"
+
+[[rules]]
+geo_url = "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/cn.srs"
+outbound = "direct"
+
+[[rules]]
+geo_url = "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/category-games@cn.srs"
+outbound = "direct"
+
+[[rules]]
+geo_url = "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geoip/cn.srs"
+outbound = "direct"
+
+[[rules]]
+geo_url = "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/category-ads-all.srs"
+outbound = "none"
+
+[[rules]]
+geo_url = "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/geolocation-!cn.srs"
+outbound = "auto"
+
+[[rules]]
+outbound = "auto"

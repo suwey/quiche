@@ -1,0 +1,93 @@
+[ui]
+listen = "0.0.0.0:9090"
+secret = "admin"
+serve_path = "/Users/sss/MetaCudeXD/compress-dist"
+
+[common]
+cache_dir = "/tmp"
+
+[[inbounds]]
+type = "tun" #only support in linux with ip & iptables.
+tag = "tun-in"
+
+[[inbounds]]
+type = "socks5"
+listen = "127.0.0.1:1080"
+
+[[outbounds]]
+type = "anytls"
+tag = "A1"
+server = "001.top:423"
+password = "15e023sae"
+sni = "fafeg.qq.com"
+fp = true
+
+[[outbounds]]
+type = "anytls"
+tag = "A2"
+server = "001.top:438"
+password = "15e023sae"
+sni = "fafeg.qq.com"
+fp = true
+
+[[outbounds]]
+type = "anytls"
+tag = "A3"
+server = "001.top:439"
+password = "15e023sae"
+sni = "fafeg.qq.com"
+fp = true
+
+[[outbounds]]
+type = "urltest"
+tag = "auto"
+outbounds = ["A1", "A2", "A3"]
+#interval = 180
+#url = "www.google.com"
+
+[[rules]]
+domain_suffix = [
+    "pcbcn.org",
+    "dynv6.com",
+    "lmstudio.ai",
+    "microsoft.com",
+    "npmjs.org",
+    "apple.com",
+    "cdn-apple.com",
+    "synologyupdate.com",
+    "hf-mirror.com",
+    "xethub.hf.co",
+    "pythonhosted.org",
+    "pytorch.org",
+    "pypi.org",
+    "wireshark.org"
+]
+outbound = "direct"
+
+[[rules]]
+geo_url = "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/private.srs"
+# update_interval = "3d"
+outbound = "direct"
+
+[[rules]]
+geo_url = "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/cn.srs"
+outbound = "direct"
+
+[[rules]]
+geo_url = "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/category-games@cn.srs"
+outbound = "direct"
+
+[[rules]]
+geo_url = "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geoip/cn.srs"
+outbound = "direct"
+
+[[rules]]
+geo_url = "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/category-ads-all.srs"
+outbound = "none"
+
+[[rules]]
+geo_url = "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/geolocation-!cn.srs"
+outbound = "auto"
+
+[[rules]]
+outbound = "auto"

@@ -1,0 +1,16 @@
+[[users]]
+name = "alice"
+password = "secret"
+
+[[inbounds]]
+type = "quic"
+listen = "0.0.0.0:4433"
+cert = "cert.pem"
+key = "key.pem"
+
+[[outbounds]]
+type = "direct"
+tag = "direct-out"
+
+[[rules]]
+outbound = "direct-out"

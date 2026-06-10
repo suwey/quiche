@@ -1,0 +1,52 @@
+[package]
+name = "anywhere"
+version = "1.0.0"
+edition = { workspace = true }
+
+[dependencies]
+tokio = { workspace = true, features = ["full"] }
+tokio-util = { workspace = true }
+tokio-quiche = { path = "../tokio-quiche" }
+quiche = { path = "../quiche" }
+bytes = { workspace = true }
+futures-util = { workspace = true }
+env_logger = { workspace = true }
+log = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+toml = "1.1.2"
+async-trait = "0.1"
+base64 = "0.22"
+boring = { workspace = true, features = ["pq-experimental"] }
+boring-sys = "4.3.0"
+foreign-types-shared = "0.3"
+axum = { version = "0.7", features = ["ws"] }
+chrono = { version = "0.4", features = ["serde"] }
+tower-http = { version = "0.5", features = ["cors", "set-header", "fs"] }
+uuid = { version = "1", features = ["v4"] }
+serde_json = { workspace = true }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+sha1 = "0.10"
+lru = "0.18"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+mach2 = "0.6"
+libc = "0.2"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+rtnetlink = "0.21"
+libc = "0.2"
+socket2 = { version = "0.5", features = ["all"] }
+
+[target.'cfg(target_env = "musl")'.dependencies]
+mimalloc = { version = "0.1.52", default-features = false }
+
+[dependencies.etherparse]
+version = "0.19"
+
+[dependencies.tun]
+version = "0.8"
+features = ["async"]
+[dependencies.clap]
+version = "4"
+features = ["derive"]

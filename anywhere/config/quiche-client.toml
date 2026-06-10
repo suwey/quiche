@@ -1,0 +1,13 @@
+[[inbounds]]
+type = "socks5"
+listen = "127.0.0.1:1080"
+
+[[outbounds]]
+type = "quic"
+tag = "proxy"
+server = "127.0.0.1:4433"
+password = "secret"
+fp = true
+
+[[rules]]
+outbound = "proxy"

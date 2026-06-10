@@ -1,0 +1,313 @@
+use serde::Deserialize;
+use std::collections::HashMap;
+
+use serde::Deserializer;
+
+use crate::dns::DnsConfig;
+
+#[derive(Debug, Deserialize)]
+pub struct Config {
+    #[serde(default)]
+    pub common: CommonConfig,
+
+    #[serde(default)]
+    pub users: Vec<UserConfig>,
+
+    #[serde(default)]
+    pub inbounds: Vec<InboundConfig>,
+
+    #[serde(default)]
+    pub outbounds: Vec<OutboundConfig>,
+
+    #[serde(default)]
+    pub rules: Vec<RuleConfig>,
+
+    #[serde(default)]
+    pub ui: UiConfig,
+
+    #[serde(default)]
+    pub dns: DnsConfig,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UserConfig {
+    pub name: String,
+    pub password: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct InboundConfig {
+    #[serde(rename = "type")]
+    pub type_: String,
+
+    pub tag: Option<String>,
+
+    pub listen: Option<String>,
+
+    pub cert: Option<String>,
+
+    pub key: Option<String>,
+
+    // --- TUN inbound fields ---
+    /// TUN device address in CIDR form (default: "10.0.0.1/24").
+    #[serde(default)]
+    pub addr: Option<String>,
+
+    /// TUN device MTU.
+    #[serde(default)]
+    pub mtu: Option<u16>,
+
+    /// TUN interface name (default: "tun0").
+    #[serde(default)]
+    pub name: Option<String>,
+
+    /// Automatically manage routing and iptables (bypass fwmark, policy
+    /// routing, DNS REDIRECT, etc.). True for router environments. Set to
+    /// false on desktop Linux (only the TUN device is created, no ip
+    /// rule/iptables changes).
+    #[serde(default = "default_auto_hijack")]
+    pub auto_hijack: bool,
+    /// When true, DNS queries from local processes (127.0.0.1) are always
+    /// resolved via the direct upstream, bypassing rule matching. Useful on
+    /// routers where the device's own DNS should not depend on proxy state.
+    #[serde(default = "default_local_direct")]
+    pub local_direct: bool,
+
+    /// WAN interfaces whose local address should bypass TUN routing via
+    /// `from <wan_ip> lookup main`. These are monitored dynamically so PPPoE
+    /// redial/address changes are handled. Only effective when auto_hijack is
+    /// true.
+    #[serde(default)]
+    pub monitor_wan_ifaces: Option<Vec<String>>,
+
+    /// LAN interfaces whose local address/subnet should bypass TUN routing
+    /// via `from <lan_ip>` and `to <lan_subnet>` rules plus DNAT mangle marks.
+    /// Installed at startup. Only effective when auto_hijack is true.
+    #[serde(default)]
+    pub bypass_lan_ifaces: Option<Vec<String>>,
+}
+
+fn default_auto_hijack() -> bool {
+    true
+}
+fn default_local_direct() -> bool {
+    true
+}
+
+#[derive(Debug, Deserialize)]
+pub struct OutboundConfig {
+    #[serde(rename = "type")]
+    pub type_: String,
+
+    pub tag: Option<String>,
+
+    pub server: Option<String>,
+
+    pub password: Option<String>,
+
+    /// Command to spawn for tunnel creation (used by SSH outbound).
+    /// e.g. `ssh -D 1080 -N user@host`.
+    pub cmd: Option<String>,
+
+    /// Proxy protocol for SSH outbound: "socks5" or "http" (default).
+    pub proxy_type: Option<String>,
+
+    /// TLS SNI for anytls / vless outbound (default: server hostname).
+    pub sni: Option<String>,
+
+    #[serde(default)]
+    pub fp: bool,
+
+    pub ech_config: Option<String>,
+
+    // --- shared sub-config fields (urltest / vless) ---
+    /// List of outbound tags this urltest node manages.
+    #[serde(default)]
+    pub outbounds: Option<Vec<String>>,
+
+    /// Interval between latency tests in seconds (default: 600).
+    pub interval: Option<u64>,
+
+    /// URL to test latency against (e.g. "www.google.com").
+    pub url: Option<String>,
+
+    /// Enable mux.cool multiplexing over a single WS connection.
+    /// When enabled, replaces connection pool with a single shared session.
+    #[serde(default)]
+    pub mux: bool,
+
+    // --- vless flat fields ---
+    /// Disable TLS certificate verification.
+    #[serde(default)]
+    pub insecure: bool,
+
+    /// Transport type — only "ws" supported.
+    pub transport_type: Option<String>,
+
+    /// WebSocket path (default: "/").
+    pub transport_path: Option<String>,
+
+    /// WebSocket custom headers, e.g. `transport_headers.Host = "..."`.
+    #[serde(default)]
+    pub transport_headers: Option<HashMap<String, String>>,
+}
+
+fn default_rule_type() -> String {
+    "default".to_string()
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct RuleConfig {
+    #[serde(rename = "type", default = "default_rule_type")]
+    pub type_: String,
+
+    #[serde(default, deserialize_with = "deserialize_string_or_vec")]
+    pub domain: Option<Vec<String>>,
+
+    #[serde(default, deserialize_with = "deserialize_string_or_vec")]
+    pub domain_suffix: Option<Vec<String>>,
+
+    #[serde(default, deserialize_with = "deserialize_string_or_vec")]
+    pub domain_keyword: Option<Vec<String>>,
+
+    #[serde(default, deserialize_with = "deserialize_string_or_vec")]
+    pub ip_cidr: Option<Vec<String>>,
+
+    pub port: Option<u16>,
+
+    /// Inclusive range "min-max", e.g. "8000-9000".
+    pub port_range: Option<String>,
+
+    /// "tcp" or "udp".
+    pub network: Option<String>,
+
+    /// Protocol shorthand — expands to known port/network combinations.
+    /// Supported: "bittorrent" (tcp:6881-6889, udp:6881).
+    pub protocol: Option<String>,
+
+    pub outbound: String,
+
+    /// URL to a sing-box rule-set (.srs) file containing geo rules (site + ip).
+    pub geo_url: Option<String>,
+
+    /// Update interval string like "3d", "24h", "30m".
+    pub update_interval: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct CommonConfig {
+    pub cache_dir: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct UiConfig {
+    pub listen: Option<String>,
+    pub secret: Option<String>,
+    pub serve_path: Option<String>,
+}
+
+impl Config {
+    pub fn load(path: &str) -> Result<Self, Box<dyn std::error::Error>> {
+        let base_dir = std::path::Path::new(path)
+            .parent()
+            .unwrap_or(std::path::Path::new("."));
+
+        let mut config: Config = toml::from_str(&std::fs::read_to_string(path)?)?;
+
+        // Resolve relative cert/key paths relative to the config file directory.
+        for inbound in &mut config.inbounds {
+            resolve_path(&base_dir, &mut inbound.cert);
+            resolve_path(&base_dir, &mut inbound.key);
+        }
+
+        // Resolve relative serve_path relative to the config file directory.
+        resolve_path(&base_dir, &mut config.ui.serve_path);
+
+        Ok(config)
+    }
+
+    pub fn outbounds_by_type(&self, type_name: &str) -> Vec<&OutboundConfig> {
+        self.outbounds
+            .iter()
+            .filter(|o| o.type_ == type_name)
+            .collect()
+    }
+
+    pub fn inbounds_by_type(&self, type_name: &str) -> Vec<&InboundConfig> {
+        self.inbounds
+            .iter()
+            .filter(|i| i.type_ == type_name)
+            .collect()
+    }
+
+    pub fn passwords(&self) -> Vec<String> {
+        self.users.iter().map(|u| u.password.clone()).collect()
+    }
+}
+
+impl InboundConfig {
+    pub fn tag_or_default(&self, idx: usize) -> String {
+        self.tag.clone().unwrap_or_else(|| format!("inbound-{idx}"))
+    }
+}
+
+impl OutboundConfig {
+    pub fn tag_or_default(&self, idx: usize) -> String {
+        self.tag
+            .clone()
+            .unwrap_or_else(|| format!("outbound-{idx}"))
+    }
+}
+
+/// Deserialize an `Option<Vec<String>>` from either a single string or an array
+/// of strings.
+fn deserialize_string_or_vec<'de, D>(
+    d: D,
+) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    use serde::de;
+
+    struct Visitor;
+
+    impl<'de> de::Visitor<'de> for Visitor {
+        type Value = Option<Vec<String>>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a string or array of strings")
+        }
+
+        fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
+            Ok(Some(vec![v.to_string()]))
+        }
+
+        fn visit_seq<A: de::SeqAccess<'de>>(
+            self, mut seq: A,
+        ) -> Result<Self::Value, A::Error> {
+            let mut v = Vec::new();
+            while let Some(elem) = seq.next_element::<String>()? {
+                v.push(elem);
+            }
+            if v.is_empty() { Ok(None) } else { Ok(Some(v)) }
+        }
+
+        fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+    }
+
+    d.deserialize_any(Visitor)
+}
+fn resolve_path(base: &std::path::Path, path: &mut Option<String>) {
+    if let Some(p) = path {
+        let p_path = std::path::Path::new(p.as_str());
+        if p_path.is_relative() {
+            *p = base.join(p_path).to_string_lossy().to_string();
+        }
+    }
+}

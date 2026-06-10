@@ -1,0 +1,10 @@
+**/target
+**/*.rs.bk
+**/Cargo.lock
+**/*.*qlog
+.claude
+.cursor
+.codegraph
+docs
+.env
+reasonix.toml
