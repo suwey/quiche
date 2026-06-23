@@ -14,6 +14,13 @@ use crate::outbound::OutboundClient;
 use crate::relay::PacketRelay;
 use crate::relay::StreamRelay;
 
+/// Check whether a `dial_udp` error is an expected protocol limitation
+/// (e.g. "UDP not supported") rather than a real connectivity failure.
+/// Expected errors should NOT mark the child as failed.
+fn is_udp_expected(msg: &str) -> bool {
+    msg == crate::outbound::common::ERR_UDP_NOT_SUPPORTED
+}
+
 /// A single latency test result for one child outbound.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct LatencyRecord {
@@ -181,11 +188,16 @@ impl OutboundClient for UrlTestOutboundClient {
                 return Ok(relay);
             },
             Err(e) => {
-                log::warn!(
-                    "urltest: child '{}' dial_udp failed: {e}",
-                    self.state.children[idx]
-                );
-                self.state.failed[idx].store(true, Ordering::Relaxed);
+                let msg = e.to_string();
+                if !is_udp_expected(&msg) {
+                    log::warn!(
+                        "urltest: child '{}' dial_udp failed: {msg}",
+                        self.state.children[idx]
+                    );
+                }
+                // Do NOT mark child as failed — UDP support is optional.
+                // A dial_udp failure does not indicate the child is broken
+                // for TCP traffic.
             },
         }
 
@@ -210,11 +222,18 @@ impl OutboundClient for UrlTestOutboundClient {
                     return Ok(relay);
                 },
                 Err(e) => {
-                    log::warn!(
-                        "urltest: udp fallback child '{}' dial failed: {e}",
-                        self.state.children[i]
-                    );
-                    self.state.failed[i].store(true, Ordering::Relaxed);
+                    let msg = e.to_string();
+                    if is_udp_expected(&msg) {
+                        log::warn!(
+                            "urltest: udp fallback child '{}': {msg}",
+                            self.state.children[i]
+                        );
+                    } else {
+                        log::error!(
+                            "urltest: udp fallback child '{}' failed: {msg}",
+                            self.state.children[i]
+                        );
+                    }
                 },
             }
         }

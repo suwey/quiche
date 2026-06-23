@@ -1,0 +1,17 @@
+{
+	"name": "hermes-agent-dispatcher",
+	"private": true,
+	"type": "module",
+	"scripts": {
+		"typecheck": "tsc --noEmit",
+		"dev": "wrangler dev",
+		"scrub": "node scripts/scrub-literals.mjs",
+		"scrub:dry-run": "node scripts/scrub-literals.mjs --dry-run",
+		"deploy": "node scripts/deploy.mjs"
+	},
+	"devDependencies": {
+		"@cloudflare/workers-types": "^4.20250606.0",
+		"typescript": "^5.6.3",
+		"wrangler": "^4.0.0"
+	}
+}

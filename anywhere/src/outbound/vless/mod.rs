@@ -37,7 +37,7 @@ pub(crate) enum WsStream {
 }
 
 impl WsStream {
-    fn set_read_timeout(&self, dur: Duration) -> io::Result<()> {
+    pub(crate) fn set_read_timeout(&self, dur: Duration) -> io::Result<()> {
         match self {
             WsStream::Plain(ws) => ws.get_ref().set_read_timeout(Some(dur)),
             WsStream::Tls(ws) =>
@@ -47,21 +47,21 @@ impl WsStream {
 }
 
 impl WsStream {
-    fn send(&mut self, data: &[u8]) -> io::Result<()> {
+    pub(crate) fn send(&mut self, data: &[u8]) -> io::Result<()> {
         match self {
             WsStream::Plain(c) => c.send(data),
             WsStream::Tls(c) => c.send(data),
         }
     }
 
-    fn recv(&mut self) -> io::Result<Vec<u8>> {
+    pub(crate) fn recv(&mut self) -> io::Result<Vec<u8>> {
         match self {
             WsStream::Plain(c) => c.recv(),
             WsStream::Tls(c) => c.recv(),
         }
     }
 
-    fn close(&mut self) -> io::Result<()> {
+    pub(crate) fn close(&mut self) -> io::Result<()> {
         match self {
             WsStream::Plain(c) => c.close(),
             WsStream::Tls(c) => c.close(),
@@ -73,7 +73,9 @@ impl WsStream {
 // UUID parsing
 // ---------------------------------------------------------------------------
 
-fn parse_uuid(s: &str) -> Result<[u8; 16], Box<dyn std::error::Error>> {
+pub(crate) fn parse_uuid(
+    s: &str,
+) -> Result<[u8; 16], Box<dyn std::error::Error>> {
     let s = s.replace('-', "");
     if s.len() != 32 {
         return Err("vless: invalid UUID".into());

@@ -24,10 +24,14 @@ use std::net::SocketAddr;
 use std::os::unix::process::CommandExt;
 use std::process::Stdio;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicI32;
+use std::sync::atomic::AtomicI64;
+use std::sync::atomic::AtomicU16;
 use std::sync::atomic::AtomicU32;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
+use std::time::SystemTime;
 
 use async_trait::async_trait;
 use tokio::io::AsyncBufReadExt;
@@ -37,6 +41,7 @@ use tokio::net::TcpStream;
 use tokio::net::UdpSocket;
 use tokio::process::Child;
 use tokio::sync::Mutex;
+use tokio::sync::RwLock;
 use tokio::time::Instant;
 use tokio::time::sleep;
 
@@ -47,11 +52,15 @@ use crate::relay::PacketRelay;
 use crate::relay::StreamRelay;
 use crate::relay::TcpRelay;
 
-const SSH_STARTUP_RETRIES: usize = 25; // 5 s total at 200 ms intervals.
 const SSH_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const SSH_UDP_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_FAILURES_BEFORE_RESPAWN: u32 = 1;
 const PROXY_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// Skip the TCP health probe if the tunnel was verified healthy within this
+/// window. Avoids redundant connect(2) on every dial in high-traffic scenarios.
+const HEALTH_CHECK_CACHE_TTL_MS: i64 = 2_000;
+/// Maximum single-interval delay when polling for tunnel readiness.
+const SSH_POLL_MAX_DELAY_MS: u64 = 1_600;
 
 // ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
@@ -75,15 +84,29 @@ impl ProxyType {
 }
 // ---------------------------------------------------------------------------
 pub struct SshOutboundClient {
-    cmd: String,
+    /// Pre-parsed command binary name (parts[0]).
+    cmd_binary: String,
+    /// Pre-parsed command arguments (parts[1..]).
+    cmd_args: Vec<String>,
+    /// Whether the original cmd contains `{PORT}`.
+    has_port_placeholder: bool,
+    /// Outbound tag from config — used for concise log identification.
+    log_tag: String,
     local_ip: std::net::IpAddr,
-    allocated_port: std::sync::atomic::AtomicU16,
-    process: Arc<Mutex<Option<Child>>>,
+    allocated_port: AtomicU16,
+    process: Arc<RwLock<Option<Child>>>,
     child_pid: AtomicI32,
     proxy_type: ProxyType,
     /// Consecutive CONNECT failures. Reset on success; when reaching the
     /// threshold the tunnel is respawned even if the port is still open.
-    failure_count: std::sync::atomic::AtomicU32,
+    failure_count: AtomicU32,
+    /// Unix-epoch milliseconds of the last successful health probe. Zero means
+    /// "never probed". Checked by [`ensure_running`] to skip redundant probes.
+    last_healthy_ms: AtomicI64,
+    /// Optimistic flag; set when the health cache has ever been populated.
+    /// Prevents a spurious probe on the very first call while the tunnel is
+    /// still starting up.
+    health_cache_seeded: AtomicBool,
 }
 
 impl SshOutboundClient {
@@ -113,16 +136,32 @@ impl SshOutboundClient {
                     format!("ssh outbound: bad server '{server}': {e}")
                 })?;
 
+        // Pre-parse the command once so spawn_tunnel() avoids repeated
+        // split_whitespace + allocation on every call.
+        let cmd_parts: Vec<String> =
+            cmd.split_whitespace().map(|s| s.to_string()).collect();
+        let has_port_placeholder = cmd.contains("{PORT}");
+        let (cmd_binary, cmd_args) = if cmd_parts.is_empty() {
+            return Err("ssh outbound: empty cmd field".into());
+        } else {
+            (cmd_parts[0].clone(), cmd_parts[1..].to_vec())
+        };
+
+        let log_tag = cfg.tag.as_deref().unwrap_or("ssh").to_string();
+
         let client = Self {
-            cmd: cmd.to_string(),
+            cmd_binary,
+            cmd_args,
+            has_port_placeholder,
+            log_tag,
             local_ip: bootstrap_addr.ip(),
-            allocated_port: std::sync::atomic::AtomicU16::new(
-                bootstrap_addr.port(),
-            ),
-            process: Arc::new(Mutex::new(None)),
+            allocated_port: AtomicU16::new(bootstrap_addr.port()),
+            process: Arc::new(RwLock::new(None)),
             child_pid: AtomicI32::new(0),
             proxy_type: pt,
             failure_count: AtomicU32::new(0),
+            last_healthy_ms: AtomicI64::new(0),
+            health_cache_seeded: AtomicBool::new(false),
         };
 
         // Spawn the tunnel. Fail registration if the binary cannot be
@@ -130,15 +169,15 @@ impl SshOutboundClient {
         client
             .spawn_tunnel()
             .await
-            .map_err(|e| format!("ssh outbound '{}': {e}", client.cmd))?;
+            .map_err(|e| format!("ssh outbound '{}': {e}", client.log_tag))?;
 
         // Wait a bit for the port to become ready. If it times out, log a
-        // If it times out, log at error level because the outbound won't
-        // work until the port becomes reachable.
-        if let Err(e) = client.poll_port(SSH_STARTUP_RETRIES).await {
+        // warning at error level because the outbound won't work until the
+        // port becomes reachable.
+        if let Err(e) = client.poll_port(Duration::from_secs(5)).await {
             log::error!(
                 "ssh outbound '{}' tunnel not yet ready: {e}",
-                client.cmd,
+                client.log_tag,
             );
         }
 
@@ -150,8 +189,16 @@ impl SshOutboundClient {
     /// If the config cmd contains `{PORT}`, it is replaced with a free
     /// ephemeral port so the tunnel never collides with TIME_WAIT from a
     /// previous instance.
+    /// Spawn the tunnel command and store the child handle.
+    ///
+    /// If the config cmd contains `{PORT}`, it is replaced with a free
+    /// ephemeral port so the tunnel never collides with TIME_WAIT from a
+    /// previous instance.  Retries up to 3 times with a fresh port when the
+    /// child exits immediately — this mitigates the race between dropping the
+    /// temp listener and the SSH process binding the port (another process
+    /// could steal it in the window).
     async fn spawn_tunnel(&self) -> io::Result<()> {
-        let mut guard = self.process.lock().await;
+        let mut guard = self.process.write().await;
 
         // If we already have a running process, nothing to do.
         if let Some(child) = &mut *guard {
@@ -165,100 +212,150 @@ impl SshOutboundClient {
             }
         }
 
-        // Allocate a free port for {PORT} substitution.
-        let port = if self.cmd.contains("{PORT}") {
-            let listener =
-                std::net::TcpListener::bind("127.0.0.1:0").map_err(|e| {
+        let max_attempts = if self.has_port_placeholder { 3 } else { 1 };
+
+        for attempt in 0..max_attempts {
+            // Allocate a free port for {PORT} substitution.
+            let port = if self.has_port_placeholder {
+                let listener = std::net::TcpListener::bind("127.0.0.1:0")
+                    .map_err(|e| {
+                        io::Error::new(
+                            io::ErrorKind::Other,
+                            format!("bind temp port: {e}"),
+                        )
+                    })?;
+                let p = listener
+                    .local_addr()
+                    .map_err(|e| {
+                        io::Error::new(
+                            io::ErrorKind::Other,
+                            format!("get temp port: {e}"),
+                        )
+                    })?
+                    .port();
+                drop(listener);
+                self.allocated_port.store(p, Ordering::Relaxed);
+                p
+            } else {
+                self.allocated_port.load(Ordering::Relaxed)
+            };
+
+            // Build command from pre-parsed parts.
+            let mut std_cmd = std::process::Command::new(&self.cmd_binary);
+            if self.has_port_placeholder {
+                let port_str = port.to_string();
+                let args: Vec<String> = self
+                    .cmd_args
+                    .iter()
+                    .map(|a| a.replace("{PORT}", &port_str))
+                    .collect();
+                std_cmd.args(&args);
+            } else {
+                std_cmd.args(&self.cmd_args);
+            }
+            std_cmd
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped());
+            #[cfg(unix)]
+            {
+                std_cmd.process_group(0);
+            }
+            let mut child = tokio::process::Command::from(std_cmd)
+                .kill_on_drop(true)
+                .spawn()
+                .map_err(|e| {
+                    let cmd_tag = self.display_command(port);
                     io::Error::new(
                         io::ErrorKind::Other,
-                        format!("bind temp port: {e}"),
+                        format!("failed to spawn '{}': {e}", cmd_tag),
                     )
                 })?;
-            let p = listener
-                .local_addr()
-                .map_err(|e| {
-                    io::Error::new(
-                        io::ErrorKind::Other,
-                        format!("get temp port: {e}"),
-                    )
-                })?
-                .port();
-            drop(listener);
-            self.allocated_port.store(p, Ordering::Relaxed);
-            p
-        } else {
-            self.allocated_port.load(Ordering::Relaxed)
-        };
-        let resolved_cmd = self.cmd.replace("{PORT}", &port.to_string());
 
-        // Parse into binary + args.
-        let parts: Vec<&str> = resolved_cmd.split_whitespace().collect();
-        if parts.is_empty() {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "empty cmd"));
-        }
-
-        let mut std_cmd = std::process::Command::new(parts[0]);
-        std_cmd
-            .args(&parts[1..])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped());
-        #[cfg(unix)]
-        {
-            std_cmd.process_group(0);
-        }
-        let mut child = tokio::process::Command::from(std_cmd)
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|e| {
-                io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("failed to spawn '{}': {e}", resolved_cmd),
-                )
-            })?;
-
-        // Log stderr so the user can see SSH connection errors.
-        if let Some(stderr) = child.stderr.take() {
-            let cmd_tag = resolved_cmd.clone();
-            tokio::spawn(async move {
-                let reader = tokio::io::BufReader::new(stderr);
-                let mut lines = reader.lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    log::error!("ssh [stderr] {}: {line}", cmd_tag);
+            // If the child exited immediately (port conflict), retry.
+            if attempt + 1 < max_attempts {
+                if let Ok(Some(status)) = child.try_wait() {
+                    log::warn!(
+                        "ssh outbound '{}': tunnel exited early (status={}), \
+                         retrying with fresh port",
+                        self.log_tag,
+                        status,
+                    );
+                    continue;
                 }
-            });
+            }
+
+            // Log stderr so the user can see SSH connection errors.
+            // Use the outbound tag as a concise identifier instead of the full
+            // command string (avoids cloning a potentially large/sensitive cmd).
+            if let Some(stderr) = child.stderr.take() {
+                let tag = self.log_tag.clone();
+                tokio::spawn(async move {
+                    let reader = tokio::io::BufReader::new(stderr);
+                    let mut lines = reader.lines();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        log::error!("ssh/{tag} [stderr]: {line}");
+                    }
+                });
+            }
+
+            let pid = child.id().unwrap_or(0) as i32;
+            *guard = Some(child);
+            self.child_pid.store(pid, Ordering::Relaxed);
+            return Ok(());
         }
 
-        let pid = child.id().unwrap_or(0) as i32;
-        *guard = Some(child);
-        self.child_pid.store(pid, Ordering::Relaxed);
-        Ok(())
+        unreachable!()
     }
 
-    /// Poll `server_addr` up to `n` times (200 ms interval) until reachable.
-    async fn poll_port(&self, n: usize) -> io::Result<()> {
-        for _ in 0..n {
-            if TcpStream::connect(self.current_addr()).await.is_ok() {
+    /// Poll tunnel endpoint until reachable, using exponential backoff.
+    /// Returns `Ok(())` once the port accepts a TCP connection; returns
+    /// `Err(TimedOut)` if `max_total` elapses without success.
+    async fn poll_port(&self, max_total: Duration) -> io::Result<()> {
+        let start = Instant::now();
+        let mut delay_ms = 100u64;
+        loop {
+            if crate::outbound::common::connect_tcp_bypass(self.current_addr())
+                .await
+                .is_ok()
+            {
                 return Ok(());
             }
-            sleep(Duration::from_millis(200)).await;
+            let elapsed = start.elapsed();
+            if elapsed >= max_total {
+                break;
+            }
+            // Don't overshoot max_total.
+            let actual = delay_ms
+                .min((max_total.saturating_sub(elapsed)).as_millis() as u64);
+            sleep(Duration::from_millis(actual)).await;
+            delay_ms = (delay_ms * 2).min(SSH_POLL_MAX_DELAY_MS);
         }
         Err(io::Error::new(
             io::ErrorKind::TimedOut,
             format!(
                 "tunnel at {} not reachable after {} ms",
                 self.current_addr(),
-                n * 200,
+                start.elapsed().as_millis(),
             ),
         ))
     }
 
     /// Ensure the tunnel process is running and the local endpoint is
-    /// reachable. Spawns / respawns as needed, with a brief timeout so the
-    /// caller can fall back quickly instead of blocking for the full poll
-    /// Ensure the tunnel process is running and the local endpoint is
     /// reachable. Spawns / respawns as needed.
     async fn ensure_running(&self) -> io::Result<()> {
+        // Cache hit: tunnel was healthy within TTL, skip the TCP probe.
+        if self.health_cache_seeded.load(Ordering::Relaxed) {
+            let now = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as i64;
+            let last = self.last_healthy_ms.load(Ordering::Relaxed);
+            if now - last < HEALTH_CHECK_CACHE_TTL_MS {
+                return Ok(());
+            }
+        }
+
         // Quick check (~500 ms) — most of the time the tunnel is already up.
         if tokio::time::timeout(
             Duration::from_millis(500),
@@ -269,6 +366,7 @@ impl SshOutboundClient {
         .and_then(|r| r.ok())
         .is_some()
         {
+            self.seed_health_cache();
             return Ok(());
         }
 
@@ -277,7 +375,11 @@ impl SshOutboundClient {
 
         // After a respawn, do the full poll cycle (up to 5 s) so the tunnel
         // has time to reconnect across a potentially slow link.
-        self.poll_port(SSH_STARTUP_RETRIES).await
+        let r = self.poll_port(Duration::from_secs(5)).await;
+        if r.is_ok() {
+            self.seed_health_cache();
+        }
+        r
     }
 
     // -----------------------------------------------------------------------
@@ -337,7 +439,7 @@ impl SshOutboundClient {
         req.extend_from_slice(&dest.port.to_be_bytes());
         stream.write_all(&req).await?;
 
-        let mut header = [0u8; 4];
+        let mut header = [0u8; 4]; // VER + REP + RSV + ATYP
         stream.read_exact(&mut header).await?;
         if header[1] != 0x00 {
             return Err(io::Error::new(
@@ -345,23 +447,8 @@ impl SshOutboundClient {
                 format!("SOCKS5 CONNECT failed: rep={}", header[1]),
             ));
         }
-        let atyp = header[3];
-        let addr_len: usize = match atyp {
-            0x01 => 4,
-            0x04 => 16,
-            0x03 => {
-                let mut len = [0u8; 1];
-                stream.read_exact(&mut len).await?;
-                len[0] as usize
-            },
-            _ =>
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("SOCKS5 CONNECT unknown ATYP: {atyp}"),
-                )),
-        };
-        let mut tail = vec![0u8; addr_len + 2];
-        stream.read_exact(&mut tail).await?;
+        // Read (and discard) the server-bound address.
+        socks5_read_addr(stream).await?;
         Ok(())
     }
 
@@ -384,9 +471,11 @@ impl SshOutboundClient {
             format!("CONNECT {host_port} HTTP/1.1\r\nHost: {host_port}\r\n\r\n");
         stream.write_all(req.as_bytes()).await?;
 
-        // Read response headers until \r\n\r\n.
+        // Read response headers until \r\n\r\n (O(n) scan tracking
+        // checked_up_to so we don't re-scan bytes already examined).
         let mut buf = [0u8; 4096];
         let mut pos = 0;
+        let mut checked_up_to: usize = 0;
         loop {
             if pos >= buf.len() {
                 return Err(io::Error::new(
@@ -402,9 +491,20 @@ impl SshOutboundClient {
                 ));
             }
             pos += n;
-            if buf[..pos].windows(4).any(|w| w == b"\r\n\r\n") {
+            // Only scan the newly-received region (with 3-byte overlap for the
+            // \r\n\r\n boundary).
+            let scan_start = checked_up_to.saturating_sub(3);
+            let mut found = false;
+            for i in scan_start..pos.saturating_sub(3) {
+                if buf[i..i + 4] == [b'\r', b'\n', b'\r', b'\n'] {
+                    found = true;
+                    break;
+                }
+            }
+            if found {
                 break;
             }
+            checked_up_to = pos;
         }
 
         let status_line = std::str::from_utf8(&buf[..pos])
@@ -419,6 +519,101 @@ impl SshOutboundClient {
         }
         Ok(())
     }
+
+    /// Reconstruct the command string for log / error display, substituting
+    /// `{PORT}` if needed.
+    fn display_command(&self, port: u16) -> String {
+        if self.has_port_placeholder {
+            self.log_tag.replace("{PORT}", &port.to_string())
+        } else {
+            self.log_tag.clone()
+        }
+    }
+
+    /// Mark the tunnel as healthy in the cache so subsequent
+    /// [`ensure_running`] calls skip the TCP probe.
+    fn seed_health_cache(&self) {
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
+        self.last_healthy_ms.store(now, Ordering::Relaxed);
+        self.health_cache_seeded.store(true, Ordering::Relaxed);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SOCKS5 address helpers (shared by CONNECT, UDP ASSOCIATE, and UDP relay)
+// ---------------------------------------------------------------------------
+
+/// Append a SOCKS5 ATYP + address to `buf` (without port).
+fn socks5_encode_addr(buf: &mut Vec<u8>, dest: &Destination) {
+    match &dest.address {
+        Address::Ipv4(o) => {
+            buf.push(0x01);
+            buf.extend_from_slice(o);
+        },
+        Address::Ipv6(o) => {
+            buf.push(0x04);
+            buf.extend_from_slice(o);
+        },
+        Address::Domain(d) => {
+            buf.push(0x03);
+            buf.push(d.len() as u8);
+            buf.extend_from_slice(d.as_bytes());
+        },
+    }
+}
+
+/// Read a SOCKS5 ATYP + address + port from `stream` and return a `SocketAddr`.
+async fn socks5_read_addr(stream: &mut TcpStream) -> io::Result<SocketAddr> {
+    let mut atyp = [0u8; 1];
+    stream.read_exact(&mut atyp).await?;
+    match atyp[0] {
+        0x01 => {
+            let mut octets = [0u8; 4];
+            stream.read_exact(&mut octets).await?;
+            let mut port = [0u8; 2];
+            stream.read_exact(&mut port).await?;
+            Ok(SocketAddr::new(
+                std::net::IpAddr::V4(std::net::Ipv4Addr::from(octets)),
+                u16::from_be_bytes(port),
+            ))
+        },
+        0x04 => {
+            let mut octets = [0u8; 16];
+            stream.read_exact(&mut octets).await?;
+            let mut port = [0u8; 2];
+            stream.read_exact(&mut port).await?;
+            Ok(SocketAddr::new(
+                std::net::IpAddr::V6(std::net::Ipv6Addr::from(octets)),
+                u16::from_be_bytes(port),
+            ))
+        },
+        0x03 => {
+            let mut len = [0u8; 1];
+            stream.read_exact(&mut len).await?;
+            let mut name = vec![0u8; len[0] as usize];
+            stream.read_exact(&mut name).await?;
+            let mut port_bytes = [0u8; 2];
+            stream.read_exact(&mut port_bytes).await?;
+            let domain = String::from_utf8_lossy(&name);
+            let port = u16::from_be_bytes(port_bytes);
+            let relay_addr_str = format!("{domain}:{port}");
+            crate::outbound::common::resolve_addr(&relay_addr_str).map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::Other,
+                    format!(
+                        "SOCKS5: cannot resolve relay '{relay_addr_str}': {e}"
+                    ),
+                )
+            })
+        },
+        _ => Err(io::Error::new(
+            io::ErrorKind::Other,
+            format!("SOCKS5 unknown ATYP: {}", atyp[0]),
+        )),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -430,9 +625,9 @@ impl OutboundClient for SshOutboundClient {
     async fn dial(
         &self, dest: &Destination,
     ) -> Result<Box<dyn StreamRelay>, Box<dyn std::error::Error>> {
-        self.ensure_running()
-            .await
-            .map_err(|e| format!("ssh outbound '{}' not ready: {e}", self.cmd))?;
+        self.ensure_running().await.map_err(|e| {
+            format!("ssh outbound '{}' not ready: {e}", self.log_tag)
+        })?;
 
         let failure_count = match self.try_dial(dest).await {
             Ok(relay) => {
@@ -451,8 +646,8 @@ impl OutboundClient for SshOutboundClient {
             self.failure_count.store(0, Ordering::Relaxed);
             self.kill_process().await;
             self.spawn_tunnel().await?;
-            self.poll_port(SSH_STARTUP_RETRIES).await.map_err(|e| {
-                format!("ssh outbound '{}' respawn failed: {e}", self.cmd)
+            self.poll_port(Duration::from_secs(5)).await.map_err(|e| {
+                format!("ssh outbound '{}' respawn failed: {e}", self.log_tag)
             })?;
             return self.try_dial(dest).await;
         }
@@ -464,10 +659,34 @@ impl OutboundClient for SshOutboundClient {
     async fn dial_udp(
         &self, _initial_dest: &Destination,
     ) -> Result<Box<dyn PacketRelay>, Box<dyn std::error::Error>> {
-        self.ensure_running()
-            .await
-            .map_err(|e| format!("ssh outbound '{}' not ready: {e}", self.cmd))?;
+        self.ensure_running().await.map_err(|e| {
+            format!("ssh outbound '{}' not ready: {e}", self.log_tag)
+        })?;
 
+        let failure_count = match self.try_dial_udp().await {
+            Ok(relay) => {
+                self.failure_count.store(0, Ordering::Relaxed);
+                return Ok(relay);
+            },
+            Err(_) => self.failure_count.fetch_add(1, Ordering::Relaxed) + 1,
+        };
+
+        log::warn!(
+            "ssh outbound: UDP ASSOCIATE failed \
+             (count={failure_count}/{MAX_FAILURES_BEFORE_RESPAWN})",
+        );
+
+        if failure_count >= MAX_FAILURES_BEFORE_RESPAWN {
+            self.failure_count.store(0, Ordering::Relaxed);
+            self.kill_process().await;
+            self.spawn_tunnel().await?;
+            self.poll_port(Duration::from_secs(5)).await.map_err(|e| {
+                format!("ssh outbound '{}' respawn failed: {e}", self.log_tag)
+            })?;
+            return self.try_dial_udp().await;
+        }
+
+        sleep(Duration::from_millis(500)).await;
         self.try_dial_udp().await
     }
 
@@ -501,6 +720,7 @@ impl OutboundClient for SshOutboundClient {
         }
     }
 }
+
 impl SshOutboundClient {
     /// Kill the process group (`sh` + children like `ssh`) by PID stored in
     /// [`Self::child_pid`]. Used from both the async retry path and the
@@ -517,11 +737,41 @@ impl SshOutboundClient {
 
     /// Force-kill the current tunnel process group (`sh` + `ssh`) and wait
     /// for reaping. Used inside the SOCKS5-failure retry path.
+    ///
+    /// Sends SIGTERM first, then waits up to 500ms for the process to exit
+    /// gracefully (allowing SSH to close connections and clean up temp
+    /// files), then sends SIGKILL as the final blow.
     async fn kill_process(&self) {
         let pid = self.child_pid.load(Ordering::Relaxed);
+        if pid <= 0 {
+            return;
+        }
+
+        // Step 1: SIGTERM — ask nicely.
         Self::kill_process_group(pid);
 
-        let mut guard = self.process.lock().await;
+        // Step 2: Wait up to 500ms for graceful exit.
+        let mut guard = self.process.write().await;
+        if let Some(child) = &mut *guard {
+            let deadline =
+                tokio::time::Instant::now() + Duration::from_millis(500);
+            loop {
+                match child.try_wait() {
+                    Ok(Some(_)) => break, // Exited.
+                    Ok(None) => {
+                        if tokio::time::Instant::now() >= deadline {
+                            break; // Timeout — proceed to SIGKILL.
+                        }
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    },
+                    Err(_) => break,
+                }
+            }
+        }
+        drop(guard);
+
+        // Step 3: SIGKILL if still alive.
+        let mut guard = self.process.write().await;
         if let Some(mut child) = guard.take() {
             let _ = child.kill().await;
             let _ = child.wait().await;
@@ -535,7 +785,7 @@ impl SshOutboundClient {
     ) -> Result<Box<dyn StreamRelay>, Box<dyn std::error::Error>> {
         let mut stream = tokio::time::timeout(
             SSH_CONNECT_TIMEOUT,
-            TcpStream::connect(self.current_addr()),
+            crate::outbound::common::connect_tcp_bypass(self.current_addr()),
         )
         .await
         .map_err(|_| "ssh outbound: connect timeout to tunnel endpoint")?
@@ -557,12 +807,12 @@ impl SshOutboundClient {
         &self,
     ) -> Result<Box<dyn PacketRelay>, Box<dyn std::error::Error>> {
         if self.proxy_type == ProxyType::Http {
-            return Err("HTTP CONNECT proxy does not support UDP".into());
+            return Err(crate::outbound::common::ERR_UDP_NOT_SUPPORTED.into());
         }
 
         let mut assoc_tcp = tokio::time::timeout(
             SSH_CONNECT_TIMEOUT,
-            TcpStream::connect(self.current_addr()),
+            crate::outbound::common::connect_tcp_bypass(self.current_addr()),
         )
         .await
         .map_err(|_| "ssh outbound: connect timeout for UDP ASSOCIATE")?
@@ -591,7 +841,7 @@ impl SshOutboundClient {
         let start = Instant::now();
         let mut stream = tokio::time::timeout(
             Duration::from_secs(5),
-            TcpStream::connect(self.current_addr()),
+            crate::outbound::common::connect_tcp_bypass(self.current_addr()),
         )
         .await
         .ok()?
@@ -626,7 +876,7 @@ impl SshOutboundClient {
             ])
             .await?;
 
-        let mut header = [0u8; 4];
+        let mut header = [0u8; 4]; // VER + REP + RSV + ATYP
         stream.read_exact(&mut header).await?;
         if header[1] != 0x00 {
             return Err(io::Error::new(
@@ -634,70 +884,15 @@ impl SshOutboundClient {
                 format!("SOCKS5 UDP ASSOCIATE failed: rep={}", header[1]),
             ));
         }
-
-        let atyp = header[3];
-        let addr: SocketAddr = match atyp {
-            0x01 => {
-                let mut octets = [0u8; 4];
-                stream.read_exact(&mut octets).await?;
-                let mut port = [0u8; 2];
-                stream.read_exact(&mut port).await?;
-                SocketAddr::new(
-                    std::net::IpAddr::V4(std::net::Ipv4Addr::from(octets)),
-                    u16::from_be_bytes(port),
-                )
-            },
-            0x04 => {
-                let mut octets = [0u8; 16];
-                stream.read_exact(&mut octets).await?;
-                let mut port = [0u8; 2];
-                stream.read_exact(&mut port).await?;
-                SocketAddr::new(
-                    std::net::IpAddr::V6(std::net::Ipv6Addr::from(octets)),
-                    u16::from_be_bytes(port),
-                )
-            },
-            0x03 => {
-                let mut len = [0u8; 1];
-                stream.read_exact(&mut len).await?;
-                let mut name = vec![0u8; len[0] as usize];
-                stream.read_exact(&mut name).await?;
-                let mut port_bytes = [0u8; 2];
-                stream.read_exact(&mut port_bytes).await?;
-                let domain = String::from_utf8_lossy(&name);
-                let port = u16::from_be_bytes(port_bytes);
-                let relay_addr_str = format!("{domain}:{port}");
-                crate::outbound::common::resolve_addr(&relay_addr_str).map_err(
-                    |e| {
-                        io::Error::new(
-                            io::ErrorKind::Other,
-                            format!(
-                                "SOCKS5 UDP ASSOCIATE: cannot resolve relay \
-                                 '{relay_addr_str}': {e}"
-                            ),
-                        )
-                    },
-                )?
-            },
-            _ =>
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("SOCKS5 UDP ASSOCIATE unknown ATYP: {atyp}"),
-                )),
-        };
-
-        Ok(addr)
+        socks5_read_addr(stream).await
     }
 }
 impl Drop for SshOutboundClient {
     fn drop(&mut self) {
         let pid = self.child_pid.load(Ordering::Relaxed);
         Self::kill_process_group(pid);
-        if pid > 0 {
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
-        // kill_on_drop(true) on the Command + dropping the Child handle
-        // sends SIGKILL as the final blow.
+        // sends SIGKILL as the final blow. No blocking sleep here —
+        // std::thread::sleep in Drop would stall the tokio worker thread.
     }
 }
 
@@ -707,7 +902,6 @@ impl Drop for SshOutboundClient {
 
 /// UDP relay backed by a SOCKS5 UDP ASSOCIATE association.
 struct SshUdpRelay {
-    #[allow(dead_code)] // Held open to keep the UDP ASSOCIATION alive.
     assoc_tcp: Arc<Mutex<TcpStream>>,
     /// Server-assigned UDP relay endpoint.
     relay_addr: SocketAddr,
@@ -720,6 +914,79 @@ impl SshUdpRelay {
     fn next_deadline(&self) -> Instant {
         self.last_activity + self.idle_timeout
     }
+
+    /// Check whether the UDP ASSOCIATE TCP connection is still alive.
+    /// A closed association means the server can no longer route UDP
+    /// datagrams to us.
+    async fn assoc_alive(&self) -> bool {
+        let stream = self.assoc_tcp.lock().await;
+        // try_read with an empty buffer — just check if the socket is
+        // readable or errored. An error means the connection is gone.
+        match stream.try_read(&mut [0u8; 0]) {
+            Ok(_) => true,
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => true,
+            Err(_) => false,
+        }
+    }
+}
+
+/// Parse a SOCKS5 UDP datagram header from `buf[..n]`.
+///
+/// Returns `(payload_offset, payload_len, Destination)` where
+/// `payload_offset` is the index in `buf` where the actual UDP payload
+/// begins, and `payload_len` is its length.
+fn parse_socks5_udp_header(
+    buf: &[u8], n: usize,
+) -> Result<(usize, usize, Destination), io::Error> {
+    if n < 4 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "UDP packet too short for SOCKS5 header",
+        ));
+    }
+
+    let frag = buf[2];
+    if frag != 0x00 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "UDP fragmentation not supported",
+        ));
+    }
+
+    let atyp = buf[3];
+    let (offset, dest_addr): (usize, Address) = match atyp {
+        0x01 if n >= 10 => {
+            let octets: [u8; 4] = buf[4..8].try_into().unwrap();
+            let addr = std::net::Ipv4Addr::from(octets);
+            (8, Address::Ipv4(addr.octets()))
+        },
+        0x04 if n >= 22 => {
+            let octets: [u8; 16] = buf[4..20].try_into().unwrap();
+            let addr = std::net::Ipv6Addr::from(octets);
+            (20, Address::Ipv6(addr.octets()))
+        },
+        0x03 if n >= 5 + buf[4] as usize + 2 => {
+            let dlen = buf[4] as usize;
+            let domain = String::from_utf8_lossy(&buf[5..5 + dlen]).to_string();
+            (5 + dlen, Address::Domain(domain))
+        },
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unknown SOCKS5 address type",
+            ));
+        },
+    };
+
+    let port = u16::from_be_bytes([buf[offset], buf[offset + 1]]);
+    let payload_start = offset + 2;
+    let payload_len = n - payload_start;
+
+    Ok((payload_start, payload_len, Destination {
+        address: dest_addr,
+        port,
+        resolved_ip: None,
+    }))
 }
 
 #[async_trait]
@@ -733,56 +1000,48 @@ impl PacketRelay for SshUdpRelay {
                 .checked_duration_since(Instant::now())
                 .unwrap_or(Duration::ZERO);
 
-            let (n, _src) =
-                tokio::time::timeout(remain, self.local.recv_from(buf)).await??;
+            // Periodically check whether the ASSOCIATE TCP is still alive.
+            // If the remote peer or an intermediate NAT closed the
+            // association, the UDP relay will never receive packets and
+            // would otherwise hang until the idle timeout.
+            let check_interval = Duration::from_secs(15);
+            let poll_timeout = remain.min(check_interval);
 
-            self.last_activity = Instant::now();
+            let result =
+                tokio::time::timeout(poll_timeout, self.local.recv_from(buf))
+                    .await;
 
-            // Skip packets smaller than the SOCKS5 UDP header minimum (4 bytes
-            // for RSV+FRAG+ATYP).
-            if n < 4 {
-                continue;
+            match result {
+                Ok(Ok((n, _src))) => {
+                    self.last_activity = Instant::now();
+                    match parse_socks5_udp_header(buf, n) {
+                        Ok((payload_start, payload_len, dest)) => {
+                            // Shift payload to start of buf.
+                            buf.copy_within(payload_start..n, 0);
+                            return Ok((payload_len, dest));
+                        },
+                        Err(_) => continue, // Bad packet — skip.
+                    }
+                },
+                Ok(Err(e)) => return Err(e),
+                Err(_) => {
+                    // Timeout — check assoc_tcp health before looping.
+                    if remain <= check_interval {
+                        // Real idle timeout.
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "UDP ASSOCIATE idle timeout",
+                        ));
+                    }
+                    if !self.assoc_alive().await {
+                        return Err(io::Error::new(
+                            io::ErrorKind::ConnectionReset,
+                            "UDP ASSOCIATE TCP connection lost",
+                        ));
+                    }
+                    continue;
+                },
             }
-
-            let frag = buf[2];
-            if frag != 0x00 {
-                // Fragmentation not supported — drop.
-                continue;
-            }
-
-            let atyp = buf[3];
-            let (offset, dest_addr): (usize, Address) = match atyp {
-                0x01 if n >= 10 => {
-                    let octets: [u8; 4] = buf[4..8].try_into().unwrap();
-                    let addr = std::net::Ipv4Addr::from(octets);
-                    (8, Address::Ipv4(addr.octets()))
-                },
-                0x04 if n >= 22 => {
-                    let octets: [u8; 16] = buf[4..20].try_into().unwrap();
-                    let addr = std::net::Ipv6Addr::from(octets);
-                    (20, Address::Ipv6(addr.octets()))
-                },
-                0x03 if n >= 5 + buf[4] as usize + 2 => {
-                    let dlen = buf[4] as usize;
-                    let domain =
-                        String::from_utf8_lossy(&buf[5..5 + dlen]).to_string();
-                    (5 + dlen, Address::Domain(domain))
-                },
-                _ => continue,
-            };
-
-            let port = u16::from_be_bytes([buf[offset], buf[offset + 1]]);
-            let payload_start = offset + 2;
-
-            // Shift payload to start of buf.
-            buf.copy_within(payload_start..n, 0);
-            let payload_len = n - payload_start;
-
-            return Ok((payload_len, Destination {
-                address: dest_addr,
-                port,
-                resolved_ip: None,
-            }));
         }
     }
 
@@ -794,21 +1053,7 @@ impl PacketRelay for SshUdpRelay {
         // Build SOCKS5 UDP request header.
         let mut pkt = Vec::with_capacity(64);
         pkt.extend_from_slice(&[0x00, 0x00, 0x00]); // RSV + FRAG
-        match &dest.address {
-            Address::Ipv4(o) => {
-                pkt.push(0x01);
-                pkt.extend_from_slice(o);
-            },
-            Address::Ipv6(o) => {
-                pkt.push(0x04);
-                pkt.extend_from_slice(o);
-            },
-            Address::Domain(d) => {
-                pkt.push(0x03);
-                pkt.push(d.len() as u8);
-                pkt.extend_from_slice(d.as_bytes());
-            },
-        }
+        socks5_encode_addr(&mut pkt, dest);
         pkt.extend_from_slice(&dest.port.to_be_bytes());
         pkt.extend_from_slice(buf);
 

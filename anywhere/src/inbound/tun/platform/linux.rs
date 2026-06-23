@@ -141,10 +141,12 @@ pub fn cleanup_stale_routing() {
 
 /// Manages Linux routing table entries for the TUN interface.
 pub struct TunRouteManager {
-    handle: Handle,
-    link_index: u32,
-    tun_addr: IpAddr,
-    iface_name: String,
+    pub handle: Handle,
+    pub link_index: u32,
+    pub tun_addr: IpAddr,
+    pub iface_name: String,
+    /// Whether to install iptables rules and DNS redirect (auto-hijack mode).
+    pub auto_hijack: bool,
     /// WAN interfaces to monitor dynamically. Only `from <wan_ip>` rules are
     /// installed for these interfaces.
     monitor_wan_ifaces: Vec<String>,
@@ -160,13 +162,15 @@ pub struct TunRouteManager {
 impl TunRouteManager {
     pub fn new(
         handle: Handle, link_index: u32, tun_addr: IpAddr, iface_name: String,
-        monitor_wan_ifaces: Vec<String>, bypass_lan_ifaces: Vec<String>,
+        auto_hijack: bool, monitor_wan_ifaces: Vec<String>,
+        bypass_lan_ifaces: Vec<String>,
     ) -> Self {
         Self {
             handle,
             link_index,
             tun_addr,
             iface_name,
+            auto_hijack,
             monitor_wan_ifaces,
             bypass_lan_ifaces,
             bypass_watcher: None,
@@ -425,19 +429,27 @@ impl TunRouteManager {
 
         Ok(())
     }
-}
 
-impl Drop for TunRouteManager {
-    fn drop(&mut self) {
+    /// Tear down routing rules without deleting the TUN interface.
+    ///
+    /// Stops the bypass watcher (removing all WAN/LAN bypass rules) and
+    /// removes policy routing rules and iptables rules. The TUN interface
+    /// itself is left intact so it can be re-enabled later.
+    pub fn cleanup_routing(&mut self) {
         // Stop the bypass watcher first and synchronously wait for it to
         // remove every rule it installed. This guarantees the kernel rule
-        // table is clean before we tear down the rest of the routing setup,
-        // and before the tun interface itself is deleted.
+        // table is clean before we tear down the rest of the routing setup.
         if let Some(mut watcher) = self.bypass_watcher.take() {
             watcher.shutdown_blocking();
         }
 
         teardown_routing(Some(&self.iface_name));
+    }
+}
+
+impl Drop for TunRouteManager {
+    fn drop(&mut self) {
+        self.cleanup_routing();
 
         let output = Command::new("ip")
             .args(["link", "delete", &self.iface_name])

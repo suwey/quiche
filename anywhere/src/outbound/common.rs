@@ -8,6 +8,10 @@ use std::io;
 use tokio::net::TcpStream;
 use tokio::net::UdpSocket;
 
+/// Default error message returned by [`OutboundClient::dial_udp`] when
+/// the outbound does not support UDP at all.
+pub const ERR_UDP_NOT_SUPPORTED: &str = "UDP not supported by this outbound";
+
 // ---------------------------------------------------------------------------
 // Bypass helpers — SO_MARK on Linux so outbound sockets avoid the TUN route
 // ---------------------------------------------------------------------------

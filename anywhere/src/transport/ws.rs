@@ -142,13 +142,31 @@ impl<T: Read + Write> WsConn<T> {
 
     /// Read bytes from the underlying stream until `self.recv_buf` has at
     /// least `count` bytes.
+    ///
+    /// Partial reads on `WouldBlock`/`TimedOut` are preserved into
+    /// `recv_buf` — `read_exact` would silently drop them. The caller
+    /// (`recv()`) loops with the same `count` until all bytes are buffered.
     fn ensure_bytes(&mut self, count: usize) -> Result<()> {
-        let missing = count.saturating_sub(self.recv_buf.len());
-        if missing > 0 {
-            self.recv_buf.reserve(missing);
-            let mut buf = vec![0u8; missing];
-            self.inner.read_exact(&mut buf)?;
-            self.recv_buf.extend_from_slice(&buf);
+        while self.recv_buf.len() < count {
+            let missing = count - self.recv_buf.len();
+            let mut tmp = vec![0u8; missing.min(64 * 1024)];
+            match self.inner.read(&mut tmp) {
+                Ok(0) => {
+                    return Err(Error::new(
+                        ErrorKind::UnexpectedEof,
+                        "ws: peer closed mid-frame",
+                    ));
+                },
+                Ok(n) => {
+                    self.recv_buf.extend_from_slice(&tmp[..n]);
+                },
+                Err(e)
+                    if e.kind() == ErrorKind::Interrupted =>
+                {
+                    continue;
+                },
+                Err(e) => return Err(e),
+            }
         }
         Ok(())
     }

@@ -1,4 +1,6 @@
+pub mod command;
 pub mod config;
+pub mod context;
 pub mod dns;
 pub mod fingerprint;
 pub mod inbound;

@@ -14,10 +14,7 @@ use std::sync::atomic::Ordering::SeqCst;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use boring::hash::MessageDigest;
-use boring::hash::hash;
 use boring::ssl::SslStream;
-use bytes::BufMut;
 use tokio::sync::mpsc;
 
 use crate::config::OutboundConfig;
@@ -26,6 +23,7 @@ use crate::outbound::OutboundClient;
 use crate::outbound::common::connect_tcp_bypass_sync;
 use crate::outbound::common::create_tls_stream;
 use crate::outbound::common::resolve_sni;
+use crate::protocol::anytls as proto;
 use crate::relay::PacketRelay;
 use crate::relay::StreamRelay;
 
@@ -35,225 +33,63 @@ use uot::UotPacketRelay;
 use uot::encode_request;
 use uot::magic_address_with_port;
 
-// ========== LCG PRNG ==========
+// Re-import shared protocol primitives.
+use proto::CHECK_MARK;
+use proto::CMD_ALERT;
+use proto::CMD_FIN;
+use proto::CMD_HEART_REQUEST;
+use proto::CMD_HEART_RESPONSE;
+use proto::CMD_PSH;
+use proto::CMD_SERVER_SETTINGS;
+use proto::CMD_SETTINGS;
+use proto::CMD_SYN;
+use proto::CMD_SYNACK;
+use proto::CMD_UPDATE_PADDING_SCHEME;
+use proto::CMD_WASTE;
+use proto::DEFAULT_PADDING_SCHEME;
+use proto::LcgGen;
+use proto::PaddingFactory;
+use proto::cmd_name;
+use proto::encode_frame;
+use proto::encode_target;
+use proto::read_frame_blocking;
 
-struct LcgGen(u64);
-impl LcgGen {
-    fn new() -> Self {
-        Self(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos() as u64)
-                .unwrap_or(1),
-        )
-    }
-
-    fn next(&mut self) -> u64 {
-        self.0 = self
-            .0
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
-        self.0
-    }
-
-    fn range(&mut self, min: i64, max: i64) -> i64 {
-        min + (self.next() % (max - min + 1) as u64) as i64
-    }
+/// Process-wide padding cache shared across all sessions of one client.
+///
+/// When the server sends `CMD_UPDATE_PADDING_SCHEME`, the new scheme is
+/// stored here so that subsequent sessions can skip the update round-trip
+/// and start with the correct padding immediately.
+struct PaddingCache {
+    /// Raw scheme text (same format as `DEFAULT_PADDING_SCHEME`).
+    raw: Vec<u8>,
+    /// Pre-computed MD5 hex digest of `raw`.
+    md5: String,
 }
-
-// ========== Protocol Constants ==========
-
-const CMD_WASTE: u8 = 0;
-const CMD_SYN: u8 = 1;
-const CMD_PSH: u8 = 2;
-const CMD_FIN: u8 = 3;
-const CMD_SETTINGS: u8 = 4;
-const CMD_ALERT: u8 = 5;
-const CMD_UPDATE_PADDING_SCHEME: u8 = 6;
-const CMD_SYNACK: u8 = 7;
-const CMD_HEART_REQUEST: u8 = 8;
-const CMD_HEART_RESPONSE: u8 = 9;
-const CMD_SERVER_SETTINGS: u8 = 10;
-
-fn cmd_name(cmd: u8) -> &'static str {
-    match cmd {
-        CMD_WASTE => "WASTE",
-        CMD_SYN => "SYN",
-        CMD_PSH => "PSH",
-        CMD_FIN => "FIN",
-        CMD_SETTINGS => "SETTINGS",
-        CMD_ALERT => "ALERT",
-        CMD_UPDATE_PADDING_SCHEME => "UPDATE_PADDING_SCHEME",
-        CMD_SYNACK => "SYNACK",
-        CMD_HEART_REQUEST => "HEART_REQUEST",
-        CMD_HEART_RESPONSE => "HEART_RESPONSE",
-        CMD_SERVER_SETTINGS => "SERVER_SETTINGS",
-        _ => "UNKNOWN",
-    }
-}
-
-// ========== Padding ==========
-
-const CHECK_MARK: i32 = -1;
-const DEFAULT_PADDING_SCHEME: &str = r#"stop=8
-0=30-30
-1=100-400
-2=400-500,c,500-1000,c,500-1000,c,500-1000,c,500-1000
-3=9-9,500-1000
-4=500-1000
-5=500-1000
-6=500-1000
-7=500-1000"#;
-
-#[derive(Clone)]
-struct PaddingFactory {
-    scheme: HashMap<String, String>,
-    stop: u32,
-}
-impl PaddingFactory {
-    fn new(raw: &[u8]) -> std::io::Result<Self> {
-        let mut scheme = HashMap::new();
-        for line in std::str::from_utf8(raw)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?
-            .lines()
-        {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            let Some((k, v)) = line.split_once('=') else {
-                continue;
-            };
-            scheme.insert(k.trim().to_string(), v.trim().to_string());
-        }
-        let stop =
-            scheme
-                .get("stop")
-                .and_then(|s| s.parse().ok())
-                .ok_or_else(|| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "missing stop",
-                    )
-                })?;
-        Ok(Self { scheme, stop })
+impl PaddingCache {
+    fn from_default() -> Self {
+        Self::from_raw(DEFAULT_PADDING_SCHEME.as_bytes().to_vec())
     }
 
-    fn default_factory() -> Self {
-        Self::new(DEFAULT_PADDING_SCHEME.as_bytes()).expect("default")
+    fn from_raw(raw: Vec<u8>) -> Self {
+        let md5 = Self::compute_md5(&raw);
+        Self { raw, md5 }
     }
 
-    fn generate_sizes(&self, pkt: u32) -> Vec<i32> {
-        let mut sizes = Vec::new();
-        let Some(spec) = self.scheme.get(&pkt.to_string()) else {
-            return sizes;
-        };
-        let mut rng = LcgGen::new();
-        for part in spec.split(',') {
-            let part = part.trim();
-            if part == "c" {
-                sizes.push(CHECK_MARK);
-                continue;
-            }
-            let Some((a, b)) = part.split_once('-') else {
-                continue;
-            };
-            let min: i64 = a.trim().parse().unwrap_or(0);
-            let max: i64 = b.trim().parse().unwrap_or(0);
-            if min <= 0 || max <= 0 {
-                continue;
-            }
-            let (mn, mx) = (min.min(max), min.max(max));
-            sizes.push(if mn == mx {
-                mn as i32
-            } else {
-                rng.range(mn, mx) as i32
-            });
-        }
-        sizes
+    fn compute_md5(raw: &[u8]) -> String {
+        PaddingFactory::md5_hex(raw)
     }
 
-    fn stop(&self) -> u32 {
-        self.stop
+    fn md5(&self) -> &str {
+        &self.md5
+    }
+
+    fn update(&mut self, raw: Vec<u8>) {
+        self.md5 = Self::compute_md5(&raw);
+        self.raw = raw;
     }
 }
 
 // ========== Helpers ==========
-
-fn encode_target(target: &str) -> std::io::Result<Vec<u8>> {
-    let mut buf = Vec::new();
-    let (host, port_str) = if let Some(rest) = target.strip_prefix('[') {
-        let (host, rest) = rest.split_once(']').ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "unclosed bracket",
-            )
-        })?;
-        (host, rest.strip_prefix(':').unwrap_or(""))
-    } else {
-        let Some((h, p)) = target.rsplit_once(':') else {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("no port: {target}"),
-            ));
-        };
-        (h, p)
-    };
-    let port: u16 = port_str.parse().map_err(|_| {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid port")
-    })?;
-    if let Ok(ip) = host.parse::<std::net::Ipv4Addr>() {
-        buf.put_u8(0x01);
-        buf.extend_from_slice(&ip.octets());
-    } else if let Ok(ip) = host.parse::<std::net::Ipv6Addr>() {
-        buf.put_u8(0x04);
-        buf.extend_from_slice(&ip.octets());
-    } else {
-        if host.len() > 255 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "domain too long",
-            ));
-        }
-        buf.put_u8(0x03);
-        buf.put_u8(host.len() as u8);
-        buf.extend_from_slice(host.as_bytes());
-    }
-    buf.put_u16(port);
-    Ok(buf)
-}
-
-fn encode_frame(
-    cmd: u8, stream_id: u32, data: &[u8],
-) -> std::io::Result<Vec<u8>> {
-    if data.len() > u16::MAX as usize {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "payload too large",
-        ));
-    }
-    let mut buf = Vec::with_capacity(7 + data.len());
-    buf.push(cmd);
-    buf.extend_from_slice(&stream_id.to_be_bytes());
-    buf.extend_from_slice(&(data.len() as u16).to_be_bytes());
-    buf.extend_from_slice(data);
-    Ok(buf)
-}
-
-fn read_frame_blocking(
-    stream: &mut SslStream<TcpStream>,
-) -> std::io::Result<(u8, u32, Vec<u8>)> {
-    let mut hdr = [0u8; 7];
-    stream.read_exact(&mut hdr)?;
-    let command = hdr[0];
-    let stream_id = u32::from_be_bytes([hdr[1], hdr[2], hdr[3], hdr[4]]);
-    let data_len = u16::from_be_bytes([hdr[5], hdr[6]]) as usize;
-    let mut data = vec![0u8; data_len];
-    if data_len > 0 {
-        stream.read_exact(&mut data)?;
-    }
-    Ok((command, stream_id, data))
-}
 
 enum ControlFrame {
     Fin(u32),
@@ -263,7 +99,6 @@ enum OutboundMsg {
     RawFrame(Vec<u8>),
     OpenStream { sid: u32, target: Vec<u8> },
 }
-
 struct IoThread {
     data_tx: mpsc::UnboundedSender<Vec<u8>>,
     /// Set to true on the first PSH for this stream. Lets the FIN handler
@@ -407,6 +242,198 @@ impl StreamHandle {
     }
 }
 
+// ========== Session Pool ==========
+
+/// Pool configuration sourced from [`OutboundConfig`].
+#[derive(Clone, Debug)]
+struct SessionPoolConfig {
+    /// How often the background cleanup task runs.
+    check_interval: Duration,
+    /// Sessions idle longer than this are eligible for removal.
+    idle_timeout: Duration,
+    /// Minimum number of sessions to keep alive in the pool.
+    min_idle: usize,
+}
+
+impl SessionPoolConfig {
+    /// Build pool config from the outbound config, falling back to defaults:
+    /// - `idle_session_check_interval`: 60 s
+    /// - `idle_session_timeout`: 180 s
+    /// - `min_idle_session`: 2
+    fn from_outbound_config(cfg: &OutboundConfig) -> Self {
+        let check_interval =
+            Duration::from_secs(cfg.idle_session_check_interval.unwrap_or(60));
+        let idle_timeout =
+            Duration::from_secs(cfg.idle_session_timeout.unwrap_or(180));
+        let min_idle = cfg.min_idle_session.unwrap_or(2);
+        log::debug!(
+            "anytls pool: check_interval={:?} idle_timeout={:?} min_idle={}",
+            check_interval,
+            idle_timeout,
+            min_idle,
+        );
+        Self {
+            check_interval,
+            idle_timeout,
+            min_idle,
+        }
+    }
+}
+
+struct SessionPoolEntry {
+    handle: SessionHandle,
+    idle_since: Option<std::time::Instant>,
+}
+
+struct SessionPool {
+    entries: StdMutex<Vec<SessionPoolEntry>>,
+    config: SessionPoolConfig,
+    cleanup_abort: StdMutex<Option<tokio::task::AbortHandle>>,
+}
+
+impl SessionPool {
+    fn new(config: SessionPoolConfig) -> Arc<Self> {
+        Arc::new(Self {
+            entries: StdMutex::new(Vec::new()),
+            config,
+            cleanup_abort: StdMutex::new(None),
+        })
+    }
+
+    /// Get a live session from the pool, or create one via `factory`.
+    /// Dead sessions are purged lazily.
+    fn acquire(
+        &self, factory: impl FnOnce() -> std::io::Result<SessionHandle>,
+    ) -> std::io::Result<SessionHandle> {
+        let mut entries = self.entries.lock().unwrap();
+
+        // Remove dead sessions.
+        entries.retain(|e| !e.handle.is_closed());
+
+        // Return the first live session (mark as in-use).
+        if let Some(entry) = entries.first_mut() {
+            entry.idle_since = None;
+            return Ok(SessionHandle {
+                inner: entry.handle.inner.clone(),
+            });
+        }
+
+        // Pool empty — create a new session.
+        let handle = factory()?;
+        entries.push(SessionPoolEntry {
+            handle: SessionHandle {
+                inner: handle.inner.clone(),
+            },
+            idle_since: None,
+        });
+        Ok(handle)
+    }
+
+    /// Background cleanup: evict timed-out sessions, replenish to
+    /// `min_idle`, create sessions if pool is empty.
+    fn cleanup(&self, factory: impl Fn() -> std::io::Result<SessionHandle>) {
+        let mut entries = self.entries.lock().unwrap();
+
+        // Sort by idle_since descending (longest-idle first).
+        entries.sort_by(|a, b| match (&a.idle_since, &b.idle_since) {
+            (Some(ta), Some(tb)) => tb.cmp(ta),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        });
+
+        let mut to_remove = Vec::new();
+        let now = std::time::Instant::now();
+        let mut alive = entries.len();
+
+        for (i, entry) in entries.iter().enumerate() {
+            if entry.handle.is_closed() {
+                to_remove.push(i);
+                alive = alive.saturating_sub(1);
+                continue;
+            }
+            if let Some(idle) = entry.idle_since {
+                if now.duration_since(idle) >= self.config.idle_timeout &&
+                    alive > self.config.min_idle
+                {
+                    log::debug!(
+                        "anytls pool: removing idle session ({:.0?} idle)",
+                        now.duration_since(idle)
+                    );
+                    to_remove.push(i);
+                    alive = alive.saturating_sub(1);
+                }
+            }
+        }
+
+        // Remove in reverse to keep indices valid.
+        for i in to_remove.into_iter().rev() {
+            let entry = entries.remove(i);
+            entry.handle.inner.closed.store(true, SeqCst);
+        }
+
+        // Replenish if below min_idle (or empty).
+        let target = self.config.min_idle.max(1);
+        while entries.len() < target {
+            match factory() {
+                Ok(handle) => {
+                    entries.push(SessionPoolEntry {
+                        handle: SessionHandle {
+                            inner: handle.inner.clone(),
+                        },
+                        idle_since: Some(std::time::Instant::now()),
+                    });
+                    log::debug!(
+                        "anytls pool: replenished (now {} sessions)",
+                        entries.len()
+                    );
+                },
+                Err(e) => {
+                    log::debug!("anytls pool: replenish failed: {e}");
+                    break;
+                },
+            }
+        }
+
+        // Mark any in-use sessions that became idle.
+        for entry in entries.iter_mut() {
+            if entry.idle_since.is_none() &&
+                entry.handle.inner.active_streams.load(SeqCst) == 0
+            {
+                entry.idle_since = Some(std::time::Instant::now());
+            }
+        }
+    }
+
+    /// Spawn the periodic cleanup background task.
+    fn spawn_cleanup(
+        self: &Arc<Self>,
+        factory: impl Fn() -> std::io::Result<SessionHandle> + Send + Sync + 'static,
+    ) {
+        let pool = Arc::clone(self);
+        let interval = self.config.check_interval;
+        let handle = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            loop {
+                ticker.tick().await;
+                pool.cleanup(&factory);
+            }
+        });
+        *self.cleanup_abort.lock().unwrap() = Some(handle.abort_handle());
+    }
+
+    /// Close all sessions and cancel the cleanup task.
+    fn shutdown(&self) {
+        let mut entries = self.entries.lock().unwrap();
+        for entry in entries.drain(..) {
+            entry.handle.inner.closed.store(true, SeqCst);
+        }
+        if let Some(abort) = self.cleanup_abort.lock().unwrap().take() {
+            abort.abort();
+        }
+    }
+}
+
 // ========== Blocking I/O ==========
 
 fn write_padded(
@@ -464,7 +491,10 @@ fn write_padded(
     Ok(())
 }
 
-fn handle_blocking_frame(cmd: u8, sid: u32, data: Vec<u8>, inner: &SessionInner) {
+fn handle_blocking_frame(
+    cmd: u8, sid: u32, data: Vec<u8>, inner: &SessionInner,
+    padding_cache: Option<&Arc<StdMutex<PaddingCache>>>,
+) {
     let outbound_tx = &inner.outbound_tx;
     match cmd {
         CMD_PSH => {
@@ -507,11 +537,19 @@ fn handle_blocking_frame(cmd: u8, sid: u32, data: Vec<u8>, inner: &SessionInner)
                 let _ = outbound_tx.send(OutboundMsg::RawFrame(frame));
             }
         },
-        CMD_UPDATE_PADDING_SCHEME => match PaddingFactory::new(&data) {
-            Ok(f) => {
-                *inner.padding.lock().unwrap() = f;
-            },
-            Err(e) => log::warn!("anytls padding: {e}"),
+        CMD_UPDATE_PADDING_SCHEME => {
+            log::debug!("anytls: received padding scheme update");
+            match PaddingFactory::new(&data) {
+                Ok(f) => {
+                    *inner.padding.lock().unwrap() = f;
+                    // Update client-wide cache so new sessions start with
+                    // this scheme and skip the update round-trip.
+                    if let Some(cache) = padding_cache {
+                        cache.lock().unwrap().update(data);
+                    }
+                },
+                Err(e) => log::warn!("anytls padding: {e}"),
+            }
         },
         CMD_SERVER_SETTINGS => {
             log::debug!("anytls settings: {}", String::from_utf8_lossy(&data))
@@ -524,40 +562,21 @@ fn handle_blocking_frame(cmd: u8, sid: u32, data: Vec<u8>, inner: &SessionInner)
     }
 }
 
-/// Duration after which an idle session (0 active streams) self-closes.
-const IDLE_SESSION_TIMEOUT: std::time::Duration =
-    std::time::Duration::from_secs(300);
-
 fn run_io_loop(
     mut stream: SslStream<TcpStream>, inner: &SessionInner,
     mut control_rx: mpsc::UnboundedReceiver<ControlFrame>,
     mut outbound_rx: mpsc::UnboundedReceiver<OutboundMsg>,
+    padding_cache: Arc<StdMutex<PaddingCache>>,
 ) {
     stream
         .get_mut()
         .set_read_timeout(Some(Duration::from_secs(3)))
         .ok();
     let mut pkt_counter = 1u32;
-    let mut idle_since: Option<std::time::Instant> = None;
     log::debug!("io thread started");
     loop {
         if inner.closed.load(SeqCst) {
             break;
-        }
-
-        // Idle timeout: if no active streams for 30s, shut down.
-        if inner.active_streams.load(SeqCst) == 0 {
-            let now = std::time::Instant::now();
-            match idle_since {
-                None => idle_since = Some(now),
-                Some(t) if now.duration_since(t) >= IDLE_SESSION_TIMEOUT => {
-                    log::debug!("anytls session idle timeout");
-                    break;
-                },
-                _ => {},
-            }
-        } else {
-            idle_since = None;
         }
 
         loop {
@@ -642,7 +661,13 @@ fn run_io_loop(
                     data.len()
                 );
                 pkt_counter += 1;
-                handle_blocking_frame(cmd, sid, data, inner);
+                handle_blocking_frame(
+                    cmd,
+                    sid,
+                    data,
+                    inner,
+                    Some(&padding_cache),
+                );
             },
             Err(ref e)
                 if e.kind() == std::io::ErrorKind::WouldBlock ||
@@ -673,8 +698,10 @@ pub struct AnyTlsOutboundClient {
     password: String,
     fp: bool,
     insecure: bool,
-    session: StdMutex<Option<SessionHandle>>,
-    udp_session: StdMutex<Option<SessionHandle>>,
+    tcp_pool: Arc<SessionPool>,
+    udp_pool: Arc<SessionPool>,
+    /// Cached padding scheme shared across TCP and UDP sessions.
+    padding_cache: Arc<StdMutex<PaddingCache>>,
 }
 
 impl AnyTlsOutboundClient {
@@ -687,27 +714,81 @@ impl AnyTlsOutboundClient {
         let sni = resolve_sni(config).map_err(|e| format!("anytls: {e}"))?;
         let addr = crate::outbound::common::resolve_addr(server)
             .map_err(|e| format!("anytls: {e}"))?;
-        // Eagerly create the TLS session before TUN comes up, so the initial
-        // TCP connection to the proxy server uses normal routing (not TUN).
-        // If this fails the session will be lazily re-created on first dial().
-        let session = Self::create_session_inner(
+        let padding_cache = Arc::new(StdMutex::new(PaddingCache::from_default()));
+
+        let pool_config = SessionPoolConfig::from_outbound_config(config);
+        let tcp_pool = SessionPool::new(pool_config.clone());
+        let udp_pool = SessionPool::new(pool_config);
+
+        // Eagerly create one TLS session before TUN comes up, so the
+        // initial TCP connection uses normal routing (not TUN). If this
+        // fails the session will be lazily re-created on first dial().
+        if let Ok(handle) = Self::create_session_inner(
             addr,
             &sni,
             &password,
             config.fp,
             config.insecure,
-        )
-        .ok();
+            padding_cache.clone(),
+        ) {
+            tcp_pool.entries.lock().unwrap().push(SessionPoolEntry {
+                handle,
+                idle_since: Some(std::time::Instant::now()),
+            });
+        }
 
-        Ok(Self {
+        let client = Self {
             addr,
             sni,
             password,
             fp: config.fp,
             insecure: config.insecure,
-            session: StdMutex::new(session),
-            udp_session: StdMutex::new(None),
-        })
+            tcp_pool,
+            udp_pool,
+            padding_cache,
+        };
+
+        // Spawn periodic cleanup for both pools.
+        client.spawn_pool_cleanup_tasks();
+
+        Ok(client)
+    }
+
+    /// Spawn background cleanup tasks for TCP and UDP session pools.
+    fn spawn_pool_cleanup_tasks(&self) {
+        let addr = self.addr;
+        let sni = self.sni.clone();
+        let password = self.password.clone();
+        let fp = self.fp;
+        let insecure = self.insecure;
+        let pc = self.padding_cache.clone();
+        self.tcp_pool.spawn_cleanup(move || {
+            Self::create_session_inner(
+                addr,
+                &sni,
+                &password,
+                fp,
+                insecure,
+                pc.clone(),
+            )
+        });
+
+        let addr = self.addr;
+        let sni = self.sni.clone();
+        let password = self.password.clone();
+        let fp = self.fp;
+        let insecure = self.insecure;
+        let pc = self.padding_cache.clone();
+        self.udp_pool.spawn_cleanup(move || {
+            Self::create_session_inner(
+                addr,
+                &sni,
+                &password,
+                fp,
+                insecure,
+                pc.clone(),
+            )
+        });
     }
 
     /// Create a new TLS session and spawn its IO thread.
@@ -719,6 +800,7 @@ impl AnyTlsOutboundClient {
             &self.password,
             self.fp,
             self.insecure,
+            self.padding_cache.clone(),
         )
     }
 
@@ -726,10 +808,16 @@ impl AnyTlsOutboundClient {
     /// pre-connect) and by ensure_session (lazy reconnect).
     fn create_session_inner(
         addr: std::net::SocketAddr, sni: &str, password: &str, fp: bool,
-        insecure: bool,
+        insecure: bool, padding_cache: Arc<StdMutex<PaddingCache>>,
     ) -> std::io::Result<SessionHandle> {
         let (control_tx, control_rx) = mpsc::unbounded_channel();
         let (outbound_tx, outbound_rx) = mpsc::unbounded_channel::<OutboundMsg>();
+
+        // Initialize padding from the client-wide cache (avoids update
+        // round-trip when reconnecting).
+        let cached_raw = padding_cache.lock().unwrap().raw.clone();
+        let initial_padding = PaddingFactory::new(&cached_raw)
+            .unwrap_or_else(|_| PaddingFactory::default_factory());
 
         let inner = Arc::new(SessionInner {
             outbound_tx: outbound_tx.clone(),
@@ -738,7 +826,7 @@ impl AnyTlsOutboundClient {
             next_sid: AtomicU32::new(0),
             active_streams: AtomicU32::new(0),
             closed: AtomicBool::new(false),
-            padding: StdMutex::new(PaddingFactory::default_factory()),
+            padding: StdMutex::new(initial_padding),
         });
 
         let inner_clone = inner.clone();
@@ -765,22 +853,20 @@ impl AnyTlsOutboundClient {
             log::debug!("anytls TLS OK");
 
             // Auth
-            let pwd_hash =
-                match hash(MessageDigest::sha256(), password.as_bytes()) {
-                    Ok(h) => h,
-                    Err(e) => {
-                        log::error!("anytls hash: {e}");
-                        inner_clone.closed.store(true, SeqCst);
-                        return;
-                    },
-                };
+            let pwd_hash = match proto::sha256(password.as_bytes()) {
+                Ok(h) => h,
+                Err(e) => {
+                    log::error!("anytls hash: {e}");
+                    inner_clone.closed.store(true, SeqCst);
+                    return;
+                },
+            };
             let mut auth_padding = [0u8; 30];
             let mut rng = LcgGen::new();
-            for b in auth_padding.iter_mut() {
-                *b = rng.next() as u8;
-            }
-            let auth =
-                [pwd_hash.as_ref(), &30u16.to_be_bytes(), &auth_padding].concat();
+            rng.fill_bytes(&mut auth_padding);
+            let auth: Vec<u8> =
+                [pwd_hash.as_slice(), &30u16.to_be_bytes(), &auth_padding]
+                    .concat();
             if let Err(e) = stream.write_all(&auth) {
                 log::error!("anytls auth: {e}");
                 inner_clone.closed.store(true, SeqCst);
@@ -789,21 +875,7 @@ impl AnyTlsOutboundClient {
             stream.flush().ok();
 
             // Settings (sent once per session)
-            let settings_md5 = match hash(
-                MessageDigest::md5(),
-                DEFAULT_PADDING_SCHEME.as_bytes(),
-            ) {
-                Ok(h) => h
-                    .as_ref()
-                    .iter()
-                    .map(|b| format!("{:02x}", b))
-                    .collect::<String>(),
-                Err(e) => {
-                    log::error!("anytls settings md5: {e}");
-                    inner_clone.closed.store(true, SeqCst);
-                    return;
-                },
-            };
+            let settings_md5 = padding_cache.lock().unwrap().md5().to_string();
             let settings = format!(
                 "v=2\nclient=anywhere/0.1.0\npadding-md5={}",
                 settings_md5
@@ -843,7 +915,13 @@ impl AnyTlsOutboundClient {
                             break;
                         }
                         let d = resp[off + 7..off + 7 + len].to_vec();
-                        handle_blocking_frame(cmd, sid_val, d, &inner_clone);
+                        handle_blocking_frame(
+                            cmd,
+                            sid_val,
+                            d,
+                            &inner_clone,
+                            Some(&padding_cache),
+                        );
                         off += 7 + len;
                     }
                 },
@@ -855,7 +933,13 @@ impl AnyTlsOutboundClient {
             }
 
             // Enter IO loop
-            run_io_loop(stream, &inner_clone, control_rx, outbound_rx);
+            run_io_loop(
+                stream,
+                &inner_clone,
+                control_rx,
+                outbound_rx,
+                padding_cache,
+            );
         });
 
         Ok(SessionHandle { inner })
@@ -868,17 +952,17 @@ impl OutboundClient for AnyTlsOutboundClient {
         &self, dest: &Destination,
     ) -> Result<Box<dyn StreamRelay>, Box<dyn std::error::Error>> {
         let target = dest.to_string();
-        let guard = self.ensure_session()?;
-        let stream = guard.as_ref().unwrap().open_stream(&target)?;
+        let session = self.tcp_pool.acquire(|| self.create_session())?;
+        let stream = session.open_stream(&target)?;
         Ok(Box::new(AnyTlsStreamRelay::new(stream)))
     }
 
     async fn dial_udp(
         &self, initial_dest: &Destination,
     ) -> Result<Box<dyn PacketRelay>, Box<dyn std::error::Error>> {
-        let guard = self.ensure_udp_session()?;
+        let session = self.udp_pool.acquire(|| self.create_session())?;
         let magic = magic_address_with_port();
-        let stream = guard.as_ref().unwrap().open_stream(&magic)?;
+        let stream = session.open_stream(&magic)?;
 
         let req = encode_request(false, initial_dest)?;
         stream.write(&req)?;
@@ -911,41 +995,12 @@ impl OutboundClient for AnyTlsOutboundClient {
     }
 }
 
-impl AnyTlsOutboundClient {
-    /// Reuse the current session if alive; otherwise build a fresh one.
-    fn ensure_session(
-        &self,
-    ) -> std::io::Result<std::sync::MutexGuard<'_, Option<SessionHandle>>> {
-        let mut guard = self.session.lock().unwrap();
-        let need_new = match &*guard {
-            Some(s) => s.is_closed(),
-            None => true,
-        };
-        if need_new {
-            if guard.is_some() {
-                log::debug!("anytls session closed, creating new one");
-            }
-            let session = self.create_session()?;
-            *guard = Some(session);
-        }
-        Ok(guard)
-    }
-
-    /// Separate session for UDP traffic — avoids head-of-line blocking from
-    /// TCP streams on the main session.
-    fn ensure_udp_session(
-        &self,
-    ) -> std::io::Result<std::sync::MutexGuard<'_, Option<SessionHandle>>> {
-        let mut guard = self.udp_session.lock().unwrap();
-        let need_new = match &*guard {
-            Some(s) => s.is_closed(),
-            None => true,
-        };
-        if need_new {
-            let session = self.create_session()?;
-            *guard = Some(session);
-        }
-        Ok(guard)
+impl Drop for AnyTlsOutboundClient {
+    fn drop(&mut self) {
+        // Shut down session pools: close all sessions and abort cleanup
+        // tasks so tokio runtime shutdown doesn't hang.
+        self.tcp_pool.shutdown();
+        self.udp_pool.shutdown();
     }
 }
 

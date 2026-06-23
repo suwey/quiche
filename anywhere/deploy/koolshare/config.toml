@@ -18,7 +18,9 @@ tag = "tun-in"
 # name = "tun0"
 # addr = "10.0.0.1/24"
 # mtu = 1500
-# Auto set iptables for dns
+# Auto set iptables for tun, advance user can set false and manage all ip route & rules.
+# auto_route = true
+# Auto set iptables for dns, no effect when aute_route=false
 # auto_hijack = true
 # WAN ifaces are monitored dynamically and only get `from <wan_ip>` rules.
 # No effect when auto_hijack=false, linux desktop no need this
@@ -90,6 +92,26 @@ outbound = "none" # drop the traffic
 [[rules]]
 # some software use other ports such as Xunlei, recommend set direct mode in ui when download.
 protocol = "bittorrent" # tcp:6881,6889 && udp:6881,
+outbound = "direct"
+
+[[rules]]
+# NTP
+protocol = "udp:123"
+outbound = "direct"
+
+[[rules]]
+# mDNS
+protocol = "udp:5353"
+outbound = "direct"
+
+[[rules]]
+# NetBIOS
+protocol = "udp:137,139"
+outbound = "direct"
+
+[[rules]]
+# DHCP
+protocol = "udp:67,68"
 outbound = "direct"
 
 [[rules]]

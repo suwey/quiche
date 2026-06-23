@@ -2,13 +2,16 @@
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use anywhere::config::Config;
+use anywhere::context::AppContext;
 use anywhere::inbound::Inbound;
 use anywhere::inbound::InboundConn;
+use anywhere::inbound::anytls::AnytlsInbound;
 use anywhere::inbound::quic::QuicInbound;
 use anywhere::inbound::socks5::Socks5Inbound;
 use anywhere::outbound::registry::OutboundRegistry;
@@ -88,11 +91,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     #[cfg(target_os = "linux")]
     {
-        let has_tun_with_hijack =
-            config.inbounds_by_type("tun").iter().any(|c| c.auto_hijack);
-        if has_tun_with_hijack {
-            anywhere::inbound::tun::cleanup_stale_routing();
-        }
+        anywhere::inbound::tun::cleanup_stale_routing();
     }
 
     log::info!("Loaded config from {}", args.config);
@@ -124,8 +123,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut tasks = Vec::new();
 
-    // --- UI server + stats ticker (only when [ui] is configured) ------------
-    let stats = if config.ui.listen.is_some() {
+    // --- Command bus and event bus (always created, used when UI is active) ---
+    let (cmd_tx, mut cmd_rx) =
+        tokio::sync::mpsc::channel::<anywhere::command::UiCommand>(64);
+    let (event_tx, _event_rx) =
+        tokio::sync::broadcast::channel::<anywhere::command::StateEvent>(64);
+
+    #[allow(unused_mut)]
+    let mut ctx = if config.ui.listen.is_some() {
         let current_memory: fn() -> u64 = if cfg!(target_os = "linux") {
             ui_state::read_linux_memory
         } else if cfg!(target_os = "macos") {
@@ -134,12 +139,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             || 0
         };
         let stats = AppStats::new(current_memory);
-
-        let ui_config = config.ui.clone();
         let logs_tx = logs_tx.unwrap();
         let start_cmd = args.start_cmd.clone();
-        let stats_clone = Arc::clone(&stats);
-        let rules_clone = rules.clone();
 
         let outbound_tags: Vec<(String, String)> = config
             .outbounds
@@ -149,31 +150,70 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .collect();
 
         let urltest_states = registry.urltest_states.clone();
-        let registry_for_ui = Arc::clone(&registry);
 
+        let ctx = AppContext::new(
+            registry.clone(),
+            rules.clone(),
+            stats.clone(),
+            logs_tx,
+            start_cmd,
+            outbound_tags,
+            urltest_states,
+            cmd_tx,
+            event_tx,
+        );
+
+        let ui_config = config.ui.clone();
+        let ctx_for_ui = ctx.clone();
         tasks.push(tokio::spawn(async move {
-            anywhere::ui::start(
-                ui_config,
-                stats_clone,
-                rules_clone,
-                logs_tx,
-                start_cmd,
-                outbound_tags,
-                urltest_states,
-                registry_for_ui,
-            )
-            .await;
+            anywhere::ui::start(ui_config, ctx_for_ui).await;
         }));
 
-        let stats_ticker = Arc::clone(&stats);
+        let stats_ticker = stats.clone();
         tasks.push(tokio::spawn(async move {
             stats_ticker_task(stats_ticker).await;
         }));
 
-        stats
+        ctx
     } else {
-        AppStats::new(|| 0)
+        let (logs_tx, _) =
+            tokio::sync::broadcast::channel::<anywhere::ui::log::LogMsg>(1);
+        AppContext::new(
+            registry.clone(),
+            rules.clone(),
+            AppStats::new(|| 0),
+            logs_tx,
+            String::new(),
+            Vec::new(),
+            HashMap::new(),
+            cmd_tx,
+            event_tx,
+        )
     };
+
+    // --- Actor: process UiCommands from the UI -----------------------------
+    {
+        let ctx_for_actor = ctx.clone();
+        tasks.push(tokio::spawn(async move {
+            use anywhere::command::UiCommand;
+            while let Some(cmd) = cmd_rx.recv().await {
+                match cmd {
+                    UiCommand::SetMode(mode, tx) => {
+                        let ok = ctx_for_actor.rules.set_mode(mode);
+                        let _ = tx.send(ok);
+                    },
+                    UiCommand::TunSetRouting(enable, tx) => {
+                        let result = if enable {
+                            ctx_for_actor.tun_routing_enable()
+                        } else {
+                            ctx_for_actor.tun_routing_disable()
+                        };
+                        let _ = tx.send(result);
+                    },
+                }
+            }
+        }));
+    }
 
     // --- TUN mode check: when TUN is configured, skip other inbounds --------
     let has_tun =
@@ -193,12 +233,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         match Socks5Inbound::new(listen).await {
             Ok(inbound) => {
                 log::info!("Starting SOCKS5 inbound on {listen}");
-                tasks.push(tokio::spawn(run_inbound(
-                    inbound,
-                    registry.clone(),
-                    rules.clone(),
-                    Arc::clone(&stats),
-                )));
+                tasks.push(tokio::spawn(run_inbound(inbound, ctx.clone())));
             },
             Err(e) => {
                 log::error!("Failed to bind SOCKS5 inbound on {listen}: {e}");
@@ -218,15 +253,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         match QuicInbound::from_config(cfg, config.passwords()) {
             Some(inbound) => {
                 log::info!("Starting QUIC inbound");
-                tasks.push(tokio::spawn(run_inbound(
-                    inbound,
-                    registry.clone(),
-                    rules.clone(),
-                    Arc::clone(&stats),
-                )));
+                tasks.push(tokio::spawn(run_inbound(inbound, ctx.clone())));
             },
             None => {
                 log::warn!("QuicInbound::from_config returned None");
+            },
+        }
+    }
+
+    // --- AnyTLS inbounds ---------------------------------------------------
+    for cfg in config.inbounds_by_type("anytls") {
+        if has_tun {
+            log::warn!(
+                "TUN inbound active -- skipping anytls inbounds \
+                 (all traffic already proxied via TUN)"
+            );
+            break;
+        }
+        match AnytlsInbound::from_config(cfg, config.passwords()) {
+            Some(inbound) => {
+                log::info!("Starting anytls inbound");
+                tasks.push(tokio::spawn(run_inbound(inbound, ctx.clone())));
+            },
+            None => {
+                log::warn!("AnytlsInbound::from_config returned None");
             },
         }
     }
@@ -283,12 +333,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         dns_cfg.direct,
                         dns_cfg.remote
                     );
-                    tasks.push(tokio::spawn(run_inbound(
-                        inbound,
-                        registry.clone(),
-                        rules.clone(),
-                        Arc::clone(&stats),
-                    )));
+                    tasks.push(tokio::spawn(run_inbound(inbound, ctx.clone())));
                     last_guard = Some(guard);
                 },
                 Err(e) => {
@@ -300,6 +345,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     #[cfg(not(target_os = "linux"))]
     let _tun_guard: Option<anywhere::inbound::tun::TunGuard> = None;
+
+    // Inject TUN manager into context (if TUN is active).
+    #[cfg(target_os = "linux")]
+    if let Some(ref guard) = _tun_guard {
+        if let Some(mgr) = guard.tun_mgr() {
+            ctx.set_tun_mgr(mgr);
+        }
+    }
 
     if tasks.is_empty() {
         log::warn!("No inbounds configured; nothing to do.");
@@ -367,10 +420,7 @@ async fn stats_ticker_task(stats: Arc<AppStats>) {
 // Per-inbound event loop
 // ---------------------------------------------------------------------------
 
-async fn run_inbound(
-    mut inbound: impl Inbound + 'static, registry: Arc<OutboundRegistry>,
-    rules: Arc<Rules>, stats: Arc<AppStats>,
-) {
+async fn run_inbound(mut inbound: impl Inbound + 'static, ctx: AppContext) {
     loop {
         let Some(conn) = inbound.accept().await else {
             log::warn!("Inbound accept returned None, retrying in 1s...");
@@ -378,9 +428,7 @@ async fn run_inbound(
             continue;
         };
 
-        let registry = Arc::clone(&registry);
-        let rules = Arc::clone(&rules);
-        let stats = Arc::clone(&stats);
+        let ctx = ctx.clone();
 
         tokio::spawn(async move {
             let destination = conn.destination().clone();
@@ -390,7 +438,7 @@ async fn run_inbound(
             let dest_port = destination.port.to_string();
             let source = conn.source();
 
-            let rule_match = match rules.match_conn(&destination, network) {
+            let rule_match = match ctx.rules.match_conn(&destination, network) {
                 Some(m) => m,
                 None => {
                     log::warn!("No rule for {destination} ({network}), dropping");
@@ -399,7 +447,7 @@ async fn run_inbound(
             };
             let tag = &rule_match.outbound_tag;
 
-            let client = match registry.get(&tag) {
+            let client = match ctx.registry.get(&tag) {
                 Some(c) => c,
                 None => {
                     log::warn!("No outbound tag '{tag}'");
@@ -409,7 +457,7 @@ async fn run_inbound(
 
             let conn_id = Uuid::new_v4().to_string();
             let counters = ui_state::ConnCounters::new_arc();
-            let tag_stats = stats.get_or_create_tag(&tag).await;
+            let tag_stats = ctx.stats.get_or_create_tag(&tag).await;
 
             let info = ui_state::Connection {
                 id: conn_id.clone(),
@@ -431,7 +479,7 @@ async fn run_inbound(
                 rule: rule_match.description.clone(),
             };
 
-            stats
+            ctx.stats
                 .add_connection(conn_id.clone(), Arc::clone(&counters), info)
                 .await;
 
@@ -451,14 +499,14 @@ async fn run_inbound(
                         Err(msg) => {
                             log::error!("{msg}");
                             let _ = stream.shutdown().await;
-                            stats.remove_connection(&conn_id).await;
+                            ctx.stats.remove_connection(&conn_id).await;
                             return;
                         },
                     };
 
                     let mut counted_out = CountedStreamRelay {
                         inner: out,
-                        stats: Arc::clone(&stats),
+                        stats: Arc::clone(&ctx.stats),
                         conn_counters: Arc::clone(&counters),
                         tag_stats: Arc::clone(&tag_stats),
                     };
@@ -483,7 +531,7 @@ async fn run_inbound(
                         Ok(o) => o,
                         Err(msg) => {
                             log::error!("{msg}");
-                            stats.remove_connection(&conn_id).await;
+                            ctx.stats.remove_connection(&conn_id).await;
                             // If fd exhausted, sleep briefly to let the
                             // TUN handler's backpressure kick in.
                             if msg.contains("No file descriptors") {
@@ -496,7 +544,7 @@ async fn run_inbound(
 
                     let mut counted_out = CountedPacketRelay {
                         inner: out,
-                        stats: Arc::clone(&stats),
+                        stats: Arc::clone(&ctx.stats),
                         conn_counters: Arc::clone(&counters),
                         tag_stats: Arc::clone(&tag_stats),
                     };
@@ -507,7 +555,7 @@ async fn run_inbound(
                 },
             }
 
-            stats.remove_connection(&conn_id).await;
+            ctx.stats.remove_connection(&conn_id).await;
         });
     }
 }

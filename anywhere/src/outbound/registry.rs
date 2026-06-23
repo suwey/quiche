@@ -6,6 +6,7 @@ use crate::config::OutboundConfig;
 use crate::outbound::OutboundClient;
 use crate::outbound::anytls::AnyTlsOutboundClient;
 use crate::outbound::direct::DirectOutboundClient;
+use crate::outbound::mless::MlessOutboundClient;
 use crate::outbound::quic::QuicOutboundClient;
 use crate::outbound::ssh::SshOutboundClient;
 use crate::outbound::urltest::UrlTestOutboundClient;
@@ -108,6 +109,20 @@ impl OutboundRegistry {
                 Err(e) => {
                     log::error!(
                         "failed to init ssh outbound '{}': {e}",
+                        Self::tag(cfg).unwrap_or("?"),
+                    );
+                },
+            }
+        }
+
+        for cfg in config.outbounds.iter().filter(|o| o.type_ == "mless") {
+            match MlessOutboundClient::from_config(vec![cfg]).await {
+                Ok(client) => {
+                    clients.insert(Self::tag(cfg)?.to_string(), Arc::new(client));
+                },
+                Err(e) => {
+                    log::error!(
+                        "failed to init mless outbound '{}': {e}",
                         Self::tag(cfg).unwrap_or("?"),
                     );
                 },

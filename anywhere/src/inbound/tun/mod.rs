@@ -22,6 +22,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+#[cfg(target_os = "linux")]
+pub use platform::linux::BYPASS_FWMARK;
+#[cfg(target_os = "linux")]
+pub use platform::linux::TunRouteManager;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
@@ -29,9 +33,6 @@ use tokio::sync::Mutex;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
-
-#[cfg(target_os = "linux")]
-pub use platform::linux::BYPASS_FWMARK;
 
 use crate::config::InboundConfig;
 use crate::dns::DnsHijack;
@@ -59,6 +60,11 @@ pub struct TunConfig {
     /// Automatically manage routing and iptables. True for router environments.
     /// Set to false on desktop Linux (only the TUN device is created).
     pub auto_hijack: bool,
+    /// Automatically manage policy routing rules (`ip rule`/`ip route`).
+    /// When false, only the TUN device is created; no routing rules are
+    /// installed. Cleanup of stale rules from previous runs still happens
+    /// at startup. Default: true.
+    pub auto_route: bool,
     /// WAN interfaces to monitor for `from <wan_ip> lookup main` bypass rules.
     pub monitor_wan_ifaces: Vec<String>,
     /// LAN interfaces to install `from <ip>` / `to <subnet>` bypass rules for.
@@ -89,6 +95,7 @@ impl TunConfig {
         if mask_len > max_prefix {
             return Err(format!("invalid addr prefix: {mask_len}"));
         }
+        let auto_route = cfg.auto_route;
 
         let mtu = cfg.mtu.unwrap_or(1500);
 
@@ -105,6 +112,7 @@ impl TunConfig {
             mtu,
             name,
             auto_hijack,
+            auto_route,
             monitor_wan_ifaces,
             bypass_lan_ifaces,
             local_direct,
@@ -124,9 +132,48 @@ pub struct TunInbound {
 /// is guaranteed to run when main() returns.
 pub struct TunGuard {
     #[cfg(target_os = "linux")]
-    _inner: platform::linux::TunRouteManager,
+    _inner: Option<Arc<std::sync::Mutex<TunRouteManager>>>,
     #[cfg(not(target_os = "linux"))]
     _inner: (),
+}
+
+impl TunGuard {
+    /// Return a clone of the inner TUN route manager, if available.
+    #[cfg(target_os = "linux")]
+    pub fn tun_mgr(&self) -> Option<Arc<std::sync::Mutex<TunRouteManager>>> {
+        self._inner.clone()
+    }
+}
+
+impl Drop for TunGuard {
+    fn drop(&mut self) {
+        #[cfg(target_os = "linux")]
+        if let Some(mgr) = self._inner.take() {
+            if let Ok(mut mgr) = mgr.lock() {
+                mgr.cleanup_routing();
+
+                let output = std::process::Command::new("ip")
+                    .args(["link", "delete", &mgr.iface_name])
+                    .output();
+                match output {
+                    Ok(out) if out.status.success() => {
+                        log::info!("TUN interface {} deleted", mgr.iface_name);
+                    },
+                    Ok(out) => {
+                        let stderr = String::from_utf8_lossy(&out.stderr);
+                        log::warn!(
+                            "Failed to delete TUN interface {}: {}",
+                            mgr.iface_name,
+                            stderr.trim()
+                        );
+                    },
+                    Err(e) => {
+                        log::warn!("Failed to run ip link delete: {e}");
+                    },
+                }
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -219,6 +266,7 @@ impl TunInbound {
                 link_index,
                 addr,
                 name.clone(),
+                config.auto_hijack,
                 monitor_wan_ifaces,
                 bypass_lan_ifaces,
             );
@@ -229,8 +277,10 @@ impl TunInbound {
                 );
             }
 
-            if let Err(e) = mgr.setup_routing(config.auto_hijack) {
-                log::warn!("Failed to set up routing: {e}");
+            if config.auto_route {
+                if let Err(e) = mgr.setup_routing(config.auto_hijack) {
+                    log::warn!("Failed to set up routing: {e}");
+                }
             }
 
             // Start DNS loopback listener only when auto-hijack installs
@@ -242,8 +292,8 @@ impl TunInbound {
                     hijack.start_hijack_listener();
                 }
             }
-
-            TunGuard { _inner: mgr }
+            let mgr = Arc::new(std::sync::Mutex::new(mgr));
+            TunGuard { _inner: Some(mgr) }
         };
 
         #[cfg(not(target_os = "linux"))]

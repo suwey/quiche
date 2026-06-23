@@ -27,8 +27,32 @@ Set socks5://127.0.0.1:1080 and test.
 5. Implemented useful clash api for [MetaCudeXD](https://github.com/MetaCubeX/metacubexd/releases/): most info APIs, global mode change, `Restart Core` by start command setted by -s option (default is systemctl, will call systemctl restart [exename]). 
 
 6. Urltest outbound as auto selector, domain and geo rules, tun inbound.
-7. Vless outbound, tls + ws mode for [edgetunnel](https://github.com/cmliu/edgetunnel), hide sensitive characters and back up as `deploy/openclaw`, can deploy to cloudflare pages or worker.
+7. Vless outbound, tls + ws mode for [edgetunnel](https://github.com/cmliu/edgetunnel), hide sensitive characters and back up as `deploy/openclaw`, can deploy to cloudflare pages (workers domain maybe blocked).
 8. Fake ip, auto enabled by tun inbound.
+9. Auto monitor wan ifaces and bypass lan ifaces.
+10. Mless outbound, my multiplex protocol based on vless, deploy `deploy/hermes` to cloudflare workers:
+```
+npm install -g wrangler
+npm install
+npm run deploy
+# set login password
+npx wrangler secret put ADMIN
+```
+Add a custom domain in cloudflare dashboard then login at https://custom.domain.not.blocked/login, config is same as vless, only type is `mless`:
+```
+[[outbounds]]
+type = "mless"
+tag = "CF"
+# click sub button after login, pick one from url like vless://xxxx-xxx-xx-xx@s.s.s.s:1334?......
+server = "s.s.s.s:1334"
+password = "xxxx-xxx-xx-xx"
+sni = "custom.domain.not.blocked"
+fp = true
+transport_type = "ws"
+transport_path = "/"
+transport_headers.Host = "custom.domain.not.blocked"
+```
+Recommend to deploy `openclaw` and `hermes` both, cloudflare's free plan will be very enough to use.
 
 ## Deploy to arm64 router running koolshare with jffs enabled
 Tun inbound only support linux now and need ip & iptables commands (as root), other platform will just ignore it and only support anytls servers now. Config is very simple and most default setted, see `deploy/koolshare/config.toml`, build for arm64 router:

@@ -227,8 +227,12 @@ pub async fn bidirectional_relay(
         let b2 = &mut *(b as *mut dyn StreamRelay);
 
         tokio::select! {
-            _ = copy_one_way(a1, b1) => {},
-            _ = copy_one_way(b2, a2) => {},
+            _ = copy_one_way(a1, b1) => {
+                log::debug!("relay: direction A→B completed first");
+            },
+            _ = copy_one_way(b2, a2) => {
+                log::debug!("relay: direction B→A completed first");
+            },
         }
     }
 
@@ -246,11 +250,17 @@ async fn copy_one_way(src: &mut dyn StreamRelay, dst: &mut dyn StreamRelay) {
                 let _ = dst.shutdown().await;
                 break;
             },
-            Ok(n) =>
+            Ok(n) => {
                 if dst.write(&buf[..n]).await.is_err() {
                     break;
-                },
-            Err(_) => break,
+                }
+            },
+            Err(e) => {
+                log::debug!(
+                    "relay: copy_one_way src read error {e}, breaking"
+                );
+                break;
+            },
         }
     }
 }

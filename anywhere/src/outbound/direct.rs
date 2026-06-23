@@ -127,7 +127,6 @@ impl OutboundClient for DirectOutboundClient {
     ) -> Result<Box<dyn PacketRelay>, Box<dyn std::error::Error>> {
         let bind_addr: std::net::SocketAddr = "0.0.0.0:0".parse().unwrap();
         let socket = bind_udp_bypass(bind_addr).await?;
-        log::info!("direct udp outbound ready");
         Ok(Box::new(DirectUdpRelay::new(
             socket,
             DIRECT_UDP_IDLE_TIMEOUT,

@@ -5,6 +5,9 @@
 .claude
 .cursor
 .codegraph
-docs
 .env
 reasonix.toml
+.mimocode
+.qoder
+**/.wrangler
+**/node_modules

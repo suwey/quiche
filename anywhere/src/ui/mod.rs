@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::Router;
@@ -20,13 +19,8 @@ use tower_http::cors::CorsLayer;
 use tower_http::services::ServeDir;
 
 use serde::Deserialize;
-use tokio::sync::broadcast;
 
 use crate::config::UiConfig;
-use crate::outbound::registry::OutboundRegistry;
-use crate::rules::Rules;
-
-use self::log::LogMsg;
 
 pub mod log;
 pub mod state;
@@ -40,41 +34,24 @@ fn mode_str(n: u8) -> &'static str {
     MODE_LIST[n as usize]
 }
 
+use crate::context::AppContext;
+
 /// Shared application state for axum.
 pub struct UiState {
-    pub stats: Arc<AppStats>,
+    pub ctx: AppContext,
     pub config: UiConfig,
-    pub rules: Arc<Rules>,
-    pub logs_tx: broadcast::Sender<LogMsg>,
-    pub start_cmd: String,
-    pub outbound_tags: Vec<(String, String)>,
-    pub urltest_states:
-        HashMap<String, Arc<crate::outbound::urltest::UrlTestState>>,
-    pub registry: Arc<OutboundRegistry>,
 }
 
 /// Start the UI HTTP server. Never returns (runs until SIGINT).
-pub async fn start(
-    config: UiConfig, stats: Arc<AppStats>, rules: Arc<Rules>,
-    logs_tx: broadcast::Sender<LogMsg>, start_cmd: String,
-    outbound_tags: Vec<(String, String)>,
-    urltest_states: HashMap<String, Arc<crate::outbound::urltest::UrlTestState>>,
-    registry: Arc<OutboundRegistry>,
-) {
+pub async fn start(config: UiConfig, ctx: AppContext) {
     let listen = config
         .listen
         .clone()
         .unwrap_or_else(|| "127.0.0.1:9090".to_string());
 
     let ui_state = Arc::new(UiState {
-        stats,
+        ctx,
         config: config.clone(),
-        rules,
-        logs_tx: logs_tx.clone(),
-        start_cmd,
-        outbound_tags,
-        urltest_states,
-        registry,
     });
 
     let api_routes = Router::new()
@@ -188,9 +165,12 @@ async fn configs_handler(
 ) -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "allow-lan": false,
-        "mode": mode_str(state.rules.current_mode()),
+        "mode": mode_str(state.ctx.rules.current_mode()),
         "mode-list": MODE_LIST,
         "log-level": self::log::current_level(),
+        "tun": {
+            "enable": state.ctx.tun_routing_enabled(),
+        },
     }))
 }
 
@@ -201,7 +181,7 @@ async fn patch_configs_handler(
     if let Some(mode) = payload.mode {
         if let Some(idx) = MODE_LIST.iter().position(|m| *m == mode) {
             let idx = idx as u8;
-            if !state.rules.set_mode(idx) {
+            if !state.ctx.rules.set_mode(idx) {
                 return (StatusCode::NO_CONTENT, ());
             }
             ::log::info!("Switched mode to {}", mode_str(idx));
@@ -224,7 +204,7 @@ async fn post_restart_handler(
         .to_string_lossy()
         .to_string();
 
-    match std::process::Command::new(&state.start_cmd)
+    match std::process::Command::new(&state.ctx.start_cmd)
         .arg("restart")
         .arg(&service_name)
         .spawn()
@@ -232,7 +212,7 @@ async fn post_restart_handler(
         Ok(_) => {
             ::log::info!(
                 "Restarting via {} restart {}...",
-                state.start_cmd,
+                state.ctx.start_cmd,
                 service_name
             );
             tokio::spawn(async {
@@ -242,7 +222,7 @@ async fn post_restart_handler(
             (StatusCode::NO_CONTENT, ())
         },
         Err(e) => {
-            ::log::error!("Failed to restart via {}: {e}", state.start_cmd);
+            ::log::error!("Failed to restart via {}: {e}", state.ctx.start_cmd);
             (StatusCode::INTERNAL_SERVER_ERROR, ())
         },
     }
@@ -252,6 +232,7 @@ async fn rules_handler(
     State(state): State<Arc<UiState>>,
 ) -> Json<serde_json::Value> {
     let rules: Vec<serde_json::Value> = state
+        .ctx
         .rules
         .list()
         .iter()
@@ -282,13 +263,14 @@ async fn proxies_handler(
 
     // Build the list of all user-configured outbound tags.
     let all_tags: Vec<&str> = state
+        .ctx
         .outbound_tags
         .iter()
         .map(|(tag, _)| tag.as_str())
         .collect();
 
     // GLOBAL group
-    let now_tag = state.rules.global_outbound().to_string();
+    let now_tag = state.ctx.rules.global_outbound().to_string();
     proxies.insert(
         "GLOBAL".into(),
         serde_json::json!({
@@ -304,9 +286,9 @@ async fn proxies_handler(
     // Collect urltest child tags so we skip them at the top level.
     let mut urltest_child_tags: std::collections::HashSet<&str> =
         std::collections::HashSet::new();
-    for (tag, type_) in &state.outbound_tags {
+    for (tag, type_) in &state.ctx.outbound_tags {
         if type_ == "urltest" {
-            if let Some(ut_state) = state.urltest_states.get(tag.as_str()) {
+            if let Some(ut_state) = state.ctx.urltest_states.get(tag.as_str()) {
                 for child_tag in &ut_state.children {
                     urltest_child_tags.insert(child_tag.as_str());
                 }
@@ -316,6 +298,7 @@ async fn proxies_handler(
 
     // Lookup map for outbound type by tag.
     let outbound_type_map: std::collections::HashMap<&str, &str> = state
+        .ctx
         .outbound_tags
         .iter()
         .map(|(tag, type_)| (tag.as_str(), type_.as_str()))
@@ -323,9 +306,9 @@ async fn proxies_handler(
 
     // Top-level entries: urltest nodes (with children embedded) +
     // non-urltest-children.
-    for (tag, type_) in &state.outbound_tags {
+    for (tag, type_) in &state.ctx.outbound_tags {
         if type_ == "urltest" {
-            if let Some(ut_state) = state.urltest_states.get(tag.as_str()) {
+            if let Some(ut_state) = state.ctx.urltest_states.get(tag.as_str()) {
                 let current_idx =
                     ut_state.current.load(std::sync::atomic::Ordering::Relaxed);
                 let now = ut_state
@@ -426,16 +409,19 @@ async fn group_delay_handler(
         };
         (host, port)
     };
-
     let mut timeout_dur = std::time::Duration::from_millis(params.timeout);
 
     // For urltest nodes, each child gets the per-node timeout.
-    if let Some(ut_state) = state.urltest_states.get(&tag) {
+    if let Some(ut_state) = state.ctx.urltest_states.get(&tag) {
         let n = ut_state.children.len().max(1) as u32;
         timeout_dur *= n;
     }
 
-    let client_arc = state.registry.get(&tag).ok_or(StatusCode::BAD_REQUEST)?;
+    let client_arc = state
+        .ctx
+        .registry
+        .get(&tag)
+        .ok_or(StatusCode::BAD_REQUEST)?;
 
     let mut result = serde_json::Map::new();
     let delay =
@@ -453,27 +439,27 @@ async fn group_delay_handler(
 async fn ws_traffic_handler(
     ws: WebSocketUpgrade, State(state): State<Arc<UiState>>,
 ) -> impl IntoResponse {
-    let rx = state.stats.traffic_tx.subscribe();
+    let rx = state.ctx.stats.traffic_tx.subscribe();
     ws.on_upgrade(move |socket| ws::handle_traffic(socket, rx))
 }
 
 async fn ws_memory_handler(
     ws: WebSocketUpgrade, State(state): State<Arc<UiState>>,
 ) -> impl IntoResponse {
-    let rx = state.stats.memory_tx.subscribe();
+    let rx = state.ctx.stats.memory_tx.subscribe();
     ws.on_upgrade(move |socket| ws::handle_memory(socket, rx))
 }
 
 async fn ws_connections_handler(
     ws: WebSocketUpgrade, State(state): State<Arc<UiState>>,
 ) -> impl IntoResponse {
-    let rx = state.stats.connections_tx.subscribe();
+    let rx = state.ctx.stats.connections_tx.subscribe();
     ws.on_upgrade(move |socket| ws::handle_connections(socket, rx))
 }
 
 async fn ws_logs_handler(
     ws: WebSocketUpgrade, State(state): State<Arc<UiState>>,
 ) -> impl IntoResponse {
-    let rx = state.logs_tx.subscribe();
+    let rx = state.ctx.logs_tx.subscribe();
     ws.on_upgrade(move |socket| ws::handle_logs(socket, rx))
 }

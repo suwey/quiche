@@ -61,6 +61,13 @@ pub struct InboundConfig {
     #[serde(default)]
     pub name: Option<String>,
 
+    /// Automatically manage policy routing rules (`ip rule`/`ip route`).
+    /// When false, only the TUN device is created; no routing rules are
+    /// installed. Cleanup of stale rules from previous runs still happens
+    /// at startup. Default: true.
+    #[serde(default = "default_true")]
+    pub auto_route: bool,
+
     /// Automatically manage routing and iptables (bypass fwmark, policy
     /// routing, DNS REDIRECT, etc.). True for router environments. Set to
     /// false on desktop Linux (only the TUN device is created, no ip
@@ -85,9 +92,17 @@ pub struct InboundConfig {
     /// Installed at startup. Only effective when auto_hijack is true.
     #[serde(default)]
     pub bypass_lan_ifaces: Option<Vec<String>>,
+
+    /// Custom padding scheme text for anytls inbound (optional).
+    #[serde(default)]
+    pub padding_scheme: Option<String>,
 }
 
 fn default_auto_hijack() -> bool {
+    true
+}
+
+fn default_true() -> bool {
     true
 }
 fn default_local_direct() -> bool {
@@ -150,6 +165,17 @@ pub struct OutboundConfig {
     /// WebSocket custom headers, e.g. `transport_headers.Host = "..."`.
     #[serde(default)]
     pub transport_headers: Option<HashMap<String, String>>,
+
+    // --- anytls session pool ---
+    /// How often the pool cleanup task runs (seconds, default: 60).
+    pub idle_session_check_interval: Option<u64>,
+
+    /// Sessions idle longer than this are eligible for removal (seconds,
+    /// default: 180).
+    pub idle_session_timeout: Option<u64>,
+
+    /// Minimum number of sessions to keep alive in the pool (default: 2).
+    pub min_idle_session: Option<usize>,
 }
 
 fn default_rule_type() -> String {

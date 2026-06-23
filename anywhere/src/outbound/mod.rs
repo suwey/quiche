@@ -12,6 +12,7 @@ pub mod registry;
 pub mod ssh;
 pub mod urltest;
 
+pub mod mless;
 pub mod vless;
 #[async_trait]
 pub trait OutboundClient: Send + Sync {
@@ -28,7 +29,7 @@ pub trait OutboundClient: Send + Sync {
     async fn dial_udp(
         &self, _initial_dest: &Destination,
     ) -> Result<Box<dyn PacketRelay>, Box<dyn std::error::Error>> {
-        Err("UDP not supported by this outbound".into())
+        Err(crate::outbound::common::ERR_UDP_NOT_SUPPORTED.into())
     }
 
     /// Measure round-trip latency to `host:port` by creating a fresh connection

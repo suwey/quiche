@@ -1,0 +1,22 @@
+compatibility_date = "2026-06-13"
+compatibility_flags = ["nodejs_compat"]
+name = "hermes-agent-dispatcher"
+main = "src/index.ts"
+keep_vars = true
+
+[[durable_objects.bindings]]
+name = "HERMES_AGENT_DISPATCHER"
+class_name = "HermesAgentDispatcher"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = [ "HermesAgentDispatcher" ]
+
+[dev]
+port = 8787
+local_protocol = "https"
+
+[observability.logs]
+enabled = true
+invocation_logs = true
+
