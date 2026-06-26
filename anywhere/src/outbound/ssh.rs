@@ -690,34 +690,8 @@ impl OutboundClient for SshOutboundClient {
         self.try_dial_udp().await
     }
 
-    async fn test_latency(&self, host: &str, port: u16) -> Option<u64> {
-        self.ensure_running().await.ok()?;
-
-        let dest = if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-            let addr = match ip {
-                std::net::IpAddr::V4(v4) => Address::Ipv4(v4.octets()),
-                std::net::IpAddr::V6(v6) => Address::Ipv6(v6.octets()),
-            };
-            Destination {
-                address: addr,
-                port,
-                resolved_ip: None,
-            }
-        } else {
-            Destination {
-                address: Address::Domain(host.to_string()),
-                port,
-                resolved_ip: None,
-            }
-        };
-
-        match self.try_connect_latency(&dest).await {
-            Some(elapsed) => Some(elapsed),
-            None => {
-                log::warn!("ssh outbound: test_latency failed, may be stale");
-                None
-            },
-        }
+    async fn test_latency(&self, _host: &str, _port: u16) -> Option<u64> {
+        None
     }
 }
 
@@ -836,31 +810,6 @@ impl SshOutboundClient {
         }))
     }
 
-    /// Connect and do latency measurement.
-    async fn try_connect_latency(&self, dest: &Destination) -> Option<u64> {
-        let start = Instant::now();
-        let mut stream = tokio::time::timeout(
-            Duration::from_secs(5),
-            crate::outbound::common::connect_tcp_bypass(self.current_addr()),
-        )
-        .await
-        .ok()?
-        .ok()?;
-
-        tokio::time::timeout(
-            PROXY_CONNECT_TIMEOUT,
-            Self::proxy_connect(self.proxy_type, &mut stream, dest),
-        )
-        .await
-        .ok()?
-        .ok()?;
-
-        let elapsed = start.elapsed().as_millis() as u64;
-        let _ = stream
-            .into_std()
-            .map(|s| s.shutdown(std::net::Shutdown::Both));
-        Some(elapsed)
-    }
 }
 
 // Add socks5_udp_associate back — it was removed during the proxy_type
@@ -1093,6 +1042,9 @@ mod tests {
             transport_type: None,
             transport_path: None,
             transport_headers: None,
+            idle_session_check_interval: None,
+            idle_session_timeout: None,
+            min_idle_session: None,
         };
         assert!(SshOutboundClient::from_config(&cfg).await.is_err());
     }
@@ -1117,6 +1069,9 @@ mod tests {
             transport_type: None,
             transport_path: None,
             transport_headers: None,
+            idle_session_check_interval: None,
+            idle_session_timeout: None,
+            min_idle_session: None,
         };
         assert!(SshOutboundClient::from_config(&cfg).await.is_err());
     }
@@ -1138,6 +1093,9 @@ mod tests {
             url: None,
             mux: false,
             insecure: false,
+            idle_session_check_interval: None,
+            idle_session_timeout: None,
+            min_idle_session: None,
             transport_type: None,
             transport_path: None,
             transport_headers: None,

@@ -5,7 +5,7 @@
 ## A rust client for router.
 
 1. Real BoringSsl fingerprint.
-2. Socks5 inbound.
+2. Socks5 inbound. most platform can use it.
 3. Simple quic with auth inbound & outbound.
 
 ```
@@ -24,26 +24,33 @@ RUST_LOG=debug cargo run -p anywhere --bin anywhere -- -c anywhere/config/anytls
 
 Set socks5://127.0.0.1:1080 and test.
 
-5. Implemented useful clash api for [MetaCudeXD](https://github.com/MetaCubeX/metacubexd/releases/): most info APIs, global mode change, `Restart Core` by start command setted by -s option (default is systemctl, will call systemctl restart [exename]). 
+5. Implemented useful clash api for [MetaCudeXD](https://github.com/MetaCubeX/metacubexd/releases/): most info APIs, global mode change (auto disable tun when mode direct, enable tun when mode rule/global), `Restart Core` by start command setted by -s option (default is systemctl, will call systemctl restart [exename]). 
 
-6. Urltest outbound as auto selector, domain and geo rules, tun inbound.
-7. Vless outbound, tls + ws mode for [edgetunnel](https://github.com/cmliu/edgetunnel), hide sensitive characters and back up as `deploy/openclaw`, can deploy to cloudflare pages (workers domain maybe blocked).
-8. Fake ip, auto enabled by tun inbound.
-9. Auto monitor wan ifaces and bypass lan ifaces.
+6. Urltest outbound as auto selector, domain and geo rules, tun inbound (linux only).
+7. Fake ip, DNS hijack auto enabled by tun inbound.
+8. Auto monitor wan ifaces and bypass lan ifaces.
+9. Vless outbound, tls + ws mode for [edgetunnel](https://github.com/cmliu/edgetunnel), hide sensitive characters and back up as `deploy/openclaw`, can deploy to cloudflare pages (workers domain has been blocked).
 10. Mless outbound, my multiplex protocol based on vless, deploy `deploy/hermes` to cloudflare workers:
 ```
+cd anywehre/deploy/hermes
 npm install -g wrangler
+# login to cloudflare
+wrangler login
 npm install
 npm run deploy
 # set login password
 npx wrangler secret put ADMIN
+# deploy again after change env
+npm run deploy
 ```
-Add a custom domain in cloudflare dashboard then login at https://custom.domain.not.blocked/login, config is same as vless, only type is `mless`:
+Add a custom.domain.not.blocked to worker in cloudflare dashboard, then login at https://custom.domain.not.blocked/login, config is same as vless, only type is `mless`:
 ```
 [[outbounds]]
 type = "mless"
 tag = "CF"
-# click sub button after login, pick one from url like vless://xxxx-xxx-xx-xx@s.s.s.s:1334?......
+# copy and open url https://custom.domain.not.blocked/sub?token=xxxxxxxxxxxxx after login
+# pick one from urls like vless://xxxx-xxx-xx-xx@s.s.s.s:1334?......
+# if blocked by some websites, change to another one
 server = "s.s.s.s:1334"
 password = "xxxx-xxx-xx-xx"
 sni = "custom.domain.not.blocked"
@@ -52,10 +59,10 @@ transport_type = "ws"
 transport_path = "/"
 transport_headers.Host = "custom.domain.not.blocked"
 ```
-Recommend to deploy `openclaw` and `hermes` both, cloudflare's free plan will be very enough to use.
+Recommend to deploy `openclaw` and `hermes` both, cloudflare's free plan will be very enough to use. Many thanks to @cmliu for [edgetunnel](https://github.com/cmliu/edgetunnel), see it for more info.
 
 ## Deploy to arm64 router running koolshare with jffs enabled
-Tun inbound only support linux now and need ip & iptables commands (as root), other platform will just ignore it and only support anytls servers now. Config is very simple and most default setted, see `deploy/koolshare/config.toml`, build for arm64 router:
+Tun inbound only support linux now and need ip & iptables commands (as root), other platform will just ignore it, config is very simple and most are setted, linux desktop can use too, see [config.toml](./anywhere/deploy/koolshare/config.toml), build for arm64 router:
 ```
 cargo zigbuild -p anywhere --target aarch64-unknown-linux-musl --release
 ```
@@ -77,9 +84,9 @@ scp -O S99anywhere.sh 192.168.1.1:/koolshare/init.d/
 cd /jffs/anywhere && chmod +x anywhere*
 ./anywhere.sh start
 ```
-Confirm works fine before reboot, if can't work, ctrl+c or ./anywhere.sh stop, check config.toml and try again. If realy can not work, `rm -rf /koolshare/init.d/S99anywhere.sh` then reboot.
+Confirm works fine before reboot, if can't work, ctrl+c or ./anywhere.sh stop, check config.toml and try again. If really can not work, `rm -rf /koolshare/init.d/S99anywhere.sh` then reboot.
 
-4. Open UI at http://192.168.1.1:9090 to see infos, can change mode to drect or global and restart core in config page.
+4. Open UI at http://192.168.1.1:9090 to see infos, can change mode to drect or rule/global or restart core in config page.
 
 
 ## Notice

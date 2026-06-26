@@ -234,6 +234,9 @@ mod tests {
             mux: false,
             transport_type: None,
             transport_path: None,
+            idle_session_check_interval: None,
+            idle_session_timeout: None,
+            min_idle_session: None,
             transport_headers: None,
         }
     }

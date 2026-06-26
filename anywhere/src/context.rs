@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 #[cfg(target_os = "linux")]
 use std::sync::Mutex;
-use std::sync::atomic::AtomicBool;
+#[cfg(target_os = "linux")]
 use std::sync::atomic::Ordering;
 
 use tokio::sync::broadcast;
@@ -44,9 +44,7 @@ pub struct AppContext {
     pub event_tx: broadcast::Sender<StateEvent>,
     #[cfg(target_os = "linux")]
     tun_mgr: Option<Arc<Mutex<TunRouteManager>>>,
-    tun_routing_enabled: AtomicBool,
 }
-
 impl Clone for AppContext {
     fn clone(&self) -> Self {
         Self {
@@ -61,9 +59,6 @@ impl Clone for AppContext {
             event_tx: self.event_tx.clone(),
             #[cfg(target_os = "linux")]
             tun_mgr: self.tun_mgr.clone(),
-            tun_routing_enabled: AtomicBool::new(
-                self.tun_routing_enabled.load(Ordering::Acquire),
-            ),
         }
     }
 }
@@ -89,7 +84,6 @@ impl AppContext {
             event_tx,
             #[cfg(target_os = "linux")]
             tun_mgr: None,
-            tun_routing_enabled: AtomicBool::new(false),
         }
     }
 
@@ -99,30 +93,59 @@ impl AppContext {
         self.tun_mgr = Some(mgr);
     }
 
-    /// Enable TUN routing using the manager's `auto_hijack` setting.
+    /// Set the routing mode. When TUN is active, automatically enables routing
+    /// for `rule`/`global` modes and disables it for `direct` mode.
+    pub fn set_mode(&self, mode: u8) -> bool {
+        let changed = self.rules.set_mode(mode);
+        if changed {
+            match mode {
+                // direct → disable TUN routing (traffic goes directly to WAN).
+                1 => {
+                    let _ = self.tun_routing_disable();
+                },
+                // rule / global → enable TUN routing.
+                0 | 2 => {
+                    let _ = self.tun_routing_enable();
+                },
+                _ => {},
+            }
+        }
+        changed
+    }
+
+    /// Enable TUN capture using the manager's `auto_hijack` setting.
     #[cfg(target_os = "linux")]
     pub fn tun_routing_enable(&self) -> Result<(), String> {
         let mgr = self.tun_mgr.as_ref().ok_or("TUN manager not available")?;
         let mut mgr = mgr.lock().map_err(|e| e.to_string())?;
         let auto_hijack = mgr.auto_hijack;
-        mgr.setup_routing(auto_hijack).map_err(|e| e.to_string())?;
-        self.tun_routing_enabled.store(true, Ordering::Release);
+        mgr.enable_tun_capture(auto_hijack).map_err(|e| e.to_string())?;
         Ok(())
     }
 
-    /// Disable TUN routing.
+    /// Disable TUN capture without tearing down bypass rules.
     #[cfg(target_os = "linux")]
     pub fn tun_routing_disable(&self) -> Result<(), String> {
         let mgr = self.tun_mgr.as_ref().ok_or("TUN manager not available")?;
         let mut mgr = mgr.lock().map_err(|e| e.to_string())?;
-        mgr.cleanup_routing();
-        self.tun_routing_enabled.store(false, Ordering::Release);
+        mgr.disable_tun_capture();
         Ok(())
     }
 
     /// Check whether TUN routing is currently enabled.
+    #[cfg(target_os = "linux")]
     pub fn tun_routing_enabled(&self) -> bool {
-        self.tun_routing_enabled.load(Ordering::Acquire)
+        self.tun_mgr
+            .as_ref()
+            .and_then(|mgr| mgr.lock().ok())
+            .map(|mgr| mgr.tun_capture.load(Ordering::Acquire))
+            .unwrap_or(false)
+    }
+
+    /// TUN routing is not available on non-Linux.
+    #[cfg(not(target_os = "linux"))]
+    pub fn tun_routing_enabled(&self) -> bool {
+        false
     }
 
     /// Enable TUN routing (no-op on non-Linux).

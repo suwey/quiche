@@ -5,6 +5,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use tokio::net::UdpSocket;
 use tokio::time::Instant;
+#[allow(unused)]
 use tokio::time::timeout;
 use tokio::time::timeout_at;
 
@@ -133,24 +134,8 @@ impl OutboundClient for DirectOutboundClient {
         )))
     }
 
-    async fn test_latency(&self, host: &str, port: u16) -> Option<u64> {
-        let std_addr = resolve_addr(&format!("{host}:{port}")).ok()?;
-        let start = Instant::now();
-        match timeout(
-            std::time::Duration::from_secs(5),
-            connect_tcp_bypass(std_addr),
-        )
-        .await
-        {
-            Ok(Ok(stream)) => {
-                let elapsed = start.elapsed().as_millis() as u64;
-                let _ = stream
-                    .into_std()
-                    .map(|s| s.shutdown(std::net::Shutdown::Both));
-                Some(elapsed)
-            },
-            _ => None,
-        }
+    async fn test_latency(&self, _host: &str, _port: u16) -> Option<u64> {
+        None
     }
 }
 

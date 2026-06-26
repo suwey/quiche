@@ -130,7 +130,7 @@ pub struct OutboundConfig {
     /// TLS SNI for anytls / vless outbound (default: server hostname).
     pub sni: Option<String>,
 
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub fp: bool,
 
     pub ech_config: Option<String>,

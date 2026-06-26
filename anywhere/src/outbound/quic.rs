@@ -3,11 +3,9 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
-use std::time::Instant;
 
 use async_trait::async_trait;
 use quiche::h3::NameValue;
-use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
 use tokio::sync::oneshot;
 use tokio_quiche::http3::driver::ClientEventStream;
@@ -358,59 +356,6 @@ impl OutboundClient for QuicOutboundClient {
     }
 
     async fn test_latency(&self, _host: &str, _port: u16) -> Option<u64> {
-        use tokio_quiche::ConnectionParams;
-        use tokio_quiche::http3::driver::ClientH3Driver;
-        use tokio_quiche::http3::settings::Http3Settings;
-        use tokio_quiche::quic::connect_with_config;
-        use tokio_quiche::settings::Hooks;
-        use tokio_quiche::settings::QuicSettings;
-        use tokio_quiche::socket::Socket;
-
-        use crate::fingerprint::FingerprintHook;
-
-        let start = Instant::now();
-
-        let bind_addr = match self.server_addr {
-            std::net::SocketAddr::V4(_) => "0.0.0.0:0",
-            std::net::SocketAddr::V6(_) => "[::]:0",
-        };
-        let socket = UdpSocket::bind(bind_addr).await.ok()?;
-        socket.connect(self.server_addr).await.ok()?;
-
-        let (h3_driver, _controller) =
-            ClientH3Driver::new(Http3Settings::default());
-        let quic_socket: Socket<_, _> = socket.try_into().ok()?;
-
-        let mut quic_settings = QuicSettings::default();
-        quic_settings.max_idle_timeout = Some(Duration::from_secs(5));
-        quic_settings.verify_peer = false;
-
-        let hooks = Hooks {
-            connection_hook: FingerprintHook::into_arc_option(
-                self.fp,
-                self.ech_config.clone(),
-            ),
-        };
-        let params = ConnectionParams::new_client(quic_settings, None, hooks);
-
-        let result = tokio::time::timeout(
-            Duration::from_secs(10),
-            connect_with_config(
-                quic_socket,
-                Some(&self.server_host),
-                &params,
-                h3_driver,
-            ),
-        )
-        .await;
-
-        match result {
-            Ok(Ok(_conn)) => {
-                let elapsed = start.elapsed().as_millis() as u64;
-                // Drop _conn to close immediately.
-                Some(elapsed)
-            },
-            _ => None,
-        }
+        None
     }
 }

@@ -969,30 +969,6 @@ impl OutboundClient for AnyTlsOutboundClient {
         Ok(Box::new(UotPacketRelay::new(stream)))
     }
 
-    async fn test_latency(&self, _host: &str, _port: u16) -> Option<u64> {
-        let addr = self.addr;
-        let sni = self.sni.clone();
-        let fp = self.fp;
-        let insecure = self.insecure;
-
-        tokio::time::timeout(
-            Duration::from_secs(5),
-            tokio::task::spawn_blocking(move || {
-                use std::time::Instant;
-
-                let start = Instant::now();
-
-                let tcp = connect_tcp_bypass_sync(addr).ok()?;
-                let stream = create_tls_stream(tcp, &sni, fp, insecure).ok()?;
-                let elapsed = start.elapsed().as_millis() as u64;
-                let _ = stream.get_ref().shutdown(std::net::Shutdown::Both);
-                Some(elapsed)
-            }),
-        )
-        .await
-        .ok()?
-        .ok()?
-    }
 }
 
 impl Drop for AnyTlsOutboundClient {

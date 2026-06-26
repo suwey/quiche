@@ -7,20 +7,20 @@ const DRY_RUN = argv.includes('--dry-run');
 const ROOT = new URL('../src/', import.meta.url).pathname;
 
 const REPLACEMENTS = [
-	{ name: 'vless single', from: /'vless'/g, to: 'TOKENS.vless' },
-	{ name: 'vless double', from: /"vless"/g, to: 'TOKENS.vless' },
-	{ name: 'trojan single', from: /'trojan'/g, to: 'TOKENS.trojan' },
-	{ name: 'trojan double', from: /"trojan"/g, to: 'TOKENS.trojan' },
-	{ name: 'tro+jan single', from: /'tro'\s*\+\s*'jan'/g, to: 'TOKENS.trojan' },
-	{ name: 'tro+jan double', from: /"tro"\s*\+\s*"jan"/g, to: 'TOKENS.trojan' },
-	{ name: 'edgetunnel single', from: /'edgetunnel'/g, to: 'TOKENS.edgetunnel' },
-	{ name: 'edgetunnel double', from: /"edgetunnel"/g, to: 'TOKENS.edgetunnel' },
-	{ name: 'edge+tunnel single', from: /'edge'\s*\+\s*'tunnel'/g, to: 'TOKENS.edgetunnel' },
-	{ name: 'cmliu/edge single', from: /'cmliu\/edge'/g, to: 'TOKENS.cmliuEdge' },
-	{ name: 'cmliu/edge double', from: /"cmliu\/edge"/g, to: 'TOKENS.cmliuEdge' },
-	{ name: 'subconverter UA', from: /'Subconverter for \$\{订阅类型\} edgetunnel \(https:\/\/github\.com\/cmliu\/edgetunnel\)'/g, to: "'Subconverter for ${订阅类型} ' + TOKENS.edgetunnel + ' (https://github.com/cmliu/' + TOKENS.edgetunnel + ')'" },
-	{ name: 'subconverter fragment', from: /' edgetunnel \(https:\/\/github\.com\/cmliu\/edgetunnel\)'/g, to: "' ' + TOKENS.edgetunnel + ' (https://github.com/cmliu/' + TOKENS.edgetunnel + ')'" },
-	{ name: 'github UA fragment', from: /'tunnel \(https:\/\/github\.com\/cmliu\/edge'/g, to: "'tunnel (https://github.com/' + TOKENS.cmliuEdge" },
+	{ name: 'vless single', from: /'vless'/g, to: 'TOKENS.V' },
+	{ name: 'vless double', from: /"vless"/g, to: 'TOKENS.V' },
+	{ name: 'trojan single', from: /'trojan'/g, to: 'TOKENS.T' },
+	{ name: 'trojan double', from: /"trojan"/g, to: 'TOKENS.T' },
+	{ name: 'tro+jan single', from: /'tro'\s*\+\s*'jan'/g, to: 'TOKENS.T' },
+	{ name: 'tro+jan double', from: /"tro"\s*\+\s*"jan"/g, to: 'TOKENS.T' },
+	{ name: 'edgetunnel single', from: /'edgetunnel'/g, to: 'TOKENS.E' },
+	{ name: 'edgetunnel double', from: /"edgetunnel"/g, to: 'TOKENS.E' },
+	{ name: 'edge+tunnel single', from: /'edge'\s*\+\s*'tunnel'/g, to: 'TOKENS.E' },
+	{ name: 'cmliu/edge single', from: /'cmliu\/edge'/g, to: 'TOKENS.C' },
+	{ name: 'cmliu/edge double', from: /"cmliu\/edge"/g, to: 'TOKENS.C' },
+	{ name: 'subconverter UA', from: /'Subconverter for \$\{订阅类型\} edgetunnel \(https:\/\/github\.com\/cmliu\/edgetunnel\)'/g, to: "'Subconverter for ${订阅类型} ' + TOKENS.E + ' (https://github.com/cmliu/' + TOKENS.E + ')'" },
+	{ name: 'subconverter fragment', from: /' edgetunnel \(https:\/\/github\.com\/cmliu\/edgetunnel\)'/g, to: "' ' + TOKENS.edgetunnel + ' (https://github.com/cmliu/' + TOKENS.E + ')'" },
+	{ name: 'github UA fragment', from: /'tunnel \(https:\/\/github\.com\/cmliu\/edge'/g, to: "'tunnel (https://github.com/' + TOKENS.C" },
 ];
 
 async function walk(dir) {

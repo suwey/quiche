@@ -156,8 +156,14 @@ async fn version_handler() -> Json<serde_json::Value> {
 }
 
 #[derive(Deserialize)]
+struct TunPatch {
+    enable: Option<bool>,
+}
+
+#[derive(Deserialize)]
 struct PatchConfigs {
     mode: Option<String>,
+    tun: Option<TunPatch>,
 }
 
 async fn configs_handler(
@@ -178,17 +184,40 @@ async fn patch_configs_handler(
     State(state): State<Arc<UiState>>,
     axum::extract::Json(payload): axum::extract::Json<PatchConfigs>,
 ) -> impl IntoResponse {
+    let mut handled = false;
+
+    if let Some(tun) = payload.tun {
+        if let Some(enable) = tun.enable {
+            handled = true;
+            let result = if enable {
+                ::log::info!("Enabling TUN routing via API");
+                state.ctx.tun_routing_enable()
+            } else {
+                ::log::info!("Disabling TUN routing via API");
+                state.ctx.tun_routing_disable()
+            };
+            if let Err(e) = result {
+                ::log::error!("Failed to toggle TUN routing: {e}");
+                return (StatusCode::INTERNAL_SERVER_ERROR, ());
+            }
+        }
+    }
+
     if let Some(mode) = payload.mode {
         if let Some(idx) = MODE_LIST.iter().position(|m| *m == mode) {
             let idx = idx as u8;
-            if !state.ctx.rules.set_mode(idx) {
-                return (StatusCode::NO_CONTENT, ());
+            if state.ctx.set_mode(idx) {
+                ::log::info!("Switched mode to {}", mode_str(idx));
+                handled = true;
             }
-            ::log::info!("Switched mode to {}", mode_str(idx));
-            return (StatusCode::NO_CONTENT, ());
         }
     }
-    (StatusCode::BAD_REQUEST, ())
+
+    if handled {
+        (StatusCode::NO_CONTENT, ())
+    } else {
+        (StatusCode::BAD_REQUEST, ())
+    }
 }
 
 async fn post_restart_handler(

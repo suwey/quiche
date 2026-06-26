@@ -32,12 +32,16 @@ pub trait OutboundClient: Send + Sync {
         Err(crate::outbound::common::ERR_UDP_NOT_SUPPORTED.into())
     }
 
-    /// Measure round-trip latency to `host:port` by creating a fresh connection
-    /// and immediately tearing it down.
+    /// Measure real proxy latency by dialing `host:port` through this outbound
+    /// and measuring connection establishment time.
     ///
     /// Returns `None` on failure (timeout, unreachable, etc.).
-    /// Default returns `None` — implementations override on demand.
-    async fn test_latency(&self, _host: &str, _port: u16) -> Option<u64> {
-        None
+    /// Override to return `None` for outbounds that should not participate in
+    /// latency testing (direct, quic, ssh).
+    async fn test_latency(&self, host: &str, port: u16) -> Option<u64> {
+        let dest: Destination = format!("{host}:{port}").parse().ok()?;
+        let start = std::time::Instant::now();
+        self.dial(&dest).await.ok()?;
+        Some(start.elapsed().as_millis() as u64)
     }
 }

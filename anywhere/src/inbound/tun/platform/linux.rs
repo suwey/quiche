@@ -2,6 +2,7 @@
 
 use std::net::IpAddr;
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::dns::DNS_REDIRECT_PORT;
 
@@ -39,17 +40,28 @@ const TUN_IIF_EXCEPTION_PRIO: u32 = 400;
 /// When `iface_name` is `None`, interface-specific iptables rules are skipped.
 fn teardown_routing(iface_name: Option<&str>) {
     // Policy routing rules & bypass.
-    let _ = run_ip(&["rule", "del", "priority", &TUN_CATCH_ALL_PRIO.to_string()]);
-    let _ = run_ip(&[
+    if let Err(e) = run_ip(&["rule", "del", "priority", &TUN_CATCH_ALL_PRIO.to_string()]) {
+        log::debug!("teardown: del catch-all rule failed: {e}");
+    }
+    if let Err(e) = run_ip(&[
         "rule",
         "del",
         "priority",
         &TUN_IIF_EXCEPTION_PRIO.to_string(),
-    ]);
-    let _ = run_ip(&[
+    ]) {
+        log::debug!("teardown: del iif exception rule failed: {e}");
+    }
+
+    // Bypass fwmark rule & table 200 — only safe when the TUN device is about
+    // to be deleted (Drop) or doesn't exist yet (startup cleanup).
+    if let Err(e) = run_ip(&[
         "rule", "del", "fwmark", "1", "table", "100", "priority", "100",
-    ]);
-    let _ = run_ip(&["route", "flush", "table", &TUN_ROUTING_TABLE.to_string()]);
+    ]) {
+        log::debug!("teardown: del fwmark rule failed: {e}");
+    }
+    if let Err(e) = run_ip(&["route", "flush", "table", &TUN_ROUTING_TABLE.to_string()]) {
+        log::debug!("teardown: flush table 200 failed: {e}");
+    }
 
     // Note: LAN mangle DNAT mark rules are removed by the BypassWatcher on
     // normal shutdown. On stale cleanup we cannot enumerate which LAN
@@ -60,12 +72,14 @@ fn teardown_routing(iface_name: Option<&str>) {
     // Interface-specific iptables (INPUT/FORWARD ACCEPT, POSTROUTING).
     if let Some(name) = iface_name {
         for chain in &["INPUT", "FORWARD"] {
-            let _ =
-                run_cmd("iptables", &["-D", chain, "-i", name, "-j", "ACCEPT"]);
+            if let Err(e) = run_cmd("iptables", &["-D", chain, "-i", name, "-j", "ACCEPT"]) {
+                log::debug!("teardown: iptables -D {chain} -i {name} ACCEPT failed: {e}");
+            }
         }
-        let _ =
-            run_cmd("iptables", &["-D", "FORWARD", "-o", name, "-j", "ACCEPT"]);
-        let _ = run_cmd("iptables", &[
+        if let Err(e) = run_cmd("iptables", &["-D", "FORWARD", "-o", name, "-j", "ACCEPT"]) {
+            log::debug!("teardown: iptables -D FORWARD -o {name} ACCEPT failed: {e}");
+        }
+        if let Err(e) = run_cmd("iptables", &[
             "-t",
             "nat",
             "-D",
@@ -74,11 +88,13 @@ fn teardown_routing(iface_name: Option<&str>) {
             name,
             "-j",
             "ACCEPT",
-        ]);
+        ]) {
+            log::debug!("teardown: iptables -t nat -D POSTROUTING -o {name} ACCEPT failed: {e}");
+        }
     }
 
     // DNS REDIRECT rules.
-    let _ = run_cmd("iptables", &[
+    if let Err(e) = run_cmd("iptables", &[
         "-t",
         "nat",
         "-D",
@@ -96,8 +112,10 @@ fn teardown_routing(iface_name: Option<&str>) {
         "REDIRECT",
         "--to-port",
         &DNS_REDIRECT_PORT.to_string(),
-    ]);
-    let _ = run_cmd("iptables", &[
+    ]) {
+        log::debug!("teardown: del DNS OUTPUT redirect failed: {e}");
+    }
+    if let Err(e) = run_cmd("iptables", &[
         "-t",
         "nat",
         "-D",
@@ -114,7 +132,9 @@ fn teardown_routing(iface_name: Option<&str>) {
         "REDIRECT",
         "--to-port",
         &DNS_REDIRECT_PORT.to_string(),
-    ]);
+    ]) {
+        log::debug!("teardown: del DNS PREROUTING redirect failed: {e}");
+    }
 }
 
 /// Clean up stale routing rules from a previous crash.
@@ -157,6 +177,8 @@ pub struct TunRouteManager {
     /// bypass rules. `None` until `setup_routing` runs, or when both lists are
     /// empty.
     bypass_watcher: Option<BypassWatcherHandle>,
+    /// Whether TUN capture rules (catch-all + iif exception) are installed.
+    pub tun_capture: AtomicBool,
 }
 
 impl TunRouteManager {
@@ -174,6 +196,7 @@ impl TunRouteManager {
             monitor_wan_ifaces,
             bypass_lan_ifaces,
             bypass_watcher: None,
+            tun_capture: AtomicBool::new(false),
         }
     }
 
@@ -241,7 +264,6 @@ impl TunRouteManager {
     pub fn setup_routing(
         &mut self, auto_hijack: bool,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        // --- bypass: fwmark 0x1 → table 100 ---
         run_ip(&[
             "rule", "add", "fwmark", "1", "table", "100", "priority", "100",
         ])?;
@@ -257,38 +279,7 @@ impl TunRouteManager {
             self.iface_name
         );
 
-        // table 100/200 contents were refreshed above. Add only the policy
-        // rules here.
-
-        // iif tun0 → lookup main (TUN handler responses reach LAN).
-        run_ip(&[
-            "rule",
-            "add",
-            "priority",
-            &TUN_IIF_EXCEPTION_PRIO.to_string(),
-            "iif",
-            &self.iface_name,
-            "lookup",
-            "main",
-        ])?;
-
-        // from all → lookup 200 (catch-all).
-        run_ip(&[
-            "rule",
-            "add",
-            "priority",
-            &TUN_CATCH_ALL_PRIO.to_string(),
-            "from",
-            "all",
-            "lookup",
-            &TUN_ROUTING_TABLE.to_string(),
-        ])?;
-
-        log::info!(
-            "Policy routing configured (all traffic → table {} via {})",
-            TUN_ROUTING_TABLE,
-            self.iface_name
-        );
+        self.enable_tun_capture(auto_hijack)?;
 
         // --- router hacks (only when auto_hijack is true) ---
         if auto_hijack {
@@ -339,70 +330,6 @@ impl TunRouteManager {
                 );
             }
 
-            // Redirect local DNS (53 → 1053) so router's own processes use
-            // the anywhere hijack instead of dnsmasq.  dnsmasq continues
-            // running (DHCP is untouched).
-            // IMPORTANT: exclude bypass-marked packets (! --mark 1) —
-            // anywhere's outbound sockets use SO_MARK=1 to bypass TUN routing,
-            // but without this exclusion their upstream DNS queries (to
-            // 8.8.8.8:53 / 223.5.5.5:53) would also be redirected back here,
-            // creating an infinite loop.
-            if let Err(e) = run_cmd("iptables", &[
-                "-t",
-                "nat",
-                "-I",
-                "OUTPUT",
-                "1",
-                "-p",
-                "udp",
-                "--dport",
-                "53",
-                "-m",
-                "mark",
-                "!",
-                "--mark",
-                &BYPASS_FWMARK.to_string(),
-                "-j",
-                "REDIRECT",
-                "--to-port",
-                &DNS_REDIRECT_PORT.to_string(),
-            ]) {
-                log::error!(
-                    "Failed to redirect local DNS (53→{}): {e}. Router's own DNS queries will bypass DNS hijack and may not be resolved correctly.",
-                    DNS_REDIRECT_PORT
-                );
-            }
-
-            // Also redirect LAN clients' DNS to the router's LAN IP
-            // (e.g. 192.168.50.1:53). These packets are delivered locally
-            // (never go through TUN), so the TUN handler never sees them.
-            // We use `-m addrtype --dst-type LOCAL` so that DNS sent to
-            // external servers (8.8.8.8:53, 223.5.5.5:53) is NOT redirected
-            // — those still go through TUN and are intercepted by the handler.
-            if let Err(e) = run_cmd("iptables", &[
-                "-t",
-                "nat",
-                "-I",
-                "PREROUTING",
-                "1",
-                "-p",
-                "udp",
-                "--dport",
-                "53",
-                "-m",
-                "addrtype",
-                "--dst-type",
-                "LOCAL",
-                "-j",
-                "REDIRECT",
-                "--to-port",
-                &DNS_REDIRECT_PORT.to_string(),
-            ]) {
-                log::error!(
-                    "Failed to redirect LAN client DNS (53→{}): {e}. LAN clients sending DNS to the router's LAN IP will bypass DNS hijack.",
-                    DNS_REDIRECT_PORT
-                );
-            }
 
             // --- Interface-based bypass routes ---
             // Spawn the BypassIfaceWatcher: it owns the lifecycle of all WAN
@@ -430,26 +357,139 @@ impl TunRouteManager {
         Ok(())
     }
 
-    /// Tear down routing rules without deleting the TUN interface.
+    /// Re-enable only the rules disabled by `disable_tun_capture`.
+    /// Used when switching from direct mode back to rule/global mode.
+    pub fn enable_tun_capture(
+        &mut self, auto_hijack: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if self.tun_capture.load(Ordering::Acquire) {
+            log::debug!("TUN capture already enabled, skipping");
+            return Ok(());
+        }
+
+        // Delete first to make this robust against partial previous toggles.
+        let _ = run_ip(&["rule", "del", "priority", &TUN_IIF_EXCEPTION_PRIO.to_string()]);
+        run_ip(&[
+            "rule",
+            "add",
+            "priority",
+            &TUN_IIF_EXCEPTION_PRIO.to_string(),
+            "iif",
+            &self.iface_name,
+            "lookup",
+            "main",
+        ])?;
+
+        let _ = run_ip(&["rule", "del", "priority", &TUN_CATCH_ALL_PRIO.to_string()]);
+        run_ip(&[
+            "rule",
+            "add",
+            "priority",
+            &TUN_CATCH_ALL_PRIO.to_string(),
+            "from",
+            "all",
+            "lookup",
+            &TUN_ROUTING_TABLE.to_string(),
+        ])?;
+
+        if auto_hijack {
+            let _ = run_cmd("iptables", &[
+                "-t", "nat", "-D", "OUTPUT",
+                "-p", "udp", "--dport", "53",
+                "-m", "mark", "!", "--mark", &BYPASS_FWMARK.to_string(),
+                "-j", "REDIRECT", "--to-port", &DNS_REDIRECT_PORT.to_string(),
+            ]);
+            if let Err(e) = run_cmd("iptables", &[
+                "-t", "nat", "-I", "OUTPUT", "1",
+                "-p", "udp", "--dport", "53",
+                "-m", "mark", "!", "--mark", &BYPASS_FWMARK.to_string(),
+                "-j", "REDIRECT", "--to-port", &DNS_REDIRECT_PORT.to_string(),
+            ]) {
+                log::error!("Failed to redirect local DNS (53→{}): {e}", DNS_REDIRECT_PORT);
+            }
+
+            let _ = run_cmd("iptables", &[
+                "-t", "nat", "-D", "PREROUTING",
+                "-p", "udp", "--dport", "53",
+                "-m", "addrtype", "--dst-type", "LOCAL",
+                "-j", "REDIRECT", "--to-port", &DNS_REDIRECT_PORT.to_string(),
+            ]);
+            if let Err(e) = run_cmd("iptables", &[
+                "-t", "nat", "-I", "PREROUTING", "1",
+                "-p", "udp", "--dport", "53",
+                "-m", "addrtype", "--dst-type", "LOCAL",
+                "-j", "REDIRECT", "--to-port", &DNS_REDIRECT_PORT.to_string(),
+            ]) {
+                log::error!(
+                    "Failed to redirect LAN client DNS (53→{}): {e}",
+                    DNS_REDIRECT_PORT
+                );
+            }
+        }
+
+        self.tun_capture.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    /// Remove rules that direct traffic into the TUN interface.
+    /// Safe to call when switching to direct mode — does NOT touch:
+    ///   - fwmark bypass rule (outbound sockets still need table 100)
+    ///   - table 100 / table 200 route contents
+    ///   - iptables ACCEPT rules (INPUT/FORWARD, POSTROUTING)
     ///
-    /// Stops the bypass watcher (removing all WAN/LAN bypass rules) and
-    /// removes policy routing rules and iptables rules. The TUN interface
-    /// itself is left intact so it can be re-enabled later.
-    pub fn cleanup_routing(&mut self) {
+    /// Rules removed:
+    ///   priority 400  iif tun0           lookup main
+    ///   priority 3000  from all           lookup 200
+    ///   iptables -t nat -I OUTPUT ... DNS REDIRECT
+    ///   iptables -t nat -I PREROUTING ... DNS REDIRECT
+    pub fn disable_tun_capture(&mut self) {
+        if !self.tun_capture.load(Ordering::Acquire) {
+            log::debug!("TUN capture already disabled, skipping");
+            return;
+        }
+        if let Err(e) = run_ip(&["rule", "del", "priority", &TUN_CATCH_ALL_PRIO.to_string()]) {
+            log::debug!("disable_tun_capture: del catch-all rule failed: {e}");
+        }
+        if let Err(e) = run_ip(&["rule", "del", "priority", &TUN_IIF_EXCEPTION_PRIO.to_string()]) {
+            log::debug!("disable_tun_capture: del iif exception rule failed: {e}");
+        }
+
+        // Remove DNS redirect so local processes can resolve directly.
+        if let Err(e) = run_cmd("iptables", &[
+            "-t", "nat", "-D", "OUTPUT",
+            "-p", "udp", "--dport", "53",
+            "-m", "mark", "!", "--mark", &BYPASS_FWMARK.to_string(),
+            "-j", "REDIRECT", "--to-port", &DNS_REDIRECT_PORT.to_string(),
+        ]) {
+            log::debug!("disable_tun_capture: del DNS OUTPUT redirect failed: {e}");
+        }
+        if let Err(e) = run_cmd("iptables", &[
+            "-t", "nat", "-D", "PREROUTING",
+            "-p", "udp", "--dport", "53",
+            "-m", "addrtype", "--dst-type", "LOCAL",
+            "-j", "REDIRECT", "--to-port", &DNS_REDIRECT_PORT.to_string(),
+        ]) {
+            log::debug!("disable_tun_capture: del DNS PREROUTING redirect failed: {e}");
+        }
+        self.tun_capture.store(false, Ordering::Release);
+    }
+
+    pub fn cleanup_routing(&mut self) {  
         // Stop the bypass watcher first and synchronously wait for it to
-        // remove every rule it installed. This guarantees the kernel rule
-        // table is clean before we tear down the rest of the routing setup.
+        // remove every rule it installed.
         if let Some(mut watcher) = self.bypass_watcher.take() {
             watcher.shutdown_blocking();
         }
-
-        teardown_routing(Some(&self.iface_name));
+        self.disable_tun_capture();
     }
 }
 
 impl Drop for TunRouteManager {
     fn drop(&mut self) {
         self.cleanup_routing();
+        // Full teardown including fwmark/DNS/table 200 — safe here because
+        // the TUN device is about to be deleted, so no traffic can loop.
+        teardown_routing(Some(&self.iface_name));
 
         let output = Command::new("ip")
             .args(["link", "delete", &self.iface_name])

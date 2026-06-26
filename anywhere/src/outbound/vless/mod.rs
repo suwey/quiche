@@ -210,7 +210,6 @@ impl VlessPool {
 pub struct VlessOutboundClient {
     pool: Arc<VlessPool>,
     uuid: [u8; 16],
-    addr: SocketAddr,
     /// Mux session — replaces pool when `mux = true`.
     mux_session: Option<Arc<crate::outbound::vless::mux::MuxSession>>,
 }
@@ -285,7 +284,6 @@ impl VlessOutboundClient {
         Ok(Self {
             pool,
             uuid,
-            addr,
             mux_session,
         })
     }
@@ -346,11 +344,6 @@ impl OutboundClient for VlessOutboundClient {
         Ok(Box::new(VlessDeferredPacketRelay { state }))
     }
 
-    async fn test_latency(&self, _host: &str, _port: u16) -> Option<u64> {
-        let start = std::time::Instant::now();
-        connect_tcp_bypass_sync(self.addr).ok()?;
-        Some(start.elapsed().as_millis() as u64)
-    }
 }
 
 // ---------------------------------------------------------------------------

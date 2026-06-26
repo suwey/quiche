@@ -151,7 +151,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let urltest_states = registry.urltest_states.clone();
 
-        let ctx = AppContext::new(
+        AppContext::new(
             registry.clone(),
             rules.clone(),
             stats.clone(),
@@ -161,20 +161,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             urltest_states,
             cmd_tx,
             event_tx,
-        );
-
-        let ui_config = config.ui.clone();
-        let ctx_for_ui = ctx.clone();
-        tasks.push(tokio::spawn(async move {
-            anywhere::ui::start(ui_config, ctx_for_ui).await;
-        }));
-
-        let stats_ticker = stats.clone();
-        tasks.push(tokio::spawn(async move {
-            stats_ticker_task(stats_ticker).await;
-        }));
-
-        ctx
+        )
     } else {
         let (logs_tx, _) =
             tokio::sync::broadcast::channel::<anywhere::ui::log::LogMsg>(1);
@@ -191,6 +178,94 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
     };
 
+    // --- TUN inbounds (Linux only) — must init before UI clone so the
+    // configs API endpoint reads the correct routing state. ---------------
+    #[cfg(target_os = "linux")]
+    let _tun_guard: Option<anywhere::inbound::tun::TunGuard> = {
+        use anywhere::dns::DnsHijack;
+        use anywhere::inbound::tun::TunConfig;
+        use anywhere::inbound::tun::TunInbound;
+
+        let dns_cfg = config.dns.clone();
+
+        let mut last_guard = None;
+
+        for cfg in config.inbounds_by_type("tun") {
+            let tun_config = match TunConfig::from_inbound_config(cfg) {
+                Ok(c) => c,
+                Err(e) => {
+                    log::error!("Invalid TUN config: {e}");
+                    continue;
+                },
+            };
+
+            let local_direct = tun_config.local_direct;
+            let dns_cfg_for_builder = dns_cfg.clone();
+            let rules_for_builder = rules.clone();
+            let registry_clients = registry.clients_arc();
+            let dns_builder: Box<
+                dyn FnOnce(
+                        anywhere::inbound::tun::TunWriter,
+                        std::sync::Arc<
+                            anywhere::inbound::tun::reverse_dns::ReverseDnsCache,
+                        >,
+                    ) -> DnsHijack
+                    + Send,
+            > = Box::new(move |writer, reverse_cache| {
+                DnsHijack::new(
+                    &dns_cfg_for_builder,
+                    local_direct,
+                    rules_for_builder,
+                    registry_clients,
+                    writer,
+                    reverse_cache,
+                )
+                .expect("invalid dns upstream")
+            });
+
+            match TunInbound::new(&tun_config, Some(dns_builder)).await {
+                Ok((inbound, guard)) => {
+                    log::info!("Starting TUN inbound on {}", tun_config.addr);
+                    log::info!(
+                        "DNS hijack enabled (direct={}, remote={})",
+                        dns_cfg.direct,
+                        dns_cfg.remote
+                    );
+                    tasks.push(tokio::spawn(run_inbound(inbound, ctx.clone())));
+                    last_guard = Some(guard);
+                },
+                Err(e) => {
+                    log::error!("Failed to start TUN inbound: {e}");
+                },
+            }
+        }
+        last_guard
+    };
+    #[cfg(not(target_os = "linux"))]
+    let _tun_guard: Option<anywhere::inbound::tun::TunGuard> = None;
+
+    // Inject TUN manager into context before any clones are made.
+    #[cfg(target_os = "linux")]
+    if let Some(ref guard) = _tun_guard {
+        if let Some(mgr) = guard.tun_mgr() {
+            ctx.set_tun_mgr(mgr);
+        }
+    }
+
+    // --- UI server (optional) -------------------------------------------
+    if config.ui.listen.is_some() {
+        let ctx_for_ui = ctx.clone();
+        let ui_config = config.ui.clone();
+        tasks.push(tokio::spawn(async move {
+            anywhere::ui::start(ui_config, ctx_for_ui).await;
+        }));
+
+        let stats = ctx.stats.clone();
+        tasks.push(tokio::spawn(async move {
+            stats_ticker_task(stats).await;
+        }));
+    }
+
     // --- Actor: process UiCommands from the UI -----------------------------
     {
         let ctx_for_actor = ctx.clone();
@@ -199,7 +274,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             while let Some(cmd) = cmd_rx.recv().await {
                 match cmd {
                     UiCommand::SetMode(mode, tx) => {
-                        let ok = ctx_for_actor.rules.set_mode(mode);
+                        let ok = ctx_for_actor.set_mode(mode);
                         let _ = tx.send(ok);
                     },
                     UiCommand::TunSetRouting(enable, tx) => {
@@ -278,79 +353,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             None => {
                 log::warn!("AnytlsInbound::from_config returned None");
             },
-        }
-    }
-
-    // --- TUN inbounds (Linux only) -----------------------------------------
-    #[cfg(target_os = "linux")]
-    let _tun_guard: Option<anywhere::inbound::tun::TunGuard> = {
-        use anywhere::dns::DnsHijack;
-        use anywhere::inbound::tun::TunConfig;
-        use anywhere::inbound::tun::TunInbound;
-
-        let dns_cfg = config.dns.clone();
-
-        let mut last_guard = None;
-
-        for cfg in config.inbounds_by_type("tun") {
-            let tun_config = match TunConfig::from_inbound_config(cfg) {
-                Ok(c) => c,
-                Err(e) => {
-                    log::error!("Invalid TUN config: {e}");
-                    continue;
-                },
-            };
-
-            let local_direct = tun_config.local_direct;
-            let dns_cfg_for_builder = dns_cfg.clone();
-            let rules_for_builder = rules.clone();
-            let registry_clients = registry.clients_arc();
-            let dns_builder: Box<
-                dyn FnOnce(
-                        anywhere::inbound::tun::TunWriter,
-                        std::sync::Arc<
-                            anywhere::inbound::tun::reverse_dns::ReverseDnsCache,
-                        >,
-                    ) -> DnsHijack
-                    + Send,
-            > = Box::new(move |writer, reverse_cache| {
-                DnsHijack::new(
-                    &dns_cfg_for_builder,
-                    local_direct,
-                    rules_for_builder,
-                    registry_clients,
-                    writer,
-                    reverse_cache,
-                )
-                .expect("invalid dns upstream")
-            });
-
-            match TunInbound::new(&tun_config, Some(dns_builder)).await {
-                Ok((inbound, guard)) => {
-                    log::info!("Starting TUN inbound on {}", tun_config.addr);
-                    log::info!(
-                        "DNS hijack enabled (direct={}, remote={})",
-                        dns_cfg.direct,
-                        dns_cfg.remote
-                    );
-                    tasks.push(tokio::spawn(run_inbound(inbound, ctx.clone())));
-                    last_guard = Some(guard);
-                },
-                Err(e) => {
-                    log::error!("Failed to start TUN inbound: {e}");
-                },
-            }
-        }
-        last_guard
-    };
-    #[cfg(not(target_os = "linux"))]
-    let _tun_guard: Option<anywhere::inbound::tun::TunGuard> = None;
-
-    // Inject TUN manager into context (if TUN is active).
-    #[cfg(target_os = "linux")]
-    if let Some(ref guard) = _tun_guard {
-        if let Some(mgr) = guard.tun_mgr() {
-            ctx.set_tun_mgr(mgr);
         }
     }
 

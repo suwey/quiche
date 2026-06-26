@@ -262,7 +262,6 @@ impl OutboundClient for MlessOutboundClient {
         }
     }
 }
-
 /// TCP stream relay backed by a Mless multiplexed stream.
 ///
 /// The first `write()` sends a combined FIRST+DATA frame so the server

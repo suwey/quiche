@@ -41,7 +41,10 @@ tag = "A1"
 server = "001.top:423"
 password = "15e023sae"
 sni = "fafeg.qq.com"
-fp = true
+# fp = true
+# idle_session_check_interval = 60
+# idle_session_timeout = 180
+# min_idle_session = 2
 
 [[outbounds]]
 type = "anytls"
@@ -49,7 +52,6 @@ tag = "A2"
 server = "001.top:438"
 password = "15e023sae"
 sni = "fafeg.qq.com"
-fp = true
 
 [[outbounds]]
 type = "anytls"
@@ -57,7 +59,6 @@ tag = "A3"
 server = "001.top:439"
 password = "15e023sae"
 sni = "fafeg.qq.com"
-fp = true
 
 [[outbounds]]
 type = "vless"

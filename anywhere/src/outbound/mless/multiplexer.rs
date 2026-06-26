@@ -247,6 +247,12 @@ fn io_loop(
 ) {
     let _ = ws.set_read_timeout(std::time::Duration::from_millis(100));
 
+    // If no data received within this window, the connection is considered
+    // dead (half-open TCP). The server should send periodic keepalive frames
+    // or close gracefully; if it doesn't, we detect silence here.
+    const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+    let mut last_data = std::time::Instant::now();
+
     loop {
         let Some(mux) = mux.upgrade() else {
             return;
@@ -254,12 +260,16 @@ fn io_loop(
 
         loop {
             match ws_rx.try_recv() {
-                Ok(frame) =>
+                Ok(frame) => {
                     if let Err(e) = ws.send(&frame) {
                         log::warn!("mless: ws write error: {e} ({:?}), closing", e.kind());
                         mux.on_disconnect();
                         return;
-                    },
+                    }
+                    // Successful write resets the idle timer — the connection
+                    // is clearly alive.
+                    last_data = std::time::Instant::now();
+                },
                 Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
                 Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
                     log::warn!("mless: ws_tx channel disconnected, closing");
@@ -272,6 +282,7 @@ fn io_loop(
 
         match ws.recv() {
             Ok(data) if !data.is_empty() => {
+                last_data = std::time::Instant::now();
                 // A single WebSocket message may contain multiple
                 // concatenated mless frames (the server's Grain sender
                 // batches frames into one WS message). Parse them all.
@@ -305,6 +316,16 @@ fn io_loop(
                 if e.kind() == std::io::ErrorKind::WouldBlock ||
                     e.kind() == std::io::ErrorKind::TimedOut
                 {
+                    // Check for silent idle timeout — the server may have
+                    // died without closing the TCP connection (half-open).
+                    if last_data.elapsed() >= IDLE_TIMEOUT {
+                        log::warn!(
+                            "mless: no data for {:?}, treating as disconnected",
+                            IDLE_TIMEOUT,
+                        );
+                        mux.on_disconnect();
+                        return;
+                    }
                     continue;
                 }
                 log::warn!("mless: ws read error: {e} ({:?}), closing", e.kind());
