@@ -1,0 +1,99 @@
+[ui]
+secret = "admin"
+
+[[inbounds]]
+type = "tun"
+tag = "tun-in"
+mtu = 8096
+
+[[outbounds]]
+type = "mless"
+tag = "CF"
+server = "REDACTED:2087"
+password = "REDACTED"
+sni = "REDACTED"
+fp = true
+transport_type = "ws"
+transport_path = "/"
+transport_headers.Host = "REDACTED"
+
+[[outbounds]]
+type = "urltest"
+tag = "auto"
+outbounds = ["CF"]
+
+[[rules]]
+# protocol examples: "both:1232" "tcp:123,1132" "udp:123,2222"
+protocol = "stun"  # both:3748,3749
+outbound = "none" # drop the traffic
+
+[[rules]]
+# some software use other ports such as Xunlei, recommend set direct mode in ui when download.
+protocol = "bittorrent" # tcp:6881,6889 && udp:6881,
+outbound = "direct"
+
+[[rules]]
+# NTP
+protocol = "udp:123"
+outbound = "direct"
+
+[[rules]]
+# mDNS
+protocol = "udp:5353"
+outbound = "direct"
+
+[[rules]]
+# NetBIOS
+protocol = "udp:137,139"
+outbound = "direct"
+
+[[rules]]
+# DHCP
+protocol = "udp:67,68"
+outbound = "direct"
+
+[[rules]]
+domain_suffix = [
+    "lmstudio.ai",
+    "rust-lang.org",
+    "microsoft.com",
+    "npmjs.org",
+    "apple.com",
+    "cdn-apple.com",
+    "synologyupdate.com",
+    "synology.com",
+    "hf-mirror.com",
+    "xethub.hf.co",
+    "pythonhosted.org",
+    "pytorch.org",
+    "pypi.org",
+    "wireshark.org"
+]
+outbound = "direct"
+
+[[rules]]
+geo_url = "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/private.srs"
+outbound = "direct"
+
+[[rules]]
+geo_url = "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/cn.srs"
+outbound = "direct"
+
+[[rules]]
+geo_url = "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/category-games@cn.srs"
+outbound = "direct"
+
+[[rules]]
+geo_url = "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geoip/cn.srs"
+outbound = "direct"
+
+[[rules]]
+geo_url = "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/category-ads-all.srs"
+outbound = "none"
+
+[[rules]]
+geo_url = "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/geolocation-!cn.srs"
+outbound = "auto"
+
+[[rules]]
+outbound = "auto"

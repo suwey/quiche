@@ -854,23 +854,18 @@ impl GeoRuleSet {
     }
 
     /// Download, parse, and write to cache. Returns the GeoMatcher on success.
+    ///
+    /// Uses `connect_tcp_bypass` + `tokio-rustls` TLS so that on Android the
+    /// underlying socket is protected via `VpnService.protect()`, bypassing
+    /// the TUN interface.  This avoids the startup deadlock where geo-rule
+    /// downloads would be routed into the TUN before the rules engine is
+    /// ready.
     async fn fetch_and_cache(
         url: &str, cache_path: &std::path::Path, source_name: &str,
     ) -> Result<GeoMatcher, String> {
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
-            .build()
-            .map_err(|e| e.to_string())?;
-
-        let resp = client.get(url).send().await.map_err(|e| e.to_string())?;
-        let status = resp.status();
-
-        if !status.is_success() {
-            return Err(format!("HTTP {status}"));
-        }
-
-        let bytes = resp.bytes().await.map_err(|e| e.to_string())?;
-        let data = bytes.to_vec();
+        let data = Self::http_get_bypass(url)
+            .await
+            .map_err(|e| format!("HTTP GET {url}: {e}"))?;
 
         let parsed = read_srs_bytes(&data)
             .ok_or_else(|| "Failed to parse SRS file".to_string())?;
@@ -880,6 +875,109 @@ impl GeoRuleSet {
         let _ = tokio::fs::write(cache_path, &data).await;
         log::info!("Updated geo rule set: {source_name}");
         Ok(matcher)
+    }
+
+    /// HTTP/1.1 GET over a protect-ed (bypass) TCP + TLS connection.
+    ///
+    /// This replaces `reqwest` for geo-rule downloads so that the socket is
+    /// properly protected on Android (via `VpnService.protect`) and marked
+    /// with `SO_MARK` on Linux, consistent with all other outbound
+    /// connections.
+    async fn http_get_bypass(url: &str) -> Result<Vec<u8>, String> {
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        use http_body_util::{BodyExt, Empty};
+        use hyper::body::Bytes;
+        use hyper::Request;
+        use hyper_util::rt::TokioIo;
+        use tokio_rustls::rustls::pki_types::ServerName;
+        use tokio_rustls::rustls::ClientConfig;
+        use tokio_rustls::TlsConnector;
+
+        // Parse URL.
+        let parsed = url::Url::parse(url)
+            .map_err(|e| format!("invalid URL: {e}"))?;
+        let host = parsed.host_str()
+            .ok_or_else(|| "URL has no host".to_string())?;
+        let port = parsed.port_or_known_default().unwrap_or(443);
+        let path = if parsed.path().is_empty() { "/" } else { parsed.path() };
+        let query = parsed.query().map(|q| format!("?{q}")).unwrap_or_default();
+        let path_query = format!("{path}{query}");
+
+        // Resolve host to IP via system resolver.
+        let ips = tokio::net::lookup_host(format!("{host}:{port}")).await
+            .map_err(|e| format!("DNS lookup {host}: {e}"))?;
+        let addr: std::net::SocketAddr = ips.into_iter().next()
+            .ok_or_else(|| format!("no addresses for {host}"))?;
+
+        // TCP connect with bypass (protect on Android / SO_MARK on Linux).
+        let tcp = crate::outbound::common::connect_tcp_bypass(addr)
+            .await
+            .map_err(|e| format!("TCP connect {addr}: {e}"))?;
+        let _ = tcp.set_nodelay(true);
+
+        // TLS handshake with ALPN "http/1.1".
+        let provider = tokio_rustls::rustls::crypto::ring::default_provider();
+        let mut roots = tokio_rustls::rustls::RootCertStore::empty();
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        let mut tls_config = ClientConfig::builder_with_provider(Arc::new(provider))
+            .with_safe_default_protocol_versions()
+            .map_err(|e| format!("TLS config: {e}"))?
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        tls_config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        let connector = TlsConnector::from(Arc::new(tls_config));
+
+        let server_name = ServerName::try_from(host.to_string())
+            .map_err(|e| format!("invalid server name '{host}': {e}"))?;
+        let tls = tokio::time::timeout(
+            Duration::from_secs(15),
+            connector.connect(server_name, tcp),
+        )
+        .await
+        .map_err(|_| format!("TLS handshake timeout ({host})"))?
+        .map_err(|e| format!("TLS handshake {host}: {e}"))?;
+
+        // HTTP/1.1 GET via hyper.
+        let io = TokioIo::new(tls);
+        let (mut sender, conn) = hyper::client::conn::http1::handshake(io)
+            .await
+            .map_err(|e| format!("hyper handshake: {e}"))?;
+
+        // Drive the connection in the background.
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+
+        let req = Request::builder()
+            .method("GET")
+            .uri(&path_query)
+            .header("Host", host)
+            .header("User-Agent", "anywhere/geo-rules")
+            .header("Connection", "close")
+            .body(Empty::<Bytes>::new())
+            .map_err(|e| format!("build request: {e}"))?;
+
+        let resp = tokio::time::timeout(
+            Duration::from_secs(30),
+            sender.send_request(req),
+        )
+        .await
+        .map_err(|_| "HTTP response timeout".to_string())?
+        .map_err(|e| format!("send request: {e}"))?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(format!("HTTP {status}"));
+        }
+
+        // Collect body.
+        let body = resp.into_body()
+            .collect()
+            .await
+            .map_err(|e| format!("read body: {e}"))?;
+        Ok(body.to_bytes().to_vec())
     }
 
     async fn load_cache(

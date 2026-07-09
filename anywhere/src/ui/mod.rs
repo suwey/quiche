@@ -58,8 +58,11 @@ pub async fn start(config: UiConfig, ctx: AppContext) {
         .route("/version", get(version_handler))
         .route(
             "/configs",
-            get(configs_handler).patch(patch_configs_handler),
+            get(configs_handler)
+                .patch(patch_configs_handler)
+                .put(put_configs_handler),
         )
+        .route("/configs/file", get(config_file_handler))
         .route("/rules", get(rules_handler))
         .route("/proxies", get(proxies_handler))
         .route("/group/:tag/delay", get(group_delay_handler))
@@ -180,6 +183,27 @@ async fn configs_handler(
     }))
 }
 
+/// GET /configs/file — return raw config file content as text/plain.
+async fn config_file_handler(
+    State(state): State<Arc<UiState>>,
+) -> impl IntoResponse {
+    match &state.ctx.config_path {
+        Some(path) => match std::fs::read_to_string(path) {
+            Ok(content) => (
+                StatusCode::OK,
+                [(axum::http::header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+                content,
+            )
+                .into_response(),
+            Err(e) => {
+                ::log::error!("Failed to read config file {path}: {e}");
+                (StatusCode::INTERNAL_SERVER_ERROR, "failed to read config file").into_response()
+            },
+        },
+        None => (StatusCode::INTERNAL_SERVER_ERROR, "no config path set").into_response(),
+    }
+}
+
 async fn patch_configs_handler(
     State(state): State<Arc<UiState>>,
     axum::extract::Json(payload): axum::extract::Json<PatchConfigs>,
@@ -220,41 +244,160 @@ async fn patch_configs_handler(
     }
 }
 
+/// Trigger a process-level restart.
+///
+/// On desktop:
+///   - If `start_cmd` is set: spawns `<start_cmd> restart <service_name>` then exits.
+///   - If `start_cmd` is None: re-executes itself via `execve` after a short
+///     delay (lets the HTTP response flush to the client).
+/// On Android: exits with code 0; the JNI layer (Kotlin) handles re-calling
+///   `startEngine` to reload the native engine.
+fn trigger_restart(state: &AppContext) -> StatusCode {
+    #[cfg(not(target_os = "android"))]
+    {
+        let exe = match std::env::current_exe() {
+            Ok(p) => p,
+            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR,
+        };
+
+        if let Some(ref start_cmd) = state.start_cmd {
+            // External restart via `start_cmd restart <service_name>`.
+            // Do NOT exit ourselves — let the service manager send SIGTERM
+            // so we get a graceful shutdown (connections close, TUN cleanup, etc.).
+            let service_name = exe
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+            match std::process::Command::new(start_cmd)
+                .arg("restart")
+                .arg(&service_name)
+                .spawn()
+            {
+                Ok(_) => {
+                    ::log::info!(
+                        "Restart requested via {start_cmd} restart {service_name}, waiting for SIGTERM..."
+                    );
+                    StatusCode::NO_CONTENT
+                },
+                Err(e) => {
+                    ::log::error!("Failed to restart via {start_cmd}: {e}");
+                    StatusCode::INTERNAL_SERVER_ERROR
+                },
+            }
+        } else {
+            // Self re-exec via execve: no external process manager needed.
+            // The kernel replaces the current process image, so all memory,
+            // fds, and tokio tasks are instantly reclaimed — cleaner than
+            // graceful shutdown.
+            //
+            // We collect args *before* spawning the delay so that
+            // `std::env::args()` is read from the main thread.
+            let exe_str = exe.to_string_lossy().to_string();
+            let args: Vec<String> = std::env::args().collect();
+            ::log::info!("Restarting via execve: {exe_str} {:?}", args);
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                do_execve(&exe_str, &args);
+            });
+            StatusCode::NO_CONTENT
+        }
+    }
+
+    #[cfg(target_os = "android")]
+    {
+        let _ = state;
+        ::log::info!("Restarting engine in-process (no process exit)");
+        // Delay slightly to let the HTTP response flush, then signal
+        // the engine to shut down. The JNI layer detects the restart
+        // flag and calls onEngineRestart() on the Kotlin VpnService.
+        tokio::spawn(async {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            crate::android::jni::request_restart();
+        });
+        StatusCode::NO_CONTENT
+    }
+}
+
+/// Re-execute the current binary, replacing the process image.
+///
+/// Uses `execve` via `std::os::unix::process::CommandExt::exec()`.
+/// On success, this function never returns (the process image is replaced).
+/// On failure, logs the error and exits with code 1.
+#[cfg(not(target_os = "android"))]
+fn do_execve(exe: &str, args: &[String]) {
+    use std::os::unix::process::CommandExt;
+    let err = std::process::Command::new(exe)
+        .args(&args[1..])
+        .exec();
+    // exec() only returns on failure.
+    ::log::error!("execve failed: {err}");
+    std::process::exit(1);
+}
+
 async fn post_restart_handler(
     State(state): State<Arc<UiState>>,
 ) -> impl IntoResponse {
-    let exe = match std::env::current_exe() {
-        Ok(p) => p,
-        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, ()),
-    };
-    let service_name = exe
-        .file_stem()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .to_string();
+    trigger_restart(&state.ctx)
+}
 
-    match std::process::Command::new(&state.ctx.start_cmd)
-        .arg("restart")
-        .arg(&service_name)
-        .spawn()
-    {
-        Ok(_) => {
-            ::log::info!(
-                "Restarting via {} restart {}...",
-                state.ctx.start_cmd,
-                service_name
-            );
-            tokio::spawn(async {
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                std::process::exit(0);
-            });
-            (StatusCode::NO_CONTENT, ())
-        },
-        Err(e) => {
-            ::log::error!("Failed to restart via {}: {e}", state.ctx.start_cmd);
-            (StatusCode::INTERNAL_SERVER_ERROR, ())
-        },
+// ---------------------------------------------------------------------------
+// PUT /configs?force=true — write new config and restart
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct PutConfigsQuery {
+    force: Option<bool>,
+}
+
+#[derive(Deserialize)]
+struct PutConfigsPayload {
+    /// Ignored — we always write to the current config file path.
+    #[allow(dead_code)]
+    path: Option<String>,
+    /// New config file content (TOML). If empty, just restart with existing file.
+    payload: Option<String>,
+}
+
+async fn put_configs_handler(
+    State(state): State<Arc<UiState>>,
+    Query(query): Query<PutConfigsQuery>,
+    axum::extract::Json(body): axum::extract::Json<PutConfigsPayload>,
+) -> impl IntoResponse {
+    // Only process when force=true.
+    if query.force != Some(true) {
+        return (StatusCode::BAD_REQUEST, "force=true is required");
     }
+
+    // If payload is provided, write it to the config file.
+    if let Some(ref payload) = body.payload {
+        if !payload.is_empty() {
+            let config_path = match &state.ctx.config_path {
+                Some(p) => p.clone(),
+                None => {
+                    ::log::error!("Cannot write config: no config_path set");
+                    return (StatusCode::INTERNAL_SERVER_ERROR, "no config path");
+                },
+            };
+
+            match std::fs::write(&config_path, payload) {
+                Ok(()) => {
+                    ::log::info!("Config file updated: {config_path}");
+                },
+                Err(e) => {
+                    ::log::error!("Failed to write config file: {e}");
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "failed to write config",
+                    );
+                },
+            }
+        }
+    }
+
+    // Trigger restart with the (potentially updated) config file.
+    let status = trigger_restart(&state.ctx);
+    (status, "")
 }
 
 async fn rules_handler(

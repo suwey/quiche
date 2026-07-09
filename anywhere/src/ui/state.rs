@@ -186,8 +186,7 @@ impl AppStats {
 // is inside function bodies. main.rs picks the right fn at startup.)
 // ---------------------------------------------------------------------------
 
-/// Reads RSS memory on Linux via /proc/self/status. Returns 0 on other
-/// platforms.
+/// Reads RSS memory on Linux/Android via /proc/self/status. Returns 0 on other
 pub fn read_linux_memory() -> u64 {
     if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
         for line in status.lines() {

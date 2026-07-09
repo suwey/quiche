@@ -9,6 +9,9 @@ pub mod linux;
 #[cfg(target_os = "linux")]
 pub(super) mod bypass_watcher;
 
+#[cfg(target_os = "android")]
+pub mod android;
+
 /// Run an arbitrary command, returning an error on non-zero exit.
 /// All shell commands from TUN routing should go through this so
 /// there is a single place with debug logging and error formatting.

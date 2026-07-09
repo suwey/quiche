@@ -31,7 +31,7 @@ pub async fn connect_tcp_bypass(
         use socket2::Type;
 
         const TCP_CONNECT_TIMEOUT: std::time::Duration =
-            std::time::Duration::from_secs(3);
+            std::time::Duration::from_secs(5);
 
         let domain = if addr.is_ipv4() {
             Domain::IPV4
@@ -43,6 +43,8 @@ pub async fn connect_tcp_bypass(
         tokio::task::spawn_blocking(move || {
             let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
             socket.set_mark(fwmark)?;
+            // Disable Nagle for low-latency protocols (DoH, proxy handshakes).
+            socket.set_nodelay(true)?;
             socket.connect_timeout(&addr.into(), TCP_CONNECT_TIMEOUT)?;
             let std_stream: std::net::TcpStream = socket.into();
             TcpStream::from_std(std_stream)
@@ -50,7 +52,88 @@ pub async fn connect_tcp_bypass(
         .await
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "android")]
+    {
+        use std::os::fd::AsRawFd;
+        use crate::inbound::tun::platform::android::get_protector;
+
+        // IMPORTANT: VpnService.protect() MUST be called BEFORE connect(),
+        // otherwise the SYN packet is already routed into the TUN.
+        // tokio::TcpStream::connect() creates the socket and connects in
+        // one step, leaving no window to protect the fd.  We must manually
+        // create the socket, protect it, then connect.
+        let domain = if addr.is_ipv4() {
+            socket2::Domain::IPV4
+        } else {
+            socket2::Domain::IPV6
+        };
+
+        let protector = get_protector();
+
+        tokio::task::spawn_blocking(move || {
+            let socket = socket2::Socket::new(
+                domain,
+                socket2::Type::STREAM,
+                Some(socket2::Protocol::TCP),
+            )?;
+            let fd = socket.as_raw_fd();
+            let protected = protector.protect(fd);
+            if !protected {
+                log::warn!("VpnService.protect() failed for TCP fd={fd} addr={addr}");
+            } else {
+                log::debug!("protect(fd={fd}) ok, connecting to {addr}");
+            }
+            socket.set_nodelay(true)?;
+            socket.set_nonblocking(true)?;
+
+            // Non-blocking connect returns EINPROGRESS immediately.
+            // We need to poll for writability, then check SO_ERROR.
+            match socket.connect(&addr.into()) {
+                Ok(()) => {}
+                Err(e) if e.raw_os_error() == Some(libc::EINPROGRESS) => {
+                    // Wait for the socket to become writable (connect completes).
+                    // Use poll() with a timeout.
+                    let mut pfd = libc::pollfd {
+                        fd,
+                        events: libc::POLLOUT,
+                        revents: 0,
+                    };
+                    let ret = unsafe { libc::poll(&mut pfd, 1, 10_000) };
+                    if ret < 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    if ret == 0 {
+                        return Err(io::Error::new(io::ErrorKind::TimedOut, "connect poll timeout"));
+                    }
+                    // Check SO_ERROR to see if connect succeeded.
+                    let mut err: i32 = 0;
+                    let mut len = std::mem::size_of::<i32>() as libc::socklen_t;
+                    let ret = unsafe {
+                        libc::getsockopt(
+                            fd,
+                            libc::SOL_SOCKET,
+                            libc::SO_ERROR,
+                            &mut err as *mut _ as *mut _,
+                            &mut len,
+                        )
+                    };
+                    if ret < 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    if err != 0 {
+                        return Err(io::Error::from_raw_os_error(err));
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+
+            let std_stream: std::net::TcpStream = socket.into();
+            Ok(TcpStream::from_std(std_stream))
+        })
+        .await
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))??
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
     {
         TcpStream::connect(addr).await
     }
@@ -87,7 +170,20 @@ pub async fn bind_udp_bypass(
         .await
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "android")]
+    {
+        use std::os::fd::AsRawFd;
+        use crate::inbound::tun::platform::android::get_protector;
+
+        let socket = UdpSocket::bind(bind_addr).await?;
+        let protector = get_protector();
+        let fd = socket.as_raw_fd();
+        if !protector.protect(fd) {
+            log::warn!("VpnService.protect() failed for UDP fd={}", fd);
+        }
+        Ok(socket)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
     {
         UdpSocket::bind(bind_addr).await
     }
@@ -114,10 +210,36 @@ pub fn connect_tcp_bypass_sync(
         };
         let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
         socket.set_mark(BYPASS_FWMARK)?;
+        socket.set_nodelay(true)?;
         socket.connect(&addr.into())?;
         Ok(socket.into())
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "android")]
+    {
+        use std::os::fd::AsRawFd;
+        use crate::inbound::tun::platform::android::get_protector;
+
+        // protect() MUST be called BEFORE connect().
+        let domain = if addr.is_ipv4() {
+            socket2::Domain::IPV4
+        } else {
+            socket2::Domain::IPV6
+        };
+        let socket = socket2::Socket::new(
+            domain,
+            socket2::Type::STREAM,
+            Some(socket2::Protocol::TCP),
+        )?;
+        let fd = socket.as_raw_fd();
+        let protector = get_protector();
+        if !protector.protect(fd) {
+            log::warn!("VpnService.protect() failed for sync TCP fd={fd}");
+        }
+        socket.set_nodelay(true)?;
+        socket.connect(&addr.into())?;
+        Ok(socket.into())
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
     {
         std::net::TcpStream::connect(addr)
     }

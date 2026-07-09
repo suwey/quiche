@@ -59,14 +59,17 @@ impl MlessMultiplexer {
         tls_fp: bool, path: &str, headers: &HashMap<String, String>,
     ) -> Result<Arc<Self>, Box<dyn std::error::Error>> {
         log::debug!("mless: connecting to {addr}...");
+        // Use bypass TCP to avoid TUN routing loop on Linux. Same pattern
+        // as vless (connect_tcp_bypass sets SO_MARK on Linux / protect on
+        // Android). Timeout is 8s to match previous behaviour.
         let tcp = tokio::time::timeout(
             std::time::Duration::from_secs(8),
-            tokio::net::TcpStream::connect(addr),
+            crate::outbound::common::connect_tcp_bypass(addr),
         )
         .await
         .map_err(|_| "mless: connect timeout (8s)")?
         .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })?;
-        log::debug!("mless: tcp connected, building ws...");
+        log::debug!("mless: tcp connected (bypass), building ws...");
         let tcp_std = tcp.into_std()?;
         tcp_std.set_nonblocking(false)?;
         let ws = build_ws(tcp_std, tls_server, insecure, tls_fp, path, headers)?;

@@ -37,11 +37,15 @@ pub struct AppContext {
     pub rules: Arc<Rules>,
     pub stats: Arc<AppStats>,
     pub logs_tx: broadcast::Sender<LogMsg>,
-    pub start_cmd: String,
+    pub start_cmd: Option<String>,
     pub outbound_tags: Vec<(String, String)>,
     pub urltest_states: HashMap<String, Arc<UrlTestState>>,
     pub cmd_tx: mpsc::Sender<UiCommand>,
     pub event_tx: broadcast::Sender<StateEvent>,
+    /// Absolute path to the config file (for reload/restart).
+    /// Always set to an absolute path — resolved from -c argument,
+    /// inline content fallback, or Android filesDir.
+    pub config_path: Option<String>,
     #[cfg(target_os = "linux")]
     tun_mgr: Option<Arc<Mutex<TunRouteManager>>>,
 }
@@ -57,6 +61,7 @@ impl Clone for AppContext {
             urltest_states: self.urltest_states.clone(),
             cmd_tx: self.cmd_tx.clone(),
             event_tx: self.event_tx.clone(),
+            config_path: self.config_path.clone(),
             #[cfg(target_os = "linux")]
             tun_mgr: self.tun_mgr.clone(),
         }
@@ -67,7 +72,7 @@ impl AppContext {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         registry: Arc<OutboundRegistry>, rules: Arc<Rules>, stats: Arc<AppStats>,
-        logs_tx: broadcast::Sender<LogMsg>, start_cmd: String,
+        logs_tx: broadcast::Sender<LogMsg>, start_cmd: Option<String>,
         outbound_tags: Vec<(String, String)>,
         urltest_states: HashMap<String, Arc<UrlTestState>>,
         cmd_tx: mpsc::Sender<UiCommand>, event_tx: broadcast::Sender<StateEvent>,
@@ -82,6 +87,7 @@ impl AppContext {
             urltest_states,
             cmd_tx,
             event_tx,
+            config_path: None,
             #[cfg(target_os = "linux")]
             tun_mgr: None,
         }
@@ -91,6 +97,11 @@ impl AppContext {
     #[cfg(target_os = "linux")]
     pub fn set_tun_mgr(&mut self, mgr: Arc<Mutex<TunRouteManager>>) {
         self.tun_mgr = Some(mgr);
+    }
+
+    /// Set the config file path (for reload support).
+    pub fn set_config_path(&mut self, path: Option<String>) {
+        self.config_path = path;
     }
 
     /// Set the routing mode. When TUN is active, automatically enables routing
@@ -142,7 +153,7 @@ impl AppContext {
             .unwrap_or(false)
     }
 
-    /// TUN routing is not available on non-Linux.
+    /// TUN routing is not available on non-Linux/Android.
     #[cfg(not(target_os = "linux"))]
     pub fn tun_routing_enabled(&self) -> bool {
         false

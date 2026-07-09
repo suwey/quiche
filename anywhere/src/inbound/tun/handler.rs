@@ -218,6 +218,7 @@ pub async fn run_tun_handler(
                     &writer,
                     &mut udp_sessions,
                     &reverse_dns,
+                    &dns_hijack,
                 )
                 .await;
 
@@ -393,6 +394,7 @@ async fn handle_udp_packet(
     buf: &[u8], meta: &IpPacketMeta, tun_addr: &IpAddr,
     conn_tx: &mpsc::Sender<InboundConn>, writer: &TunWriter,
     sessions: &mut UdpSessionTable, reverse_dns: &Option<Arc<ReverseDnsCache>>,
+    dns_hijack: &Option<Arc<DnsHijack>>,
 ) -> bool {
     let l4_off = meta.l4_offset;
     let udp_hdr_end = l4_off + 8; // UDP header is 8 bytes
@@ -454,6 +456,15 @@ async fn handle_udp_packet(
                         meta.dst_ip,
                     )
                 } else {
+                    if let Some(hj) = dns_hijack {
+                        if hj.fakeip_contains(v4) {
+                            log::warn!(
+                                "TUN fake-ip missing reverse mapping: {}:{}",
+                                v4,
+                                meta.dst_port,
+                            );
+                        }
+                    }
                     Destination::new(ip_to_address(meta.dst_ip), meta.dst_port)
                 },
             IpAddr::V6(v6) =>

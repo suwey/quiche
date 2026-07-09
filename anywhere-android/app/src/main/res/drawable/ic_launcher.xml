@@ -1,0 +1,23 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="192dp"
+    android:height="192dp"
+    android:viewportWidth="1024"
+    android:viewportHeight="1024">
+
+    <path
+        android:fillColor="#000000"
+        android:strokeColor="#FF9900"
+        android:strokeWidth="60"
+        android:pathData="M 512,512 m -400,0 a 400,400 0 1,0 800,0 a 400,400 0 1,0 -800,0" />
+
+    <!-- Letter A: yellow fill with evenOdd cutouts -->
+    <!-- Outer triangle + upper cutout + lower cutout + crossbar -->
+    <path
+        android:fillColor="#FF9900"
+        android:fillType="evenOdd"
+        android:pathData="M 512,200 L 300,760 L 724,760 Z
+                          M 512,360 L 465,520 L 559,520 Z
+                          M 512,560 L 420,760 L 604,760 Z
+                          M 455,520 L 569,520 L 569,560 L 455,560 Z" />
+
+</vector>

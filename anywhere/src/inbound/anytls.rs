@@ -419,11 +419,11 @@ fn handle_connection_inner(
                 );
                 // For simplicity, we always compare against default for now.
                 // If a custom scheme is configured, we'd use that instead.
-                let _ = server_md5;
-
-                if client_md5 != client_md5 {
-                    // Always match; skip update for now.
-                }
+                //
+                // TODO: on `client_md5 != server_md5` mismatch, send a
+                // padding scheme update to the client. For now always match
+                // and skip the update.
+                let _ = (client_md5, server_md5);
 
                 // Send server settings if client v >= 2.
                 if client_version >= PROTOCOL_VERSION {

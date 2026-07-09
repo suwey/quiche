@@ -9,6 +9,8 @@ use tokio::sync::oneshot;
 pub enum UiCommand {
     SetMode(u8, oneshot::Sender<bool>),
     TunSetRouting(bool, oneshot::Sender<Result<(), String>>),
+    /// Reload config and restart the engine (Android: stopEngine + startEngine).
+    Reload,
 }
 
 /// Events broadcast from the backend to the UI.

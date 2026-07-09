@@ -24,10 +24,10 @@ RUST_LOG=debug cargo run -p anywhere --bin anywhere -- -c anywhere/config/anytls
 
 Set socks5://127.0.0.1:1080 and test.
 
-5. Implemented useful clash api for [MetaCudeXD](https://github.com/MetaCubeX/metacubexd/releases/): most info APIs, global mode change (auto disable tun when mode direct, enable tun when mode rule/global), `Restart Core` by start command setted by -s option (default is systemctl, will call systemctl restart [exename]). 
+5. Implemented useful clash api for [MetaCudeXD](https://github.com/MetaCubeX/metacubexd/releases/): most info APIs, global mode change (auto disable tun forward when mode direct, enable tun when mode rule/global), `Restart Core` by start command setted by -s option (not set will execve a new process, if set to systemctl will execute command: systemctl restart [exename]), `Reload Config` is same as restart, `Upload Config` / `Edit Config` / `Pull Config` will overwrite config file and restart. 
 
 6. Urltest outbound as auto selector, domain and geo rules, tun inbound (linux only).
-7. Fake ip, DNS hijack auto enabled by tun inbound.
+7. Fake ip, DNS hijack auto enabled by tun inbound, DOH support.
 8. Auto monitor wan ifaces and bypass lan ifaces.
 9. Vless outbound, tls + ws mode for [edgetunnel](https://github.com/cmliu/edgetunnel), hide sensitive characters and back up as `deploy/openclaw`, can deploy to cloudflare pages (workers domain has been blocked).
 10. Mless outbound, my multiplex protocol based on vless, deploy `deploy/hermes` to cloudflare workers:
@@ -71,7 +71,7 @@ cargo zigbuild -p anywhere --target aarch64-unknown-linux-musl --release
 ```
 mkdir -p /jffs/anywhere/ui
 ```
-2. Download [MetaCudeXD](https://github.com/MetaCubeX/metacubexd/releases/) and extract, anywhere release and files in deploy, change your settings in config.toml.
+2. Download [MetaCudeXD](https://github.com/MetaCubeX/metacubexd/releases/) and extract, or my [edit version](./anywhere-android/app/src/main/assets/ui/), anywhere release and files in deploy, change your settings in config.toml.
 ```
 scp -O -r compressed-dist/* 192.168.1.1:/jffs/anywhere/ui/
 scp -O anywhere 192.168.1.1:/jffs/anywhere/
@@ -93,6 +93,14 @@ Confirm works fine before reboot, if can't work, ctrl+c or ./anywhere.sh stop, c
 1. S99anywhere.sh will delay 30s to start anywhere for original routes complete in router.
 2. Power cycling may cause issue.
 3. Full tested on AC86U, only ipv4 enabled.
+
+
+## Android
+Install apk, click start button, click `Open Web UI` (or open in computer on same local network), then go to config page: upload or edit [anywhere.toml](./anywhere-android/app/src/main/assets/config/anywhere.toml), it will restart.
+
+
+`bash scripts/build.sh --apk` to build apk, see prerequisites in [build.sh](./scripts/build.sh).
+
 
 ## Some service provider not support or limit speed of third party client
 Since all platform have ssh, use SSH outbound make router connect back to mac or win computer running provider's client.

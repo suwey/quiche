@@ -14,8 +14,12 @@ pub use handler::TunWriter;
 #[cfg(target_os = "linux")]
 pub use platform::linux::cleanup_stale_routing;
 
+#[cfg(target_os = "android")]
+pub use platform::android::create_tun_from_fd;
+
 use std::collections::HashMap;
 use std::net::IpAddr;
+#[cfg(any(target_os = "linux", target_os = "android"))]
 use std::net::Ipv4Addr;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -26,6 +30,8 @@ use async_trait::async_trait;
 pub use platform::linux::BYPASS_FWMARK;
 #[cfg(target_os = "linux")]
 pub use platform::linux::TunRouteManager;
+#[cfg(target_os = "android")]
+pub use platform::android::AndroidTunManager;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
@@ -43,6 +49,9 @@ use crate::inbound::InboundConn;
 use crate::inbound::tun::nat::TCPNat;
 use crate::inbound::tun::reverse_dns::ReverseDnsCache;
 use crate::relay::StreamRelay;
+
+#[cfg(target_os = "android")]
+use std::os::fd::RawFd;
 
 const TUN_TCP_NAT_TIMEOUT: Duration = Duration::from_secs(120);
 const TUN_TCP_NAT_CLEANUP_INTERVAL: Duration = Duration::from_secs(30);
@@ -133,7 +142,9 @@ pub struct TunInbound {
 pub struct TunGuard {
     #[cfg(target_os = "linux")]
     _inner: Option<Arc<std::sync::Mutex<TunRouteManager>>>,
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "android")]
+    _inner: Option<AndroidTunManager>,
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
     _inner: (),
 }
 
@@ -173,6 +184,13 @@ impl Drop for TunGuard {
                 }
             }
         }
+
+        #[cfg(target_os = "android")]
+        if let Some(_mgr) = self._inner.take() {
+            // AndroidTunManager::drop handles logging.
+            // VpnService is responsible for closing the TUN fd and
+            // tearing down the interface.
+        }
     }
 }
 
@@ -193,6 +211,11 @@ impl TunInbound {
     /// The `dns_hijack_builder` receives a `TunWriter` and the
     /// TUN-owned `ReverseDnsCache` so the DNS hijack can populate
     /// IP→domain mappings.
+    ///
+    /// On Android, `tun_fd` must be `Some(fd)` — the fd comes from
+    /// VpnService.establish() via JNI. On Linux, `tun_fd` is ignored
+    /// (the TUN device is created internally via rtnetlink).
+    #[allow(unused_variables)]
     pub async fn new(
         config: &TunConfig,
         dns_hijack_builder: Option<
@@ -201,6 +224,7 @@ impl TunInbound {
                     + Send,
             >,
         >,
+        #[cfg(target_os = "android")] tun_fd: Option<RawFd>,
     ) -> Result<(Self, TunGuard), Box<dyn std::error::Error>> {
         let addr = config.addr;
         let mask_len = config.mask_len;
@@ -208,15 +232,37 @@ impl TunInbound {
         let name = &config.name;
 
         // 1. Create TUN device.
-        let mut tun_config = tun::Configuration::default();
-        tun_config
-            .address(addr)
-            .netmask(mask_to_ipv4_addr(mask_len))
-            .mtu(mtu)
-            .tun_name(name.as_str())
-            .up();
-        let device = tun::create_as_async(&tun_config)?;
-        let device = Arc::new(device);
+        #[cfg(target_os = "linux")]
+        let device = {
+            let mut tun_config = tun::Configuration::default();
+            tun_config
+                .address(addr)
+                .netmask(mask_to_ipv4_addr(mask_len))
+                .mtu(mtu)
+                .tun_name(name.as_str())
+                .up();
+            let device = tun::create_as_async(&tun_config)?;
+            Arc::new(device)
+        };
+
+        #[cfg(target_os = "android")]
+        let device = {
+            let fd = tun_fd.ok_or("tun_fd is required on Android")?;
+            let device = platform::android::create_tun_from_fd(fd)?;
+            Arc::new(device)
+        };
+
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        {
+            return Err("TUN is only supported on Linux and Android".into());
+            // Compile-time: device is unbound here, but we return above.
+            #[allow(unreachable_code)]
+            let device: Arc<tun::AsyncDevice> = unreachable!();
+            let _ = device;
+        }
+
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        let device: Arc<tun::AsyncDevice> = unreachable!();
 
         log::info!("TUN device {name} created at {addr}");
 
@@ -296,7 +342,13 @@ impl TunInbound {
             TunGuard { _inner: Some(mgr) }
         };
 
-        #[cfg(not(target_os = "linux"))]
+        // Android: no routing setup needed (VpnService handles it).
+        #[cfg(target_os = "android")]
+        let guard = TunGuard {
+            _inner: Some(AndroidTunManager::new()),
+        };
+
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
         let guard = TunGuard { _inner: () };
 
         // 5. Create channels.
@@ -307,6 +359,7 @@ impl TunInbound {
         let tun_clone = device.clone();
         let nat_clone = nat.clone();
         let conn_tx_handler = conn_tx.clone();
+        let dns_hijack_clone = dns_hijack.clone();
         tokio::spawn(async move {
             handler::run_tun_handler(
                 tun_clone,
@@ -334,6 +387,7 @@ impl TunInbound {
                 cancel_accept,
                 conn_tx_accept,
                 Some(reverse_dns_accept),
+                dns_hijack_clone,
             )
             .await;
         });
@@ -377,6 +431,7 @@ async fn accept_loop(
     listener: tokio::net::TcpListener, nat: Arc<Mutex<TCPNat>>,
     cancel_registry: TcpCancelRegistry, conn_tx: mpsc::Sender<InboundConn>,
     reverse_dns: Option<Arc<ReverseDnsCache>>,
+    dns_hijack: Option<Arc<DnsHijack>>,
 ) {
     let mut backoff = Duration::from_millis(100);
     loop {
@@ -425,9 +480,11 @@ async fn accept_loop(
                                 Address::Domain(domain)
                             },
                             None => {
-                                let oct = v4.octets();
-                                if oct[0] == 198 && (oct[1] == 18 || oct[1] == 19)
-                                {
+                                let is_fakeip = match &dns_hijack {
+                                    Some(hj) => hj.fakeip_contains(v4),
+                                    None => false,
+                                };
+                                if is_fakeip {
                                     log::warn!(
                                         "TUN fake-ip missing reverse mapping: {}:{}",
                                         v4,
@@ -605,6 +662,8 @@ fn ip_to_addr(ip: std::net::IpAddr) -> Address {
 }
 
 /// Convert a prefix length to an IPv4 netmask.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[allow(dead_code)]
 fn mask_to_ipv4_addr(len: u8) -> Ipv4Addr {
     let bits = if len >= 32 {
         !0u32

@@ -535,14 +535,23 @@ pub(super) fn refresh_policy_tables(
         .args(["route", "show", "default"])
         .output()?;
     let stdout = String::from_utf8(output.stdout)?;
+    let mut found_default = false;
     for line in stdout.lines() {
         let line = line.trim();
         if line.is_empty() {
             continue;
         }
+        found_default = true;
         let spec = line.strip_prefix("default ").unwrap_or(line);
         log::info!("Adding bypass route: default {spec} → table 100");
         add_default_route_for_table(spec, Some("100"))?;
+    }
+    if !found_default {
+        log::warn!(
+            "No default route in main table — bypass routing (table 100) \
+             will NOT work. DoH and other bypass sockets will fail. \
+             Ensure WAN interface is up before starting anywhere."
+        );
     }
 
     copy_main_non_default_routes("100")?;

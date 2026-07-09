@@ -252,6 +252,13 @@ impl Config {
         Ok(config)
     }
 
+    /// Parse config from an inline TOML string (used by Android JNI where
+    /// no file system path is available).
+    pub fn from_string(content: &str) -> Result<Self, Box<dyn std::error::Error>> {
+        let config: Config = toml::from_str(content)?;
+        Ok(config)
+    }
+
     pub fn outbounds_by_type(&self, type_name: &str) -> Vec<&OutboundConfig> {
         self.outbounds
             .iter()

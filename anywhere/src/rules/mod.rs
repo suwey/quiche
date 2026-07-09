@@ -7,6 +7,7 @@ use std::sync::atomic::Ordering;
 
 use crate::config::OutboundConfig;
 use crate::config::RuleConfig;
+use crate::cache::{StatusEvent, StatusSink, NoticeLevel};
 use crate::inbound::Address;
 use crate::inbound::Destination;
 use crate::inbound::Network;
@@ -136,6 +137,17 @@ fn display_rule_list(values: &[String], max_items: usize) -> String {
 }
 
 impl Rules {
+    /// Create an empty rule set with only built-in private CIDR rules.
+    /// Used as a fallback when full rule loading fails.
+    pub fn empty() -> Self {
+        let rules = Self::builtin_private_rules();
+        Self {
+            rules,
+            mode: AtomicU8::new(MODE_RULE),
+            global_outbound: "direct".into(),
+        }
+    }
+
     /// Returns the built-in rule for private/internal network ranges that
     /// should always be routed directly. It is prepended before
     /// user-configured rules so private traffic is never accidentally
@@ -177,6 +189,7 @@ impl Rules {
     /// and expanded inline. Background refresh is started for each.
     pub async fn from_config(
         configs: &[RuleConfig], outbounds: &[OutboundConfig], cache_dir: &Path,
+        sink: &dyn StatusSink,
     ) -> Result<Self, String> {
         let mut rules = Self::builtin_private_rules();
 
@@ -270,9 +283,10 @@ impl Rules {
                         geo_sets.push(Arc::new(geo_set));
                     },
                     None => {
-                        return Err(format!(
-                            "Failed to load geo rule set {url}: download failed and no cached file"
-                        ));
+                        let msg = format!("Geo rule set {url} failed to load — traffic will fall through to catch-all rule");
+                        log::warn!("{msg}");
+                        sink.emit(StatusEvent::Notice { level: NoticeLevel::Warning, msg });
+                        continue;
                     },
                 }
             } else {
