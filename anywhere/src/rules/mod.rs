@@ -15,23 +15,20 @@ use crate::rules::geo::GeoMatcher;
 use crate::rules::geo::GeoRuleSet;
 
 pub mod geo;
+pub mod protocol;
+
 pub use geo::DomainMatcher;
 pub use geo::IpRange;
 pub use geo::ParsedRuleSet;
 pub use geo::SrsRuleSet;
+pub use protocol::ProtocolMatch;
+pub use protocol::SniffInfo;
+pub use protocol::parse_protocol;
+pub use protocol::protocol_matches;
+
 const PAYLOAD_DISPLAY_ITEMS: usize = 4;
 
 pub use geo::read_srs_bytes;
-
-/// Protocol shortcuts — expand to known port/network combos.
-fn protocol_rules() -> Vec<(&'static str, Network, u16, u16)> {
-    vec![
-        ("bittorrent", Network::Tcp, 6881, 6889),
-        ("bittorrent", Network::Udp, 6881, 6881),
-        ("stun", Network::Udp, 3478, 3479),
-        ("stun", Network::Tcp, 3478, 3479),
-    ]
-}
 
 /// A single routing rule.
 #[derive(Clone)]
@@ -44,6 +41,9 @@ pub struct Rule {
     pub port: Option<u16>,
     pub port_range: Option<(u16, u16)>,
     pub network: Option<Network>,
+    /// Protocol match conditions (port-based and/or sniff-based).
+    /// OR semantics: any condition hitting is enough.
+    pub protocol: Option<Vec<ProtocolMatch>>,
     pub outbound_tag: String,
     pub geo_matcher: Option<Arc<GeoMatcher>>,
 }
@@ -118,6 +118,23 @@ impl Rule {
         if let Some(ref net) = self.network {
             parts.push(format!("network={net}"));
         }
+        if let Some(ref proto_matches) = self.protocol {
+            let proto_strs: Vec<String> = proto_matches
+                .iter()
+                .map(|m| match m {
+                    ProtocolMatch::PortRange { network, range } => {
+                        format!("{}:{}-{}", network, range.0, range.1)
+                    },
+                    ProtocolMatch::Sniffed(name) => {
+                        format!("sniff:{name}")
+                    },
+                })
+                .collect();
+            parts.push(format!(
+                "protocol={}",
+                proto_strs.join("|")
+            ));
+        }
 
         if parts.is_empty() {
             "match-all".to_string()
@@ -171,6 +188,7 @@ impl Rules {
             port: None,
             port_range: None,
             network: None,
+            protocol: None,
             outbound_tag: "direct".into(),
             geo_matcher: None,
         }]
@@ -223,6 +241,7 @@ impl Rules {
                     port: None,
                     port_range: None,
                     network: None,
+                    protocol: None,
                     outbound_tag: "direct".into(),
                     geo_matcher: None,
                 });
@@ -241,6 +260,7 @@ impl Rules {
                     port: None,
                     port_range: None,
                     network: None,
+                    protocol: None,
                     outbound_tag: "direct".into(),
                     geo_matcher: None,
                 });
@@ -276,6 +296,7 @@ impl Rules {
                                 .network
                                 .as_deref()
                                 .and_then(parse_network),
+                            protocol: None,
                             outbound_tag: config.outbound.clone(),
                             geo_matcher: Some(Arc::new(gm)),
                         });
@@ -290,49 +311,34 @@ impl Rules {
                     },
                 }
             } else {
-                if let Some(ref proto) = config.protocol {
-                    if let Some(parsed) = parse_protocol_inline(proto) {
-                        for (net, range) in parsed {
-                            rules.push(Rule {
-                                type_: config.type_.clone(),
-                                domain: config.domain.clone(),
-                                domain_suffix: config.domain_suffix.clone(),
-                                domain_keyword: config.domain_keyword.clone(),
-                                ip_cidr: config.ip_cidr.clone(),
-                                port: None,
-                                port_range: Some(range),
-                                network: Some(net),
-                                outbound_tag: config.outbound.clone(),
-                                geo_matcher: None,
-                            });
-                        }
-                    } else {
-                        // Legacy protocol name lookup (e.g. "bittorrent").
-                        let mut matched = false;
-                        for &(p, net, lo, hi) in &protocol_rules() {
-                            if p != proto {
-                                continue;
-                            }
-                            matched = true;
-                            rules.push(Rule {
-                                type_: config.type_.clone(),
-                                domain: config.domain.clone(),
-                                domain_suffix: config.domain_suffix.clone(),
-                                domain_keyword: config.domain_keyword.clone(),
-                                ip_cidr: config.ip_cidr.clone(),
-                                port: config.port,
-                                port_range: Some((lo, hi)),
-                                network: Some(net),
-                                outbound_tag: config.outbound.clone(),
-                                geo_matcher: None,
-                            });
-                        }
-                        if !matched {
-                            log::warn!(
-                                "Unknown protocol shorthand '{proto}', skipping rule"
-                            );
-                        }
-                    }
+                // Parse protocol field into ProtocolMatch conditions.
+                // Empty / unknown protocols produce an empty vec and are skipped.
+                let proto_matches = config
+                    .protocol
+                    .as_deref()
+                    .map(parse_protocol)
+                    .filter(|v| !v.is_empty());
+
+                if proto_matches.is_some() {
+                    rules.push(Rule {
+                        type_: config.type_.clone(),
+                        domain: config.domain.clone(),
+                        domain_suffix: config.domain_suffix.clone(),
+                        domain_keyword: config.domain_keyword.clone(),
+                        ip_cidr: config.ip_cidr.clone(),
+                        port: config.port,
+                        port_range: config
+                            .port_range
+                            .as_deref()
+                            .and_then(parse_port_range),
+                        network: config
+                            .network
+                            .as_deref()
+                            .and_then(parse_network),
+                        protocol: proto_matches,
+                        outbound_tag: config.outbound.clone(),
+                        geo_matcher: None,
+                    });
                 } else {
                     rules.push(Rule {
                         type_: config.type_.clone(),
@@ -349,6 +355,7 @@ impl Rules {
                             .network
                             .as_deref()
                             .and_then(parse_network),
+                        protocol: None,
                         outbound_tag: config.outbound.clone(),
                         geo_matcher: None,
                     });
@@ -412,6 +419,7 @@ impl Rules {
     /// - RULE:     all rules are matched
     pub fn match_conn(
         &self, dest: &Destination, network: Network,
+        sniff_info: Option<&SniffInfo>,
     ) -> Option<RuleMatch> {
         if self.rules.is_empty() {
             return None;
@@ -430,7 +438,7 @@ impl Rules {
                 // Only match builtin rules (e.g. private CIDRs).
                 for rule in &self.rules {
                     if rule.type_ == TYPE_BUILTIN {
-                        if Self::matches(dest, network, rule) {
+                        if Self::matches(dest, network, rule, sniff_info) {
                             return Some(Self::rule_match(
                                 rule.outbound_tag.clone(),
                                 rule,
@@ -449,7 +457,7 @@ impl Rules {
             _ => {
                 // MODE_RULE: match all rules
                 for rule in &self.rules {
-                    if Self::matches(dest, network, rule) {
+                    if Self::matches(dest, network, rule, sniff_info) {
                         return Some(Self::rule_match(
                             rule.outbound_tag.clone(),
                             rule,
@@ -474,7 +482,10 @@ impl Rules {
     /// Returns `true` when `dest`/`network` match all configured matchers on
     /// `rule`. A matcher that is `None` is ignored. A rule with no matchers
     /// always matches (catch-all).
-    fn matches(dest: &Destination, network: Network, rule: &Rule) -> bool {
+    fn matches(
+        dest: &Destination, network: Network, rule: &Rule,
+        sniff_info: Option<&SniffInfo>,
+    ) -> bool {
         if let Some(rule_net) = rule.network {
             if rule_net != network {
                 return false;
@@ -489,6 +500,13 @@ impl Rules {
 
         if let Some((min, max)) = rule.port_range {
             if dest.port < min || dest.port > max {
+                return false;
+            }
+        }
+
+        // Protocol matching (port-based OR sniff-based)
+        if let Some(ref proto_matches) = rule.protocol {
+            if !protocol_matches(proto_matches, network, dest.port, sniff_info) {
                 return false;
             }
         }
@@ -611,77 +629,6 @@ fn parse_network(s: &str) -> Option<Network> {
     }
 }
 
-/// Parse inline protocol+port syntax like `"both:443"`, `"tcp:80,1132"`, or
-/// `"udp:53"`.
-///
-/// One value after the colon = single port. Two comma-separated values =
-/// inclusive range `lo,hi`. Three or more values → invalid (warn and skip).
-///
-/// Return value semantics:
-/// - `Some(vec![...])` — valid inline format, use these entries
-/// - `Some(vec![])` — inline format detected but invalid (already warned), skip
-/// - `None` — no `:` separator, caller should try legacy name lookup
-fn parse_protocol_inline(s: &str) -> Option<Vec<(Network, (u16, u16))>> {
-    let (proto, ports_str) = s.split_once(':')?;
-
-    let nets: &[Network] = match proto.to_ascii_lowercase().as_str() {
-        "tcp" => &[Network::Tcp],
-        "udp" => &[Network::Udp],
-        "both" => &[Network::Tcp, Network::Udp],
-        _ => {
-            log::warn!(
-                "Unknown protocol '{proto}' in '{s}', expected tcp/udp/both"
-            );
-            return Some(vec![]);
-        },
-    };
-
-    let ports: Vec<&str> = ports_str
-        .split(',')
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .collect();
-
-    if ports.is_empty() {
-        log::warn!("No valid ports in protocol '{s}'");
-        return Some(vec![]);
-    }
-
-    if ports.len() > 2 {
-        log::warn!(
-            "Too many ports in protocol '{s}', expected 1 or 2 (use '-' for range)"
-        );
-        return Some(vec![]);
-    }
-
-    let p1: u16 = match ports[0].parse() {
-        Ok(p) => p,
-        Err(_) => {
-            log::warn!("Invalid port '{}' in protocol '{s}'", ports[0]);
-            return Some(vec![]);
-        },
-    };
-
-    let range = if ports.len() == 2 {
-        let p2: u16 = match ports[1].parse() {
-            Ok(p) => p,
-            Err(_) => {
-                log::warn!("Invalid port '{}' in protocol '{s}'", ports[1]);
-                return Some(vec![]);
-            },
-        };
-        if p1 <= p2 { (p1, p2) } else { (p2, p1) }
-    } else {
-        (p1, p1)
-    };
-
-    let mut result = Vec::new();
-    for &net in nets {
-        result.push((net, range));
-    }
-
-    Some(result)
-}
 
 /// Builds a bitmask with the top `prefix` bits set for an IPv4 address.
 fn v4_prefix_mask(prefix: u8) -> u32 {
@@ -717,17 +664,25 @@ mod tests {
     impl Rules {
         fn from_config_sync(configs: &[RuleConfig]) -> Self {
             let mut rules = Self::builtin_private_rules();
-            rules.extend(configs.iter().map(|c| Rule {
-                type_: c.type_.clone(),
-                domain: c.domain.clone(),
-                domain_suffix: c.domain_suffix.clone(),
-                domain_keyword: c.domain_keyword.clone(),
-                ip_cidr: c.ip_cidr.clone(),
-                port: c.port,
-                port_range: c.port_range.as_deref().and_then(parse_port_range),
-                network: c.network.as_deref().and_then(parse_network),
-                outbound_tag: c.outbound.clone(),
-                geo_matcher: None,
+            rules.extend(configs.iter().map(|c| {
+                let proto_matches = c
+                    .protocol
+                    .as_deref()
+                    .map(parse_protocol)
+                    .filter(|v| !v.is_empty());
+                Rule {
+                    type_: c.type_.clone(),
+                    domain: c.domain.clone(),
+                    domain_suffix: c.domain_suffix.clone(),
+                    domain_keyword: c.domain_keyword.clone(),
+                    ip_cidr: c.ip_cidr.clone(),
+                    port: c.port,
+                    port_range: c.port_range.as_deref().and_then(parse_port_range),
+                    network: c.network.as_deref().and_then(parse_network),
+                    protocol: proto_matches,
+                    outbound_tag: c.outbound.clone(),
+                    geo_matcher: None,
+                }
             }));
             let global_outbound = rules
                 .iter()
@@ -773,7 +728,7 @@ mod tests {
 
         assert_eq!(
             rules
-                .match_conn(&dest("example.com:443"), Network::Tcp)
+                .match_conn(&dest("example.com:443"), Network::Tcp, None)
                 .map(|m| m.outbound_tag)
                 .as_deref(),
             Some("direct")
@@ -781,7 +736,7 @@ mod tests {
         // No catch-all rule — unmatched returns None.
         assert!(
             rules
-                .match_conn(&dest("other.com:80"), Network::Tcp)
+                .match_conn(&dest("other.com:80"), Network::Tcp, None)
                 .is_none()
         );
     }
@@ -796,14 +751,14 @@ mod tests {
 
         assert_eq!(
             rules
-                .match_conn(&dest("example.com:443"), Network::Tcp)
+                .match_conn(&dest("example.com:443"), Network::Tcp, None)
                 .map(|m| m.outbound_tag)
                 .as_deref(),
             Some("proxy")
         );
         assert_eq!(
             rules
-                .match_conn(&dest("sub.example.com:80"), Network::Tcp)
+                .match_conn(&dest("sub.example.com:80"), Network::Tcp, None)
                 .map(|m| m.outbound_tag)
                 .as_deref(),
             Some("proxy")
@@ -820,14 +775,14 @@ mod tests {
 
         assert_eq!(
             rules
-                .match_conn(&dest("google.com:443"), Network::Tcp)
+                .match_conn(&dest("google.com:443"), Network::Tcp, None)
                 .map(|m| m.outbound_tag)
                 .as_deref(),
             Some("block")
         );
         assert_eq!(
             rules
-                .match_conn(&dest("www.googleapis.com:443"), Network::Tcp)
+                .match_conn(&dest("www.googleapis.com:443"), Network::Tcp, None)
                 .map(|m| m.outbound_tag)
                 .as_deref(),
             Some("block")
@@ -851,7 +806,7 @@ mod tests {
 
         assert_eq!(
             rules
-                .match_conn(&dest("a.example:443"), Network::Tcp)
+                .match_conn(&dest("a.example:443"), Network::Tcp, None)
                 .map(|m| m.description),
             Some(
                 "domain=a.example,b.example,c.example,d.example,…(+2) => \
@@ -876,7 +831,7 @@ mod tests {
 
         assert_eq!(
             rules
-                .match_conn(&dest("www.a.example:443"), Network::Tcp)
+                .match_conn(&dest("www.a.example:443"), Network::Tcp, None)
                 .map(|m| m.description),
             Some(
                 "domain_suffix=a.example,b.example,c.example,d.example => \
@@ -896,7 +851,7 @@ mod tests {
 
         assert_eq!(
             rules
-                .match_conn(&dest("198.51.100.1:443"), Network::Tcp)
+                .match_conn(&dest("198.51.100.1:443"), Network::Tcp, None)
                 .map(|m| m.outbound_tag)
                 .as_deref(),
             Some("proxy")
@@ -914,7 +869,7 @@ mod tests {
         let dest = Destination::new(Address::Domain("192.168.1.100".into()), 443);
         assert_eq!(
             rules
-                .match_conn(&dest, Network::Tcp)
+                .match_conn(&dest, Network::Tcp, None)
                 .map(|m| m.outbound_tag)
                 .as_deref(),
             Some("direct")
@@ -924,7 +879,7 @@ mod tests {
         let dest = Destination::new(Address::Domain("10.0.0.1".into()), 443);
         assert_eq!(
             rules
-                .match_conn(&dest, Network::Tcp)
+                .match_conn(&dest, Network::Tcp, None)
                 .map(|m| m.outbound_tag)
                 .as_deref(),
             Some("direct")
@@ -941,7 +896,7 @@ mod tests {
 
         assert_eq!(
             rules
-                .match_conn(&dest("[2001:db8::1]:443"), Network::Tcp)
+                .match_conn(&dest("[2001:db8::1]:443"), Network::Tcp, None)
                 .map(|m| m.outbound_tag)
                 .as_deref(),
             Some("v6")
@@ -965,7 +920,7 @@ mod tests {
 
         assert_eq!(
             rules
-                .match_conn(&dest("example.com:443"), Network::Tcp)
+                .match_conn(&dest("example.com:443"), Network::Tcp, None)
                 .map(|m| m.outbound_tag)
                 .as_deref(),
             Some("direct")
@@ -976,7 +931,7 @@ mod tests {
     fn empty_config_returns_none_for_public_ip() {
         let rules = Rules::from_config_sync(&[]);
         // 1.1.1.1 is not a private CIDR, so built-in rules don't match.
-        let m = rules.match_conn(&dest("1.1.1.1:443"), Network::Tcp);
+        let m = rules.match_conn(&dest("1.1.1.1:443"), Network::Tcp, None);
         assert!(m.is_none());
     }
 
@@ -994,21 +949,21 @@ mod tests {
         // Everything routes to direct in DIRECT mode.
         assert_eq!(
             rules
-                .match_conn(&dest("192.168.1.1:443"), Network::Tcp)
+                .match_conn(&dest("192.168.1.1:443"), Network::Tcp, None)
                 .map(|m| m.outbound_tag)
                 .as_deref(),
             Some("direct")
         );
         assert_eq!(
             rules
-                .match_conn(&dest("example.com:443"), Network::Tcp)
+                .match_conn(&dest("example.com:443"), Network::Tcp, None)
                 .map(|m| m.outbound_tag)
                 .as_deref(),
             Some("direct")
         );
         assert_eq!(
             rules
-                .match_conn(&dest("1.1.1.1:443"), Network::Tcp)
+                .match_conn(&dest("1.1.1.1:443"), Network::Tcp, None)
                 .map(|m| m.outbound_tag)
                 .as_deref(),
             Some("direct")
@@ -1027,7 +982,7 @@ mod tests {
         // Builtin private CIDRs still route to direct.
         assert_eq!(
             rules
-                .match_conn(&dest("192.168.1.1:443"), Network::Tcp)
+                .match_conn(&dest("192.168.1.1:443"), Network::Tcp, None)
                 .map(|m| m.outbound_tag)
                 .as_deref(),
             Some("direct")
@@ -1035,7 +990,7 @@ mod tests {
         // example.com doesn't match builtin, falls through to global_outbound.
         assert_eq!(
             rules
-                .match_conn(&dest("example.com:443"), Network::Tcp)
+                .match_conn(&dest("example.com:443"), Network::Tcp, None)
                 .map(|m| m.outbound_tag)
                 .as_deref(),
             Some("proxy")
@@ -1043,7 +998,7 @@ mod tests {
         // Unmatched traffic catches to global_outbound (= last user rule).
         assert_eq!(
             rules
-                .match_conn(&dest("1.1.1.1:443"), Network::Tcp)
+                .match_conn(&dest("1.1.1.1:443"), Network::Tcp, None)
                 .map(|m| m.outbound_tag)
                 .as_deref(),
             Some("proxy")
@@ -1060,7 +1015,7 @@ mod tests {
         // Default is MODE_RULE — user rules work normally.
         assert_eq!(
             rules
-                .match_conn(&dest("example.com:443"), Network::Tcp)
+                .match_conn(&dest("example.com:443"), Network::Tcp, None)
                 .map(|m| m.outbound_tag)
                 .as_deref(),
             Some("proxy")
@@ -1068,7 +1023,7 @@ mod tests {
         // Unmatched traffic returns None in MODE_RULE (no catch-all).
         assert!(
             rules
-                .match_conn(&dest("1.1.1.1:443"), Network::Tcp)
+                .match_conn(&dest("1.1.1.1:443"), Network::Tcp, None)
                 .is_none()
         );
     }
@@ -1091,14 +1046,14 @@ mod tests {
 
         assert_eq!(
             rules
-                .match_conn(&dest("1.1.1.1:53"), Network::Udp)
+                .match_conn(&dest("1.1.1.1:53"), Network::Udp, None)
                 .map(|m| m.outbound_tag)
                 .as_deref(),
             Some("udp-out")
         );
         assert_eq!(
             rules
-                .match_conn(&dest("1.1.1.1:53"), Network::Tcp)
+                .match_conn(&dest("1.1.1.1:53"), Network::Tcp, None)
                 .map(|m| m.outbound_tag)
                 .as_deref(),
             Some("default")
@@ -1121,14 +1076,14 @@ mod tests {
 
         assert_eq!(
             rules
-                .match_conn(&dest("example.com:443"), Network::Tcp)
+                .match_conn(&dest("example.com:443"), Network::Tcp, None)
                 .map(|m| m.outbound_tag)
                 .as_deref(),
             Some("https")
         );
         assert_eq!(
             rules
-                .match_conn(&dest("example.com:80"), Network::Tcp)
+                .match_conn(&dest("example.com:80"), Network::Tcp, None)
                 .map(|m| m.outbound_tag)
                 .as_deref(),
             Some("default")
@@ -1151,232 +1106,100 @@ mod tests {
 
         assert_eq!(
             rules
-                .match_conn(&dest("example.com:8500"), Network::Tcp)
+                .match_conn(&dest("example.com:8500"), Network::Tcp, None)
                 .map(|m| m.outbound_tag)
                 .as_deref(),
             Some("range")
         );
         assert_eq!(
             rules
-                .match_conn(&dest("example.com:9001"), Network::Tcp)
+                .match_conn(&dest("example.com:9001"), Network::Tcp, None)
                 .map(|m| m.outbound_tag)
                 .as_deref(),
             Some("default")
         );
     }
 
-    // -- parse_protocol_inline ------------------------------------------------
+    // -- protocol + sniff integration -----------------------------------------
 
-    #[test]
-    fn inline_both_single_port() {
-        let result = parse_protocol_inline("both:443").unwrap();
-        assert_eq!(result.len(), 2);
-        assert!(result.contains(&(Network::Tcp, (443, 443))));
-        assert!(result.contains(&(Network::Udp, (443, 443))));
-    }
-
-    #[test]
-    fn inline_tcp_port_range() {
-        let result = parse_protocol_inline("tcp:80,1132").unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0], (Network::Tcp, (80, 1132)));
-    }
-
-    #[test]
-    fn inline_udp_single_port() {
-        let result = parse_protocol_inline("udp:53").unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0], (Network::Udp, (53, 53)));
-    }
-
-    #[test]
-    fn inline_unknown_protocol_returns_empty() {
-        let result = parse_protocol_inline("foo:443");
-        assert_eq!(result, Some(vec![]));
-    }
-
-    #[test]
-    fn inline_no_colon_falls_back() {
-        let result = parse_protocol_inline("bittorrent");
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn inline_invalid_port_returns_empty() {
-        let result = parse_protocol_inline("tcp:abc");
-        assert_eq!(result, Some(vec![]));
-    }
-
-    #[test]
-    fn inline_empty_ports_returns_empty() {
-        let result = parse_protocol_inline("both:");
-        assert_eq!(result, Some(vec![]));
-    }
-
-    #[test]
-    fn inline_too_many_ports_returns_empty() {
-        let result = parse_protocol_inline("tcp:80,443,8080");
-        assert_eq!(result, Some(vec![]));
-    }
-
-    #[test]
-    fn inline_reversed_range_swapped() {
-        let result = parse_protocol_inline("tcp:1132,80").unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0], (Network::Tcp, (80, 1132)));
-    }
-
-    // -- protocol inline via config -------------------------------------------
-
-    fn from_config_sync_protocol(configs: &[RuleConfig]) -> Rules {
-        let mut rules = Rules::builtin_private_rules();
-        for config in configs {
-            if let Some(ref proto) = config.protocol {
-                if let Some(parsed) = parse_protocol_inline(proto) {
-                    for (net, range) in parsed {
-                        rules.push(Rule {
-                            type_: config.type_.clone(),
-                            domain: config.domain.clone(),
-                            domain_suffix: config.domain_suffix.clone(),
-                            domain_keyword: config.domain_keyword.clone(),
-                            ip_cidr: config.ip_cidr.clone(),
-                            port: None,
-                            port_range: Some(range),
-                            network: Some(net),
-                            outbound_tag: config.outbound.clone(),
-                            geo_matcher: None,
-                        });
-                    }
-                } else {
-                    for &(p, net, lo, hi) in &protocol_rules() {
-                        if p != proto {
-                            continue;
-                        }
-                        rules.push(Rule {
-                            type_: config.type_.clone(),
-                            domain: config.domain.clone(),
-                            domain_suffix: config.domain_suffix.clone(),
-                            domain_keyword: config.domain_keyword.clone(),
-                            ip_cidr: config.ip_cidr.clone(),
-                            port: config.port,
-                            port_range: Some((lo, hi)),
-                            network: Some(net),
-                            outbound_tag: config.outbound.clone(),
-                            geo_matcher: None,
-                        });
-                    }
-                }
-            } else {
-                rules.push(Rule {
-                    type_: config.type_.clone(),
-                    domain: config.domain.clone(),
-                    domain_suffix: config.domain_suffix.clone(),
-                    domain_keyword: config.domain_keyword.clone(),
-                    ip_cidr: config.ip_cidr.clone(),
-                    port: config.port,
-                    port_range: config
-                        .port_range
-                        .as_deref()
-                        .and_then(parse_port_range),
-                    network: config.network.as_deref().and_then(parse_network),
-                    outbound_tag: config.outbound.clone(),
-                    geo_matcher: None,
-                });
-            }
-        }
-        let global_outbound = rules
-            .iter()
-            .rev()
-            .find(|r| r.type_ != TYPE_BUILTIN)
-            .map(|r| r.outbound_tag.clone())
-            .unwrap_or_else(|| "direct".into());
-        Rules {
-            rules,
-            mode: AtomicU8::new(MODE_RULE),
-            global_outbound,
+    fn proto_rule(protocol: &str, outbound: &str) -> RuleConfig {
+        RuleConfig {
+            protocol: Some(protocol.into()),
+            outbound: outbound.into(),
+            ..rc()
         }
     }
 
     #[test]
-    fn protocol_inline_tcp_range_matches_config() {
-        let rules = from_config_sync_protocol(&[RuleConfig {
-            protocol: Some("tcp:80,443".into()),
-            outbound: "web".into(),
-            ..rc()
-        }]);
-
+    fn protocol_bittorrent_matches_by_port() {
+        let rules = Rules::from_config_sync(&[proto_rule("bittorrent", "p2p")]);
+        // Port 6881 is in the BT port range → match
         assert_eq!(
             rules
-                .match_conn(&dest("example.com:80"), Network::Tcp)
+                .match_conn(&dest("example.com:6881"), Network::Tcp, None)
                 .map(|m| m.outbound_tag)
                 .as_deref(),
-            Some("web")
-        );
-        assert_eq!(
-            rules
-                .match_conn(&dest("example.com:443"), Network::Tcp)
-                .map(|m| m.outbound_tag)
-                .as_deref(),
-            Some("web")
-        );
-        assert!(
-            rules
-                .match_conn(&dest("example.com:80"), Network::Udp)
-                .is_none()
-        );
-        // 8080 is outside 80-443 range
-        assert!(
-            rules
-                .match_conn(&dest("example.com:8080"), Network::Tcp)
-                .is_none()
+            Some("p2p")
         );
     }
 
     #[test]
-    fn protocol_inline_both_matches_any_protocol() {
-        let rules = from_config_sync_protocol(&[RuleConfig {
-            protocol: Some("both:1232".into()),
-            outbound: "svc".into(),
-            ..rc()
-        }]);
-
-        assert_eq!(
-            rules
-                .match_conn(&dest("example.com:1232"), Network::Tcp)
-                .map(|m| m.outbound_tag)
-                .as_deref(),
-            Some("svc")
-        );
-        assert_eq!(
-            rules
-                .match_conn(&dest("example.com:1232"), Network::Udp)
-                .map(|m| m.outbound_tag)
-                .as_deref(),
-            Some("svc")
-        );
-    }
-
-    #[test]
-    fn protocol_inline_and_legacy_name_both_work() {
-        let rules = from_config_sync_protocol(&[RuleConfig {
+    fn protocol_bittorrent_matches_by_sniff() {
+        let rules = Rules::from_config_sync(&[proto_rule("bittorrent", "p2p")]);
+        // Sniffed BT on non-BT port → match via sniff
+        let sniff = SniffInfo {
+            domain: None,
             protocol: Some("bittorrent".into()),
-            outbound: "p2p".into(),
-            ..rc()
-        }]);
-
+            client: None,
+        };
         assert_eq!(
             rules
-                .match_conn(&dest("example.com:6881"), Network::Tcp)
+                .match_conn(&dest("example.com:443"), Network::Tcp, Some(&sniff))
                 .map(|m| m.outbound_tag)
                 .as_deref(),
             Some("p2p")
         );
+    }
+
+    #[test]
+    fn protocol_sniff_ssh_matches() {
+        let rules = Rules::from_config_sync(&[proto_rule("sniff:ssh", "ssh-proxy")]);
+        let sniff = SniffInfo {
+            domain: None,
+            protocol: Some("ssh".into()),
+            client: None,
+        };
         assert_eq!(
             rules
-                .match_conn(&dest("example.com:6889"), Network::Tcp)
+                .match_conn(&dest("1.2.3.4:22"), Network::Tcp, Some(&sniff))
                 .map(|m| m.outbound_tag)
                 .as_deref(),
-            Some("p2p")
+            Some("ssh-proxy")
+        );
+        // No sniff info → no match
+        assert!(
+            rules
+                .match_conn(&dest("1.2.3.4:22"), Network::Tcp, None)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn protocol_both_port_matches_tcp_and_udp() {
+        let rules = Rules::from_config_sync(&[proto_rule("both:8443", "svc")]);
+        assert_eq!(
+            rules
+                .match_conn(&dest("example.com:8443"), Network::Tcp, None)
+                .map(|m| m.outbound_tag)
+                .as_deref(),
+            Some("svc")
+        );
+        assert_eq!(
+            rules
+                .match_conn(&dest("example.com:8443"), Network::Udp, None)
+                .map(|m| m.outbound_tag)
+                .as_deref(),
+            Some("svc")
         );
     }
 
@@ -1397,7 +1220,7 @@ mod tests {
 
         assert_eq!(
             rules
-                .match_conn(&dest("8.8.8.8:53"), Network::Udp)
+                .match_conn(&dest("8.8.8.8:53"), Network::Udp, None)
                 .map(|m| m.outbound_tag)
                 .as_deref(),
             Some("dns")
@@ -1405,7 +1228,7 @@ mod tests {
         // TCP/53 should NOT match the dns rule.
         assert_eq!(
             rules
-                .match_conn(&dest("8.8.8.8:53"), Network::Tcp)
+                .match_conn(&dest("8.8.8.8:53"), Network::Tcp, None)
                 .map(|m| m.outbound_tag)
                 .as_deref(),
             Some("default")
@@ -1413,7 +1236,7 @@ mod tests {
         // UDP/443 should NOT match the dns rule either.
         assert_eq!(
             rules
-                .match_conn(&dest("8.8.8.8:443"), Network::Udp)
+                .match_conn(&dest("8.8.8.8:443"), Network::Udp, None)
                 .map(|m| m.outbound_tag)
                 .as_deref(),
             Some("default")

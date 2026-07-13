@@ -8,6 +8,8 @@ use std::io;
 use tokio::net::TcpStream;
 use tokio::net::UdpSocket;
 
+use crate::tlsfragment::{FragmentConfig, FragmentTcpStream};
+
 /// Default error message returned by [`OutboundClient::dial_udp`] when
 /// the outbound does not support UDP at all.
 pub const ERR_UDP_NOT_SUPPORTED: &str = "UDP not supported by this outbound";
@@ -45,6 +47,12 @@ pub async fn connect_tcp_bypass(
             socket.set_mark(fwmark)?;
             // Disable Nagle for low-latency protocols (DoH, proxy handshakes).
             socket.set_nodelay(true)?;
+            // Enable TCP keepalive to detect half-open connections.
+            socket.set_keepalive(true)?;
+            socket.set_tcp_keepalive(&socket2::TcpKeepalive::new()
+                .with_time(std::time::Duration::from_secs(60))
+                .with_interval(std::time::Duration::from_secs(15))
+                .with_retries(3))?;
             socket.connect_timeout(&addr.into(), TCP_CONNECT_TIMEOUT)?;
             let std_stream: std::net::TcpStream = socket.into();
             TcpStream::from_std(std_stream)
@@ -84,6 +92,12 @@ pub async fn connect_tcp_bypass(
                 log::debug!("protect(fd={fd}) ok, connecting to {addr}");
             }
             socket.set_nodelay(true)?;
+            // Enable TCP keepalive to detect half-open connections.
+            socket.set_keepalive(true)?;
+            socket.set_tcp_keepalive(&socket2::TcpKeepalive::new()
+                .with_time(std::time::Duration::from_secs(60))
+                .with_interval(std::time::Duration::from_secs(15))
+                .with_retries(3))?;
             socket.set_nonblocking(true)?;
 
             // Non-blocking connect returns EINPROGRESS immediately.
@@ -135,7 +149,13 @@ pub async fn connect_tcp_bypass(
     }
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
     {
-        TcpStream::connect(addr).await
+        let stream = TcpStream::connect(addr).await?;
+        let sock_ref = socket2::SockRef::from(&stream);
+        let _ = sock_ref.set_tcp_keepalive(&socket2::TcpKeepalive::new()
+            .with_time(std::time::Duration::from_secs(60))
+            .with_interval(std::time::Duration::from_secs(15))
+            .with_retries(3));
+        Ok(stream)
     }
 }
 
@@ -211,6 +231,11 @@ pub fn connect_tcp_bypass_sync(
         let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
         socket.set_mark(BYPASS_FWMARK)?;
         socket.set_nodelay(true)?;
+        socket.set_keepalive(true)?;
+        socket.set_tcp_keepalive(&socket2::TcpKeepalive::new()
+            .with_time(std::time::Duration::from_secs(60))
+            .with_interval(std::time::Duration::from_secs(15))
+            .with_retries(3))?;
         socket.connect(&addr.into())?;
         Ok(socket.into())
     }
@@ -236,12 +261,23 @@ pub fn connect_tcp_bypass_sync(
             log::warn!("VpnService.protect() failed for sync TCP fd={fd}");
         }
         socket.set_nodelay(true)?;
+        socket.set_keepalive(true)?;
+        socket.set_tcp_keepalive(&socket2::TcpKeepalive::new()
+            .with_time(std::time::Duration::from_secs(60))
+            .with_interval(std::time::Duration::from_secs(15))
+            .with_retries(3))?;
         socket.connect(&addr.into())?;
         Ok(socket.into())
     }
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
     {
-        std::net::TcpStream::connect(addr)
+        let stream = std::net::TcpStream::connect(addr)?;
+        let sock_ref = socket2::SockRef::from(&stream);
+        let _ = sock_ref.set_tcp_keepalive(&socket2::TcpKeepalive::new()
+            .with_time(std::time::Duration::from_secs(60))
+            .with_interval(std::time::Duration::from_secs(15))
+            .with_retries(3));
+        Ok(stream)
     }
 }
 
@@ -309,11 +345,24 @@ pub fn resolve_sni(
     }
 }
 
+/// The unified TLS stream type returned by [`create_tls_stream`].
+///
+/// When TLS fragment is enabled, the underlying TCP stream is wrapped in
+/// [`FragmentTcpStream`] which splits the first ClientHello write across
+/// multiple TCP segments.  When disabled, the wrapper still exists but
+/// passes all writes through unchanged.
+pub type TlsStream = SslStream<FragmentTcpStream<std::net::TcpStream>>;
+
 /// Build a TLS connection: SSL context → fingerprint → verify → SNI →
 /// connect. Shared by anytls, vless, and any future outbound that needs TLS.
+///
+/// If `fragment` is Some, the underlying TCP stream is wrapped with
+/// `FragmentTcpStream` before TLS handshake, causing the ClientHello to be
+/// split across multiple TCP segments to evade DPI SNI matching.
 pub fn create_tls_stream(
     tcp: std::net::TcpStream, sni: &str, fp: bool, insecure: bool,
-) -> io::Result<SslStream<std::net::TcpStream>> {
+    fragment: Option<&FragmentConfig>,
+) -> io::Result<TlsStream> {
     let mut builder = SslContextBuilder::new(SslMethod::tls())
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
     if fp {
@@ -329,7 +378,10 @@ pub fn create_tls_stream(
         ssl.set_hostname(sni)
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
     }
-    let mut stream = SslStream::new(ssl, tcp)
+    // Always wrap with FragmentTcpStream.  When fragment is None,
+    // fragment_enabled is false and all writes pass through unchanged.
+    let frag_stream = FragmentTcpStream::new(tcp, fragment.cloned());
+    let mut stream = SslStream::new(ssl, frag_stream)
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
     stream
         .connect()

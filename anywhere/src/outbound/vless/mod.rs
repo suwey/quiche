@@ -18,6 +18,7 @@ use crate::inbound::Destination;
 use crate::outbound::OutboundClient;
 use crate::outbound::common::connect_tcp_bypass_sync;
 use crate::outbound::common::create_tls_stream;
+use crate::tlsfragment::FragmentConfig;
 use crate::outbound::common::resolve_sni;
 use crate::protocol::vless::VlessCommand;
 use crate::protocol::vless::encode_request_bytes;
@@ -25,7 +26,6 @@ use crate::relay::PacketRelay;
 use crate::relay::StreamRelay;
 use crate::transport::ws::WsConn;
 use async_trait::async_trait;
-use boring::ssl::SslStream;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TryRecvError;
 
@@ -33,7 +33,7 @@ use tokio::sync::mpsc::error::TryRecvError;
 // Unified WS stream — supports TLS and plain TCP
 pub(crate) enum WsStream {
     Plain(WsConn<TcpStream>),
-    Tls(WsConn<SslStream<TcpStream>>),
+    Tls(WsConn<crate::outbound::common::TlsStream>),
 }
 
 impl WsStream {
@@ -41,7 +41,7 @@ impl WsStream {
         match self {
             WsStream::Plain(ws) => ws.get_ref().set_read_timeout(Some(dur)),
             WsStream::Tls(ws) =>
-                ws.get_ref().get_ref().set_read_timeout(Some(dur)),
+                ws.get_ref().get_ref().get_ref().set_read_timeout(Some(dur)),
         }
     }
 }
@@ -110,6 +110,7 @@ struct VlessPool {
     tls_server: String,
     insecure: bool,
     tls_fp: bool,
+    fragment: Option<FragmentConfig>,
     transport_path: String,
     transport_headers: HashMap<String, String>,
 }
@@ -117,6 +118,7 @@ struct VlessPool {
 impl VlessPool {
     fn new(
         addr: SocketAddr, tls_server: String, insecure: bool, tls_fp: bool,
+        fragment: Option<FragmentConfig>,
         transport_path: String, transport_headers: HashMap<String, String>,
     ) -> Arc<Self> {
         Arc::new(Self {
@@ -126,6 +128,7 @@ impl VlessPool {
             tls_server,
             insecure,
             tls_fp,
+            fragment,
             transport_path,
             transport_headers,
         })
@@ -144,6 +147,7 @@ impl VlessPool {
             &self.tls_server,
             self.insecure,
             self.tls_fp,
+            self.fragment.as_ref(),
             &self.transport_path,
             &self.transport_headers,
         )
@@ -253,6 +257,11 @@ impl VlessOutboundClient {
             .entry("Host".to_string())
             .or_insert_with(|| tls_server.clone());
         let mux = cfg.mux;
+        let fragment = if cfg.tls_fragment {
+            Some(FragmentConfig)
+        } else {
+            None
+        };
         let mux_session = if mux {
             let session = crate::outbound::vless::mux::MuxSession::spawn(
                 addr,
@@ -260,6 +269,7 @@ impl VlessOutboundClient {
                 &tls_server,
                 insecure,
                 tls_fp,
+                fragment.as_ref(),
                 &transport_path,
                 &transport_headers,
             )
@@ -274,6 +284,7 @@ impl VlessOutboundClient {
             tls_server.clone(),
             insecure,
             tls_fp,
+            fragment,
             transport_path.clone(),
             transport_headers.clone(),
         );
@@ -323,6 +334,16 @@ impl OutboundClient for VlessOutboundClient {
     async fn dial_udp(
         &self, initial_dest: &Destination,
     ) -> Result<Box<dyn PacketRelay>, Box<dyn std::error::Error>> {
+        // Server only supports DNS (port 53) over UDP. Non-53 UDP would be
+        // rejected by the server anyway — fail fast on the client side.
+        if initial_dest.port != 53 {
+            log::debug!(
+                "vless: rejecting udp/{} (only port 53 supported)",
+                initial_dest.port,
+            );
+            return Err(crate::outbound::common::ERR_UDP_NOT_SUPPORTED.into());
+        }
+
         if self.mux_session.is_some() {
             // Mux doesn't support UDP — fall through to pool/fresh path.
         }
@@ -416,8 +437,9 @@ fn relay_loop(
 }
 
 pub(crate) fn build_ws(
-    tcp: TcpStream, tls_server: &str, insecure: bool, tls_fp: bool, path: &str,
-    headers: &HashMap<String, String>,
+    tcp: TcpStream, tls_server: &str, insecure: bool, tls_fp: bool,
+    fragment: Option<&FragmentConfig>,
+    path: &str, headers: &HashMap<String, String>,
 ) -> io::Result<WsStream> {
     let host = tls_server;
     let hdrs: Vec<(&str, &str)> = headers
@@ -428,7 +450,7 @@ pub(crate) fn build_ws(
         let ws = WsConn::upgrade(tcp, path, host, &hdrs)?;
         return Ok(WsStream::Plain(ws));
     }
-    let ssl_stream = create_tls_stream(tcp, host, tls_fp, insecure)?;
+    let ssl_stream = create_tls_stream(tcp, host, tls_fp, insecure, fragment)?;
     let ws = WsConn::upgrade(ssl_stream, path, host, &hdrs)?;
     Ok(WsStream::Tls(ws))
 }

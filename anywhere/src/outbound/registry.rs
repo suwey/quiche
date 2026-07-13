@@ -238,6 +238,7 @@ mod tests {
             idle_session_timeout: None,
             min_idle_session: None,
             transport_headers: None,
+            tls_fragment: false,
         }
     }
 

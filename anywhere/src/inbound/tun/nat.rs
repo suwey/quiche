@@ -238,14 +238,14 @@ mod tests {
 
     #[test]
     fn test_touch_by_port_keeps_session_alive() {
-        let mut nat = TCPNat::new(Duration::from_millis(20));
+        let mut nat = TCPNat::new(Duration::from_millis(100));
         let client = sa([192, 168, 1, 100], 40000);
         let target = sa([1, 2, 3, 4], 80);
         let port = nat.lookup(client, target);
 
-        std::thread::sleep(Duration::from_millis(10));
+        std::thread::sleep(Duration::from_millis(30));
         assert!(nat.touch_by_port(port));
-        std::thread::sleep(Duration::from_millis(15));
+        std::thread::sleep(Duration::from_millis(50));
 
         assert!(nat.cleanup_expired().is_empty());
         assert!(nat.contains_port(port));

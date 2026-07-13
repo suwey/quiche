@@ -5,6 +5,8 @@
 //! loop. Both `main.rs` (desktop) and `android/jni.rs` (Android) call this.
 
 use std::collections::HashMap;
+use std::net::Ipv4Addr;
+use std::net::Ipv6Addr;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -13,6 +15,8 @@ use crate::config::Config;
 use crate::context::AppContext;
 #[allow(unused_imports)]
 use crate::cache::{self, StatusSink};
+use crate::inbound::Address;
+use crate::inbound::Destination;
 use crate::inbound::Inbound;
 use crate::inbound::InboundConn;
 use crate::inbound::anytls::AnytlsInbound;
@@ -21,9 +25,23 @@ use crate::inbound::socks5::Socks5Inbound;
 use crate::outbound::registry::OutboundRegistry;
 use crate::relay::CountedPacketRelay;
 use crate::relay::CountedStreamRelay;
+use crate::relay::PrependStreamRelay;
+use crate::relay::PrependPacketRelay;
 use crate::relay::bidirectional_packet_relay;
 use crate::relay::bidirectional_relay;
+
+/// Special outbound tag value that means "reject the connection".
+/// When a rule's outbound is this value, the connection is refused:
+/// - TCP: sends RST (via SO_LINGER=0) instead of FIN
+/// - UDP: silently dropped
+const REJECT_TAG: &str = "reject";
+
+fn is_reject_tag(tag: &str) -> bool {
+    tag == REJECT_TAG
+}
 use crate::rules::Rules;
+use crate::rules::SniffInfo;
+use crate::sniff;
 use crate::ui::AppStats;
 use crate::ui::state as ui_state;
 
@@ -730,94 +748,230 @@ async fn run_inbound(mut inbound: impl Inbound + 'static, ctx: AppContext) {
         let ctx = ctx.clone();
 
         tokio::spawn(async move {
-            let destination = conn.destination().clone();
             let network = conn.network();
-            let host = destination.address.to_string();
-            let dest_ip = destination.address.to_string();
-            let dest_port = destination.port.to_string();
-            let source = conn.source();
+            let source = *conn.source();
+            let type_name = conn.type_name().to_string();
 
-            let rule_match = match ctx.rules.match_conn(&destination, network) {
-                Some(m) => m,
-                None => {
-                    log::warn!("No rule for {destination} ({network}), dropping");
-                    return;
-                },
-            };
-            let tag = &rule_match.outbound_tag;
-
-            let client = match ctx.registry.get(&tag) {
-                Some(c) => c,
-                None => {
-                    log::warn!("No outbound tag '{tag}'");
-                    return;
-                }
-            };
-
-            let conn_id = Uuid::new_v4().to_string();
-            let counters = ui_state::ConnCounters::new_arc();
-            let tag_stats = ctx.stats.get_or_create_tag(&tag).await;
-
-            let info = ui_state::Connection {
-                id: conn_id.clone(),
-                metadata: ui_state::ConnMetadata {
-                    destination_ip: dest_ip,
-                    destination_port: dest_port,
-                    host,
-                    network: network.to_string(),
-                    type_: format!("{}/{}", conn.type_name(), network),
-                    source_ip: source.ip().to_string(),
-                    source_port: source.port().to_string(),
-                    process_path: String::new(),
-                    dns_mode: "normal".to_string(),
-                },
-                upload: 0,
-                download: 0,
-                start: chrono::Local::now().to_rfc3339(),
-                chains: vec![tag.clone()],
-                rule: rule_match.description.clone(),
-            };
-
-            ctx.stats
-                .add_connection(conn_id.clone(), Arc::clone(&counters), info)
-                .await;
-
-            match conn {
+            // --- Sniff phase (TUN TCP only) ---
+            // In TUN mode the destination is an IP address. Read the first
+            // bytes of the TCP stream to extract TLS SNI or HTTP Host,
+            // then replace the destination domain so domain-based rules match.
+            let (destination, mut stream, sniff_info) = match conn {
                 InboundConn::Tcp {
                     destination,
                     mut stream,
+                    sniff: true,
                     ..
                 } => {
-                    let dial_result = {
-                        client.dial(&destination).await.map_err(|e| {
-                            format!("Failed to dial {destination} via {tag}: {e}")
-                        })
-                    };
-                    let out = match dial_result {
-                        Ok(o) => o,
-                        Err(msg) => {
-                            log::error!("{msg}");
-                            let _ = stream.shutdown().await;
-                            ctx.stats.remove_connection(&conn_id).await;
-                            return;
-                        },
+                    // Skip sniff for server-first protocols (SMTP/IMAP/POP3/FTP/SSH)
+                    // where the server sends the first packet.
+                    if sniff::is_server_first(destination.port) {
+                        (destination, stream, None)
+                    } else {
+                    let mut buf = vec![0u8; 4096];
+                    let mut total = 0;
+                    while total < buf.len() {
+                        // Check if we have a complete TLS record — if so, stop reading.
+                        // TLS record header: type(1) + version(2) + length(2)
+                        if total >= 5 && buf[0] == 0x16 {
+                            let record_len = u16::from_be_bytes([buf[3], buf[4]]) as usize;
+                            if total >= 5 + record_len {
+                                break; // full ClientHello received
+                            }
+                        }
+                        // Also break early for HTTP (double CRLF marks end of headers)
+                        if total >= 4 && buf[total-4] == b'\r' && buf[total-3] == b'\n' 
+                            && buf[total-2] == b'\r' && buf[total-1] == b'\n' {
+                            break;
+                        }
+                        // After the first read, check if the data looks like
+                        // something we can sniff (TLS/HTTP/QUIC/DNS/etc.).
+                        // If not, skip further sniff reads immediately to
+                        // avoid adding latency to non-standard protocols
+                        // (e.g. WeChat MMTLS).
+                        if total > 0 && !sniff::looks_sniffable(&buf[..total]) {
+                            break;
+                        }
+                        // Timeout to prevent sniff from blocking indefinitely on
+                        // protocols where the client sends a small packet then
+                        // waits for the server to respond (e.g. WeChat private
+                        // protocol). Without this, the connection stalls.
+                        match tokio::time::timeout(
+                            Duration::from_millis(500),
+                            stream.read(&mut buf[total..]),
+                        ).await {
+                            Ok(Ok(0)) => break,
+                            Ok(Ok(n)) => total += n,
+                            Ok(Err(e)) => {
+                                log::debug!("sniff: read error: {e}");
+                                let _ = stream.shutdown().await;
+                                return;
+                            }
+                            Err(_) => {
+                                // Sniff timeout — proceed with whatever we have.
+                                log::debug!(
+                                    "sniff: timeout after reading {total} bytes from {destination}"
+                                );
+                                break;
+                            }
+                        }
+                    }
+                    let peeked = &buf[..total];
+                    let sniffed = sniff::sniff(peeked);
+                    let sniff_info = sniffed.as_ref().map(|r| {
+                        SniffInfo::from_sniff_result(r.domain.clone(), r.protocol)
+                    });
+
+                    let new_dest = if let Some(ref domain) = sniff_info.as_ref().and_then(|s| s.domain.as_ref()) {
+                        let ip = destination.resolved_ip
+                            .or_else(|| match &destination.address {
+                                Address::Ipv4(o) => {
+                                    Some(std::net::IpAddr::V4(Ipv4Addr::from(*o)))
+                                }
+                                Address::Ipv6(o) => {
+                                    Some(std::net::IpAddr::V6(Ipv6Addr::from(*o)))
+                                }
+                                _ => None,
+                            });
+                        match ip {
+                            Some(ip) => Destination::with_resolved(
+                                Address::Domain(domain.to_string()),
+                                destination.port,
+                                ip,
+                            ),
+                            None => Destination::new(
+                                Address::Domain(domain.to_string()),
+                                destination.port,
+                            ),
+                        }
+                    } else {
+                        destination
                     };
 
-                    let mut counted_out = CountedStreamRelay {
-                        inner: out,
-                        stats: Arc::clone(&ctx.stats),
-                        conn_counters: Arc::clone(&counters),
-                        tag_stats: Arc::clone(&tag_stats),
-                    };
-
-                    log::info!("Relaying tcp {destination} via {tag}");
-                    bidirectional_relay(&mut *stream, &mut counted_out).await;
-                },
+                    let boxed: Box<dyn crate::relay::StreamRelay> =
+                        Box::new(PrependStreamRelay::new(stream, buf[..total].to_vec()));
+                    (new_dest, boxed, sniff_info)
+                    } // end else (not server-first)
+                }
+                InboundConn::Tcp {
+                    destination, stream, ..
+                } => (destination, stream, None),
                 InboundConn::Udp {
                     initial_destination,
                     mut packet,
+                    type_,
                     ..
                 } => {
+                    // --- UDP path (with optional sniff) ---
+                    // For TUN UDP, sniff the first datagram for QUIC SNI or DNS query name.
+                    let mut sniff_info: Option<SniffInfo> = None;
+                    let mut destination = initial_destination.clone();
+
+                    let should_sniff_udp = type_ == "tun"
+                        && matches!(&initial_destination.address, Address::Ipv4(_) | Address::Ipv6(_));
+
+                    if should_sniff_udp {
+                        let mut buf = vec![0u8; 4096];
+                        match packet.read_packet(&mut buf).await {
+                            Ok((n, dest)) if n > 0 => {
+                                let payload = &buf[..n];
+                                if let Some(result) = sniff::sniff(payload) {
+                                    sniff_info = Some(SniffInfo::from_sniff_result(
+                                        result.domain.clone(),
+                                        result.protocol,
+                                    ));
+                                    if let Some(ref domain) = sniff_info.as_ref().and_then(|s| s.domain.as_ref()) {
+                                        let ip = initial_destination.resolved_ip
+                                            .or_else(|| match &initial_destination.address {
+                                                Address::Ipv4(o) => Some(std::net::IpAddr::V4(Ipv4Addr::from(*o))),
+                                                Address::Ipv6(o) => Some(std::net::IpAddr::V6(Ipv6Addr::from(*o))),
+                                                _ => None,
+                                            });
+                                        destination = match ip {
+                                            Some(ip) => Destination::with_resolved(
+                                                Address::Domain(domain.to_string()),
+                                                initial_destination.port,
+                                                ip,
+                                            ),
+                                            None => Destination::new(
+                                                Address::Domain(domain.to_string()),
+                                                initial_destination.port,
+                                            ),
+                                        };
+                                    }
+                                }
+                                // Wrap packet relay to restore the consumed first datagram.
+                                packet = Box::new(PrependPacketRelay::new(
+                                    packet,
+                                    payload.to_vec(),
+                                    dest,
+                                ));
+                            }
+                            _ => {
+                                // Failed to read first packet — proceed without sniffing.
+                            }
+                        }
+                    }
+
+                    let host = if let Some(ref si) = sniff_info {
+                        si.domain.clone().unwrap_or_else(|| destination.address.to_string())
+                    } else {
+                        destination.address.to_string()
+                    };
+                    let dest_ip = destination.address.to_string();
+                    let dest_port = destination.port.to_string();
+
+                    let rule_match = match ctx.rules.match_conn(&destination, network, sniff_info.as_ref()) {
+                        Some(m) => m,
+                        None => {
+                            log::warn!("No rule for {destination} ({network}), dropping");
+                            return;
+                        },
+                    };
+                    let tag = &rule_match.outbound_tag;
+                    if is_reject_tag(tag) {
+                        log::info!(
+                            "Reject (udp) {destination} matched rule '{}'",
+                            rule_match.description
+                        );
+                        // UDP: just drop the packet silently.
+                        return;
+                    }
+                    let client = match ctx.registry.get(&tag) {
+                        Some(c) => c,
+                        None => {
+                            log::warn!("No outbound tag '{tag}'");
+                            return;
+                        }
+                    };
+
+                    let conn_id = Uuid::new_v4().to_string();
+                    let counters = ui_state::ConnCounters::new_arc();
+                    let tag_stats = ctx.stats.get_or_create_tag(&tag).await;
+                    let info = ui_state::Connection {
+                        id: conn_id.clone(),
+                        metadata: ui_state::ConnMetadata {
+                            destination_ip: dest_ip,
+                            destination_port: dest_port,
+                            host,
+                            network: network.to_string(),
+                            type_: format!("{type_name}/{network}"),
+                            source_ip: source.ip().to_string(),
+                            source_port: source.port().to_string(),
+                            process_path: String::new(),
+                            dns_mode: "normal".to_string(),
+                        },
+                        upload: 0,
+                        download: 0,
+                        start: chrono::Local::now().to_rfc3339(),
+                        chains: vec![tag.clone()],
+                        rule: rule_match.description.clone(),
+                    };
+                    ctx.stats
+                        .add_connection(conn_id.clone(), Arc::clone(&counters), info)
+                        .await;
+
+                    let mut packet = packet;
                     let dial_result = {
                         client.dial_udp(&initial_destination).await.map_err(|e| {
                             format!(
@@ -838,21 +992,134 @@ async fn run_inbound(mut inbound: impl Inbound + 'static, ctx: AppContext) {
                             return;
                         },
                     };
-
                     let mut counted_out = CountedPacketRelay {
                         inner: out,
                         stats: Arc::clone(&ctx.stats),
                         conn_counters: Arc::clone(&counters),
                         tag_stats: Arc::clone(&tag_stats),
                     };
-
                     log::info!("Relaying udp {initial_destination} via {tag}");
-                    bidirectional_packet_relay(&mut *packet, &mut counted_out)
-                        .await;
-                },
-            }
+                    let udp_timeout = sniff_info
+                        .as_ref()
+                        .and_then(|si| si.protocol.as_deref())
+                        .map(crate::relay::udp_timeout_for_protocol)
+                        .unwrap_or(crate::relay::DEFAULT_UDP_TIMEOUT);
+                    bidirectional_packet_relay(
+                        &mut *packet, &mut counted_out, udp_timeout,
+                    )
+                    .await;
+                    ctx.stats.remove_connection(&conn_id).await;
+                    return;
+                }
+            };
 
+            // --- TCP path (after sniff) ---
+            let host = if let Some(ref si) = sniff_info {
+                si.domain.clone().unwrap_or_else(|| destination.address.to_string())
+            } else {
+                destination.address.to_string()
+            };
+            let dest_ip = destination.address.to_string();
+            let dest_port = destination.port.to_string();
+
+            let rule_match = match ctx.rules.match_conn(&destination, network, sniff_info.as_ref()) {
+                Some(m) => m,
+                None => {
+                    log::warn!("No rule for {destination} ({network}), dropping");
+                    return;
+                },
+            };
+            let tag = &rule_match.outbound_tag;
+            if is_reject_tag(tag) {
+                log::info!(
+                    "Reject (tcp) {destination} matched rule '{}'",
+                    rule_match.description
+                );
+                // TCP: send RST by setting SO_LINGER=0 then dropping the stream.
+                reset_tcp_stream(&mut stream).await;
+                return;
+            }
+            let client = match ctx.registry.get(&tag) {
+                Some(c) => c,
+                None => {
+                    log::warn!("No outbound tag '{tag}'");
+                    return;
+                }
+            };
+
+            let conn_id = Uuid::new_v4().to_string();
+            let counters = ui_state::ConnCounters::new_arc();
+            let tag_stats = ctx.stats.get_or_create_tag(&tag).await;
+            let info = ui_state::Connection {
+                id: conn_id.clone(),
+                metadata: ui_state::ConnMetadata {
+                    destination_ip: dest_ip,
+                    destination_port: dest_port,
+                    host,
+                    network: network.to_string(),
+                    type_: format!("{type_name}/{network}"),
+                    source_ip: source.ip().to_string(),
+                    source_port: source.port().to_string(),
+                    process_path: String::new(),
+                    dns_mode: "normal".to_string(),
+                },
+                upload: 0,
+                download: 0,
+                start: chrono::Local::now().to_rfc3339(),
+                chains: vec![tag.clone()],
+                rule: rule_match.description.clone(),
+            };
+            ctx.stats
+                .add_connection(conn_id.clone(), Arc::clone(&counters), info)
+                .await;
+
+            let dial_result = {
+                client.dial(&destination).await.map_err(|e| {
+                    format!("Failed to dial {destination} via {tag}: {e}")
+                })
+            };
+            let out = match dial_result {
+                Ok(o) => o,
+                Err(msg) => {
+                    log::error!("{msg}");
+                    let _ = stream.shutdown().await;
+                    ctx.stats.remove_connection(&conn_id).await;
+                    return;
+                },
+            };
+
+            let mut counted_out = CountedStreamRelay {
+                inner: out,
+                stats: Arc::clone(&ctx.stats),
+                conn_counters: Arc::clone(&counters),
+                tag_stats: Arc::clone(&tag_stats),
+            };
+
+            if let Some(ref si) = sniff_info {
+                if let Some(ref d) = si.domain {
+                    log::info!("Relaying tcp {destination} (sniffed: {d}) via {tag}");
+                } else {
+                    log::info!("Relaying tcp {destination} via {tag}");
+                }
+            } else {
+                log::info!("Relaying tcp {destination} via {tag}");
+            }
+            bidirectional_relay(&mut *stream, &mut counted_out).await;
+            // After relay completes, reset the inbound stream to release
+            // any associated resources (e.g. TUN NAT table entries).
+            // Only reset the inbound side — the outbound side is cleaned
+            // up by shutdown()/drop.
+            stream.reset().await;
             ctx.stats.remove_connection(&conn_id).await;
         });
     }
+}
+
+/// Set SO_LINGER=0 on the underlying TCP socket so that when the stream
+/// is dropped, the kernel sends a RST instead of the normal FIN sequence.
+async fn reset_tcp_stream(stream: &mut Box<dyn crate::relay::StreamRelay>) {
+    // The StreamRelay trait has a `reset()` method (default: shutdown).
+    // TcpRelay overrides it to set SO_LINGER=0 before closing, which
+    // causes the kernel to send RST on drop.
+    stream.reset().await;
 }

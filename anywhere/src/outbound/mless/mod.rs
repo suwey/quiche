@@ -18,6 +18,7 @@ use crate::outbound::direct::DirectOutboundClient;
 use crate::outbound::vless::parse_uuid;
 use crate::relay::PacketRelay;
 use crate::relay::StreamRelay;
+use crate::tlsfragment::FragmentConfig;
 
 use self::frame::FLAG_FIRST;
 use self::frame::encode_frame;
@@ -39,6 +40,7 @@ pub struct MlessOutboundClient {
     tls_server: String,
     insecure: bool,
     tls_fp: bool,
+    fragment: Option<FragmentConfig>,
     transport_path: String,
     transport_headers: std::collections::HashMap<String, String>,
     consecutive_fails: std::sync::atomic::AtomicU32,
@@ -70,6 +72,11 @@ impl MlessOutboundClient {
         let uuid_str = uuid_str.to_string();
         let insecure = cfg.insecure;
         let tls_fp = cfg.fp;
+        let fragment = if cfg.tls_fragment {
+            Some(FragmentConfig)
+        } else {
+            None
+        };
 
         let transport_type = cfg.transport_type.as_deref().unwrap_or("ws");
         if transport_type != "ws" {
@@ -94,6 +101,7 @@ impl MlessOutboundClient {
             &tls_server,
             insecure,
             tls_fp,
+            fragment.as_ref(),
             &transport_path,
             &transport_headers,
         )
@@ -106,6 +114,7 @@ impl MlessOutboundClient {
             tls_server,
             insecure,
             tls_fp,
+            fragment,
             transport_path,
             transport_headers,
             consecutive_fails: std::sync::atomic::AtomicU32::new(0),
@@ -146,6 +155,7 @@ impl MlessOutboundClient {
             &self.tls_server,
             self.insecure,
             self.tls_fp,
+            self.fragment.as_ref(),
             &self.transport_path,
             &self.transport_headers,
         )

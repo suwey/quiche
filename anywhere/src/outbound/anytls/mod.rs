@@ -5,7 +5,6 @@ use std::collections::HashMap;
 use std::io::Read;
 use std::io::Write;
 use std::net::Shutdown;
-use std::net::TcpStream;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::AtomicBool;
@@ -14,7 +13,6 @@ use std::sync::atomic::Ordering::SeqCst;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use boring::ssl::SslStream;
 use tokio::sync::mpsc;
 
 use crate::config::OutboundConfig;
@@ -23,9 +21,11 @@ use crate::outbound::OutboundClient;
 use crate::outbound::common::connect_tcp_bypass_sync;
 use crate::outbound::common::create_tls_stream;
 use crate::outbound::common::resolve_sni;
+use crate::outbound::common::TlsStream;
 use crate::protocol::anytls as proto;
 use crate::relay::PacketRelay;
 use crate::relay::StreamRelay;
+use crate::tlsfragment::FragmentConfig;
 
 pub mod uot;
 
@@ -437,7 +437,7 @@ impl SessionPool {
 // ========== Blocking I/O ==========
 
 fn write_padded(
-    stream: &mut SslStream<TcpStream>, mut data: Vec<u8>,
+    stream: &mut TlsStream, mut data: Vec<u8>,
     padding: &StdMutex<PaddingFactory>, pkt: u32,
 ) -> std::io::Result<()> {
     let pf = padding.lock().unwrap();
@@ -563,12 +563,13 @@ fn handle_blocking_frame(
 }
 
 fn run_io_loop(
-    mut stream: SslStream<TcpStream>, inner: &SessionInner,
+    mut stream: TlsStream, inner: &SessionInner,
     mut control_rx: mpsc::UnboundedReceiver<ControlFrame>,
     mut outbound_rx: mpsc::UnboundedReceiver<OutboundMsg>,
     padding_cache: Arc<StdMutex<PaddingCache>>,
 ) {
     stream
+        .get_mut()
         .get_mut()
         .set_read_timeout(Some(Duration::from_secs(3)))
         .ok();
@@ -592,7 +593,7 @@ fn run_io_loop(
                 Err(mpsc::error::TryRecvError::Empty) => break,
                 Err(mpsc::error::TryRecvError::Disconnected) => {
                     inner.closed.store(true, SeqCst);
-                    let _ = stream.get_mut().shutdown(Shutdown::Both);
+                    let _ = stream.get_mut().get_mut().shutdown(Shutdown::Both);
                     return;
                 },
             }
@@ -648,7 +649,7 @@ fn run_io_loop(
                 Err(mpsc::error::TryRecvError::Empty) => break,
                 Err(mpsc::error::TryRecvError::Disconnected) => {
                     inner.closed.store(true, SeqCst);
-                    let _ = stream.get_mut().shutdown(Shutdown::Both);
+                    let _ = stream.get_mut().get_mut().shutdown(Shutdown::Both);
                     return;
                 },
             }
@@ -685,7 +686,7 @@ fn run_io_loop(
             },
         }
     }
-    let _ = stream.get_mut().shutdown(Shutdown::Both);
+    let _ = stream.get_mut().get_mut().shutdown(Shutdown::Both);
     inner.closed.store(true, SeqCst);
     log::debug!("io thread ended");
 }
@@ -698,6 +699,7 @@ pub struct AnyTlsOutboundClient {
     password: String,
     fp: bool,
     insecure: bool,
+    fragment: Option<FragmentConfig>,
     tcp_pool: Arc<SessionPool>,
     udp_pool: Arc<SessionPool>,
     /// Cached padding scheme shared across TCP and UDP sessions.
@@ -716,6 +718,12 @@ impl AnyTlsOutboundClient {
             .map_err(|e| format!("anytls: {e}"))?;
         let padding_cache = Arc::new(StdMutex::new(PaddingCache::from_default()));
 
+        let fragment = if config.tls_fragment {
+            Some(FragmentConfig)
+        } else {
+            None
+        };
+
         let pool_config = SessionPoolConfig::from_outbound_config(config);
         let tcp_pool = SessionPool::new(pool_config.clone());
         let udp_pool = SessionPool::new(pool_config);
@@ -729,6 +737,7 @@ impl AnyTlsOutboundClient {
             &password,
             config.fp,
             config.insecure,
+            fragment.as_ref(),
             padding_cache.clone(),
         ) {
             tcp_pool.entries.lock().unwrap().push(SessionPoolEntry {
@@ -743,6 +752,7 @@ impl AnyTlsOutboundClient {
             password,
             fp: config.fp,
             insecure: config.insecure,
+            fragment,
             tcp_pool,
             udp_pool,
             padding_cache,
@@ -761,6 +771,7 @@ impl AnyTlsOutboundClient {
         let password = self.password.clone();
         let fp = self.fp;
         let insecure = self.insecure;
+        let frag = self.fragment.clone();
         let pc = self.padding_cache.clone();
         self.tcp_pool.spawn_cleanup(move || {
             Self::create_session_inner(
@@ -769,6 +780,7 @@ impl AnyTlsOutboundClient {
                 &password,
                 fp,
                 insecure,
+                frag.as_ref(),
                 pc.clone(),
             )
         });
@@ -778,6 +790,7 @@ impl AnyTlsOutboundClient {
         let password = self.password.clone();
         let fp = self.fp;
         let insecure = self.insecure;
+        let frag = self.fragment.clone();
         let pc = self.padding_cache.clone();
         self.udp_pool.spawn_cleanup(move || {
             Self::create_session_inner(
@@ -786,6 +799,7 @@ impl AnyTlsOutboundClient {
                 &password,
                 fp,
                 insecure,
+                frag.as_ref(),
                 pc.clone(),
             )
         });
@@ -800,6 +814,7 @@ impl AnyTlsOutboundClient {
             &self.password,
             self.fp,
             self.insecure,
+            self.fragment.as_ref(),
             self.padding_cache.clone(),
         )
     }
@@ -808,7 +823,8 @@ impl AnyTlsOutboundClient {
     /// pre-connect) and by ensure_session (lazy reconnect).
     fn create_session_inner(
         addr: std::net::SocketAddr, sni: &str, password: &str, fp: bool,
-        insecure: bool, padding_cache: Arc<StdMutex<PaddingCache>>,
+        insecure: bool, fragment: Option<&FragmentConfig>,
+        padding_cache: Arc<StdMutex<PaddingCache>>,
     ) -> std::io::Result<SessionHandle> {
         let (control_tx, control_rx) = mpsc::unbounded_channel();
         let (outbound_tx, outbound_rx) = mpsc::unbounded_channel::<OutboundMsg>();
@@ -832,6 +848,7 @@ impl AnyTlsOutboundClient {
         let inner_clone = inner.clone();
         let sni = sni.to_string();
         let password = password.to_string();
+        let frag = fragment.cloned();
 
         tokio::task::spawn_blocking(move || {
             let tcp = match connect_tcp_bypass_sync(addr) {
@@ -842,7 +859,7 @@ impl AnyTlsOutboundClient {
                     return;
                 },
             };
-            let mut stream = match create_tls_stream(tcp, &sni, fp, insecure) {
+            let mut stream = match create_tls_stream(tcp, &sni, fp, insecure, frag.as_ref()) {
                 Ok(s) => s,
                 Err(e) => {
                     log::error!("anytls tls: {e}");

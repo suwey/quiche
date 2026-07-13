@@ -700,6 +700,7 @@ async fn handle_server_stream(
         stream: Box::new(server_stream),
         source: peer,
         type_: "anytls".to_string(),
+        sniff: false,
     };
 
     if conn_tx.send(inbound_conn).await.is_err() {

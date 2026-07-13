@@ -11,6 +11,7 @@ use tokio::sync::oneshot;
 
 use crate::inbound::Destination;
 use crate::outbound::common::connect_tcp_bypass_sync;
+use crate::tlsfragment::FragmentConfig;
 use crate::outbound::vless::WsStream;
 use crate::outbound::vless::{
     self,
@@ -96,12 +97,13 @@ pub struct MuxSession {
 impl MuxSession {
     pub fn spawn(
         addr: std::net::SocketAddr, uuid: [u8; 16], tls_server: &str,
-        insecure: bool, tls_fp: bool, path: &str,
-        headers: &HashMap<String, String>,
+        insecure: bool, tls_fp: bool,
+        fragment: Option<&FragmentConfig>,
+        path: &str, headers: &HashMap<String, String>,
     ) -> io::Result<Arc<Self>> {
         let tcp = connect_tcp_bypass_sync(addr)?;
         let ws =
-            vless::build_ws(tcp, tls_server, insecure, tls_fp, path, headers)?;
+            vless::build_ws(tcp, tls_server, insecure, tls_fp, fragment, path, headers)?;
 
         let (frame_tx, mut frame_rx) = mpsc::unbounded_channel();
         let streams = Arc::new(Mutex::new(HashMap::new()));

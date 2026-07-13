@@ -110,6 +110,7 @@ impl Inbound for Socks5Inbound {
                 stream: Box::new(TcpRelay::new(conn.stream)),
                 source: peer,
                 type_: "socks5".to_string(),
+                sniff: false,
             });
         }
     }

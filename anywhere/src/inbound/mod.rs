@@ -137,6 +137,9 @@ pub enum InboundConn {
         stream: Box<dyn StreamRelay>,
         source: std::net::SocketAddr,
         type_: String,
+        /// Whether to sniff TLS SNI / HTTP Host from the stream before
+        /// rule matching. Only true for TUN inbounds.
+        sniff: bool,
     },
     Udp {
         initial_destination: Destination,
@@ -175,6 +178,14 @@ impl InboundConn {
         match self {
             InboundConn::Tcp { type_, .. } => type_,
             InboundConn::Udp { type_, .. } => type_,
+        }
+    }
+
+    /// Returns true if this connection should be sniffed (TUN TCP).
+    pub fn should_sniff(&self) -> bool {
+        match self {
+            InboundConn::Tcp { sniff, .. } => *sniff,
+            _ => false,
         }
     }
 }

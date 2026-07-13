@@ -1045,6 +1045,7 @@ mod tests {
             idle_session_check_interval: None,
             idle_session_timeout: None,
             min_idle_session: None,
+            tls_fragment: false,
         };
         assert!(SshOutboundClient::from_config(&cfg).await.is_err());
     }
@@ -1072,6 +1073,7 @@ mod tests {
             idle_session_check_interval: None,
             idle_session_timeout: None,
             min_idle_session: None,
+            tls_fragment: false,
         };
         assert!(SshOutboundClient::from_config(&cfg).await.is_err());
     }
@@ -1096,6 +1098,7 @@ mod tests {
             idle_session_check_interval: None,
             idle_session_timeout: None,
             min_idle_session: None,
+            tls_fragment: false,
             transport_type: None,
             transport_path: None,
             transport_headers: None,

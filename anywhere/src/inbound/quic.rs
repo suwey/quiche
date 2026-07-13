@@ -258,6 +258,7 @@ impl QuicInbound {
             stream: Box::new(relay),
             source: "0.0.0.0:0".parse().unwrap(),
             type_: "quic".to_string(),
+            sniff: false,
         };
 
         if conn_tx.send(inbound_conn).await.is_err() {

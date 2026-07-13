@@ -411,7 +411,7 @@ impl DnsHijack {
         }
         // Match rule on (domain, udp, port 53) to pick outbound + upstream.
         let dest = Destination::new(Address::Domain(q.name.clone()), 53);
-        let rule_match = self.rules.match_conn(&dest, Network::Udp);
+        let rule_match = self.rules.match_conn(&dest, Network::Udp, None);
         let plan = match rule_match {
             Some(m) => self.plan_for(m.outbound_tag),
             None => self.plan_for("direct".to_string()),

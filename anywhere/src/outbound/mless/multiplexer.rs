@@ -16,6 +16,7 @@ use tokio::sync::mpsc;
 
 use crate::outbound::vless::WsStream;
 use crate::outbound::vless::build_ws;
+use crate::tlsfragment::FragmentConfig;
 
 use super::crypto::Obfuscation;
 use super::frame::*;
@@ -56,7 +57,8 @@ pub struct MlessMultiplexer {
 impl MlessMultiplexer {
     pub async fn connect(
         addr: SocketAddr, uuid_str: &str, tls_server: &str, insecure: bool,
-        tls_fp: bool, path: &str, headers: &HashMap<String, String>,
+        tls_fp: bool, fragment: Option<&FragmentConfig>,
+        path: &str, headers: &HashMap<String, String>,
     ) -> Result<Arc<Self>, Box<dyn std::error::Error>> {
         log::debug!("mless: connecting to {addr}...");
         // Use bypass TCP to avoid TUN routing loop on Linux. Same pattern
@@ -72,7 +74,7 @@ impl MlessMultiplexer {
         log::debug!("mless: tcp connected (bypass), building ws...");
         let tcp_std = tcp.into_std()?;
         tcp_std.set_nonblocking(false)?;
-        let ws = build_ws(tcp_std, tls_server, insecure, tls_fp, path, headers)?;
+        let ws = build_ws(tcp_std, tls_server, insecure, tls_fp, fragment, path, headers)?;
         log::debug!("mless: ws built, spawning io_loop...");
 
         let (ws_tx, ws_rx): (mpsc::UnboundedSender<Vec<u8>>, _) =

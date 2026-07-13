@@ -24,15 +24,17 @@ pub struct DirectOutboundClient;
 
 struct DirectUdpRelay {
     socket: UdpSocket,
+    peer: Destination,
     last_activity: Instant,
     idle_timeout: Duration,
 }
 
 impl DirectUdpRelay {
-    fn new(socket: UdpSocket, idle_timeout: Duration) -> Self {
+    fn new(socket: UdpSocket, peer: Destination, idle_timeout: Duration) -> Self {
         let now = Instant::now();
         Self {
             socket,
+            peer,
             last_activity: now,
             idle_timeout,
         }
@@ -48,17 +50,11 @@ impl PacketRelay for DirectUdpRelay {
     async fn read_packet(
         &mut self, buf: &mut [u8],
     ) -> io::Result<(usize, Destination)> {
-        match timeout_at(self.next_deadline(), self.socket.recv_from(buf)).await {
-            Ok(Ok((n, addr))) => {
+        // connect()'ed socket: kernel only delivers packets from the peer.
+        match timeout_at(self.next_deadline(), self.socket.recv(buf)).await {
+            Ok(Ok(n)) => {
                 self.last_activity = Instant::now();
-                let dest: Destination =
-                    addr.to_string().parse().map_err(|_| {
-                        io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "invalid UDP source address",
-                        )
-                    })?;
-                Ok((n, dest))
+                Ok((n, self.peer.clone()))
             },
             Ok(Err(e)) => Err(e),
             Err(_) => Ok((0, Destination::new(Address::Ipv4([0, 0, 0, 0]), 0))),
@@ -66,16 +62,10 @@ impl PacketRelay for DirectUdpRelay {
     }
 
     async fn write_packet(
-        &mut self, buf: &[u8], dest: &Destination,
+        &mut self, buf: &[u8], _dest: &Destination,
     ) -> io::Result<()> {
-        let addr: std::net::SocketAddr =
-            dest.to_string().parse().map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "invalid destination address",
-                )
-            })?;
-        self.socket.send_to(buf, addr).await?;
+        // connect()'ed socket: send() always goes to the fixed peer.
+        self.socket.send(buf).await?;
         self.last_activity = Instant::now();
         Ok(())
     }
@@ -115,7 +105,16 @@ impl OutboundClient for DirectOutboundClient {
                     std::net::IpAddr::V6(std::net::Ipv6Addr::from(*o)),
                     dest.port,
                 ),
-                Address::Domain(_) => resolve_addr(&dest.to_string())?,
+                Address::Domain(_) => {
+                    let s = dest.to_string();
+                    tokio::task::spawn_blocking(move || resolve_addr(&s))
+                        .await
+                        .map_err(|e| {
+                            Box::<dyn std::error::Error>::from(format!(
+                                "spawn_blocking join error: {e}"
+                            ))
+                        })??
+                }
             }
         };
         let stream = connect_tcp_bypass(addr).await?;
@@ -124,12 +123,41 @@ impl OutboundClient for DirectOutboundClient {
     }
 
     async fn dial_udp(
-        &self, _initial_dest: &Destination,
+        &self, initial_dest: &Destination,
     ) -> Result<Box<dyn PacketRelay>, Box<dyn std::error::Error>> {
         let bind_addr: std::net::SocketAddr = "0.0.0.0:0".parse().unwrap();
         let socket = bind_udp_bypass(bind_addr).await?;
+        // connect() the socket to the target so the kernel only accepts
+        // packets from that peer — prevents UDP reflection attacks.
+        let peer_addr: std::net::SocketAddr = if let Some(ip) = initial_dest.resolved_ip {
+            std::net::SocketAddr::new(ip, initial_dest.port)
+        } else {
+            match &initial_dest.address {
+                Address::Ipv4(o) => std::net::SocketAddr::new(
+                    std::net::IpAddr::V4(std::net::Ipv4Addr::from(*o)),
+                    initial_dest.port,
+                ),
+                Address::Ipv6(o) => std::net::SocketAddr::new(
+                    std::net::IpAddr::V6(std::net::Ipv6Addr::from(*o)),
+                    initial_dest.port,
+                ),
+                Address::Domain(_) => {
+                    let s = initial_dest.to_string();
+                    tokio::task::spawn_blocking(move || resolve_addr(&s))
+                        .await
+                        .map_err(|e| {
+                            Box::<dyn std::error::Error>::from(format!(
+                                "spawn_blocking join error: {e}"
+                            ))
+                        })??
+                }
+            }
+        };
+        socket.connect(peer_addr).await?;
+        log::debug!("direct udp connected to {peer_addr}");
         Ok(Box::new(DirectUdpRelay::new(
             socket,
+            initial_dest.clone(),
             DIRECT_UDP_IDLE_TIMEOUT,
         )))
     }
@@ -148,7 +176,8 @@ mod tests {
     #[tokio::test]
     async fn direct_udp_read_exits_after_idle_timeout() {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let mut relay = DirectUdpRelay::new(socket, Duration::from_millis(10));
+        let peer = Destination::new(Address::Ipv4([127, 0, 0, 1]), 0);
+        let mut relay = DirectUdpRelay::new(socket, peer, Duration::from_millis(10));
         let mut buf = [0; 64];
 
         let (n, _) = relay.read_packet(&mut buf).await.unwrap();
@@ -173,7 +202,8 @@ mod tests {
             ),
             receiver.local_addr().unwrap().port(),
         );
-        let mut relay = DirectUdpRelay::new(socket, Duration::from_millis(40));
+        socket.connect(receiver.local_addr().unwrap()).await.unwrap();
+        let mut relay = DirectUdpRelay::new(socket, dest.clone(), Duration::from_millis(40));
 
         sleep(Duration::from_millis(25)).await;
         relay.write_packet(b"ping", &dest).await.unwrap();

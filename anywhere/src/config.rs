@@ -80,6 +80,11 @@ pub struct InboundConfig {
     #[serde(default = "default_local_direct")]
     pub local_direct: bool,
 
+    /// Sniff TLS SNI / HTTP Host from TCP streams to recover domain
+    /// information in TUN mode. Default: true.
+    #[serde(default = "default_sniff_true")]
+    pub sniff: Option<bool>,
+
     /// WAN interfaces whose local address should bypass TUN routing via
     /// `from <wan_ip> lookup main`. These are monitored dynamically so PPPoE
     /// redial/address changes are handled. Only effective when auto_hijack is
@@ -105,11 +110,15 @@ fn default_auto_hijack() -> bool {
 fn default_true() -> bool {
     true
 }
+
+fn default_sniff_true() -> Option<bool> {
+    Some(true)
+}
 fn default_local_direct() -> bool {
     true
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Default)]
 pub struct OutboundConfig {
     #[serde(rename = "type")]
     pub type_: String,
@@ -134,6 +143,12 @@ pub struct OutboundConfig {
     pub fp: bool,
 
     pub ech_config: Option<String>,
+
+    /// Enable TLS ClientHello fragmentation to evade DPI SNI matching.
+    /// Splits the first TLS write (ClientHello) across multiple TCP
+    /// segments with a delay between them.
+    #[serde(default)]
+    pub tls_fragment: bool,
 
     // --- shared sub-config fields (urltest / vless) ---
     /// List of outbound tags this urltest node manages.
@@ -223,6 +238,10 @@ pub struct RuleConfig {
 #[derive(Debug, Deserialize, Default)]
 pub struct CommonConfig {
     pub cache_dir: Option<String>,
+    /// Enable TLS ClientHello fragmentation on direct outbound connections
+    /// to evade DPI SNI matching. Default: false.
+    #[serde(default)]
+    pub tls_fragment: bool,
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]

@@ -25,6 +25,14 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+#[inline]
+fn now_micros() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_micros() as u64)
+        .unwrap_or(0)
+}
+
 use async_trait::async_trait;
 #[cfg(target_os = "linux")]
 pub use platform::linux::BYPASS_FWMARK;
@@ -82,6 +90,9 @@ pub struct TunConfig {
     /// matching and go directly to the direct upstream. Only effective when
     /// auto_hijack is true.
     pub local_direct: bool,
+    /// When true, sniff TLS SNI / HTTP Host from TCP streams to recover
+    /// domain information lost in TUN mode. Default: true.
+    pub sniff: bool,
 }
 
 impl TunConfig {
@@ -114,6 +125,7 @@ impl TunConfig {
             cfg.monitor_wan_ifaces.clone().unwrap_or_default();
         let bypass_lan_ifaces = cfg.bypass_lan_ifaces.clone().unwrap_or_default();
         let local_direct = cfg.local_direct;
+        let sniff = cfg.sniff.unwrap_or(true);
 
         Ok(Self {
             addr,
@@ -125,6 +137,7 @@ impl TunConfig {
             monitor_wan_ifaces,
             bypass_lan_ifaces,
             local_direct,
+            sniff,
         })
     }
 }
@@ -380,6 +393,7 @@ impl TunInbound {
         let cancel_accept = cancel_registry.clone();
         let conn_tx_accept = conn_tx.clone();
         let reverse_dns_accept = reverse_dns.clone();
+        let sniff_enabled = config.sniff;
         tokio::spawn(async move {
             accept_loop(
                 listener,
@@ -388,6 +402,7 @@ impl TunInbound {
                 conn_tx_accept,
                 Some(reverse_dns_accept),
                 dns_hijack_clone,
+                sniff_enabled,
             )
             .await;
         });
@@ -432,6 +447,7 @@ async fn accept_loop(
     cancel_registry: TcpCancelRegistry, conn_tx: mpsc::Sender<InboundConn>,
     reverse_dns: Option<Arc<ReverseDnsCache>>,
     dns_hijack: Option<Arc<DnsHijack>>,
+    sniff_enabled: bool,
 ) {
     let mut backoff = Duration::from_millis(100);
     loop {
@@ -525,6 +541,7 @@ async fn accept_loop(
                     )),
                     source: session.client_addr,
                     type_: "tun".into(),
+                    sniff: sniff_enabled,
                 };
                 if conn_tx.try_send(conn).is_err() {
                     let mut guard = nat.lock().await;
@@ -545,9 +562,13 @@ struct TunTcpRelay {
     cancel_registry: TcpCancelRegistry,
     cancel: CancellationToken,
     nat_port: u16,
-    last_activity: tokio::time::Instant,
-    idle_timeout: Duration,
+    last_activity: std::sync::atomic::AtomicU64,
+    last_nat_touch: std::sync::atomic::AtomicU64,
+    idle_timeout_ms: u64,
 }
+
+/// Minimum interval between NAT touch operations (microseconds).
+const NAT_TOUCH_INTERVAL_US: u64 = 5_000_000; // 5 seconds
 
 impl TunTcpRelay {
     fn new(
@@ -555,39 +576,42 @@ impl TunTcpRelay {
         cancel_registry: TcpCancelRegistry, cancel: CancellationToken,
         nat_port: u16, idle_timeout: Duration,
     ) -> Self {
-        let now = tokio::time::Instant::now();
+        let now_us = now_micros();
         Self {
             stream,
             nat,
             cancel_registry,
             cancel,
             nat_port,
-            last_activity: now,
-            idle_timeout,
+            last_activity: std::sync::atomic::AtomicU64::new(now_us),
+            last_nat_touch: std::sync::atomic::AtomicU64::new(now_us),
+            idle_timeout_ms: idle_timeout.as_millis() as u64,
         }
     }
 
+    #[inline]
     fn expired(&self) -> bool {
-        tokio::time::Instant::now().duration_since(self.last_activity) >=
-            self.idle_timeout
+        now_micros().saturating_sub(
+            self.last_activity.load(std::sync::atomic::Ordering::Relaxed)
+        ) >= self.idle_timeout_ms * 1000
     }
 
-    async fn touch_or_close(&mut self) -> std::io::Result<bool> {
-        if self.expired() {
-            self.close_nat().await;
-            return Ok(false);
+    /// Update local activity timestamp and, at most once every
+    /// `NAT_TOUCH_INTERVAL_US`, also update the NAT table's timestamp.
+    /// This avoids locking the shared NAT mutex on every I/O call.
+    async fn touch(&self) -> bool {
+        let now = now_micros();
+        self.last_activity.store(now, std::sync::atomic::Ordering::Relaxed);
+        let last = self.last_nat_touch.load(std::sync::atomic::Ordering::Relaxed);
+        if now.saturating_sub(last) < NAT_TOUCH_INTERVAL_US {
+            return true; // Skip NAT touch — too recent.
         }
-
+        self.last_nat_touch.store(now, std::sync::atomic::Ordering::Relaxed);
         let mut guard = self.nat.lock().await;
-        if guard.touch_by_port(self.nat_port) {
-            self.last_activity = tokio::time::Instant::now();
-            Ok(true)
-        } else {
-            Ok(false)
-        }
+        guard.touch_by_port(self.nat_port)
     }
 
-    async fn close_nat(&mut self) {
+    async fn close_nat(&self) {
         self.cancel.cancel();
         let mut guard = self.nat.lock().await;
         guard.remove(self.nat_port);
@@ -599,7 +623,7 @@ impl TunTcpRelay {
 #[async_trait]
 impl StreamRelay for TunTcpRelay {
     async fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        if self.cancel.is_cancelled() || !self.touch_or_close().await? {
+        if self.cancel.is_cancelled() || self.expired() {
             return Ok(0);
         }
 
@@ -609,19 +633,16 @@ impl StreamRelay for TunTcpRelay {
         };
 
         if n == 0 {
-            self.close_nat().await;
             return Ok(0);
         }
 
-        if !self.touch_or_close().await? {
-            return Ok(0);
-        }
-
+        // Update local activity (atomic, no lock). NAT touch is throttled.
+        let _ = self.touch().await;
         Ok(n)
     }
 
     async fn write(&mut self, buf: &[u8]) -> std::io::Result<()> {
-        if self.cancel.is_cancelled() || !self.touch_or_close().await? {
+        if self.cancel.is_cancelled() || self.expired() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::ConnectionAborted,
                 "stale TUN TCP NAT session",
@@ -638,19 +659,25 @@ impl StreamRelay for TunTcpRelay {
             result = self.stream.write_all(buf) => result?,
         }
 
-        if !self.touch_or_close().await? {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::ConnectionAborted,
-                "stale TUN TCP NAT session",
-            ));
-        }
-
+        // Update local activity (atomic, no lock). NAT touch is throttled.
+        let _ = self.touch().await;
         Ok(())
     }
 
     async fn shutdown(&mut self) -> std::io::Result<()> {
-        self.close_nat().await;
+        // Only shut down the write side (send FIN). Do NOT close_nat() here —
+        // the read side may still need to drain the server's response after
+        // the client half-closes. NAT cleanup happens when read returns 0
+        // or the idle timeout fires.
         self.stream.shutdown().await
+    }
+
+    async fn reset(&mut self) {
+        // Full teardown: cancel the NAT session and remove the mapping.
+        // This is called by the runner after bidirectional_relay completes
+        // to ensure NAT ports are reclaimed immediately rather than waiting
+        // for the 120s idle timeout.
+        self.close_nat().await;
     }
 }
 

@@ -478,13 +478,20 @@ class ProxyVpnService : VpnService() {
     }
 
     /**
-     * Copy bundled UI assets (metacubexd) to filesDir/ui.
-     * Recursively copies all files from assets/ui/ to filesDir/ui/.
-     * Existing files are skipped (idempotent across restarts).
+     * Replace filesDir/ui with a fresh copy of bundled UI assets (metacubexd).
+     *
+     * Nuxt build output uses content-hashed filenames (e.g. _nuxt/abc123.js),
+     * so a simple overwrite leaves stale files from previous builds.  We wipe
+     * the entire ui directory first, then copy everything from assets/ui/.
      */
     private fun copyUiAssets() {
         val uiDir = java.io.File(filesDir, "ui")
-        if (!uiDir.exists()) uiDir.mkdirs()
+
+        // Wipe the existing directory to remove stale hashed files
+        if (uiDir.exists()) {
+            uiDir.deleteRecursively()
+        }
+        uiDir.mkdirs()
         var copied = 0
 
         // Map asset dir names to output dir names (handle AAPT excluding '_' prefix)
@@ -496,7 +503,6 @@ class ProxyVpnService : VpnService() {
                 val assetPath = "$assetPrefix/$name"
                 val subChildren = assets.list(assetPath) ?: emptyArray()
                 if (subChildren.isEmpty()) {
-                    // It's a file — always overwrite to ensure freshness
                     val outFile = java.io.File(outDir, name)
                     try {
                         outFile.parentFile?.mkdirs()
@@ -508,7 +514,6 @@ class ProxyVpnService : VpnService() {
                         Log.w(TAG, "Failed to copy: $assetPath — ${e.message}")
                     }
                 } else {
-                    // It's a directory — apply rename if needed
                     val outName = dirRename[name] ?: name
                     val subDir = java.io.File(outDir, outName)
                     if (!subDir.exists()) subDir.mkdirs()
@@ -519,7 +524,7 @@ class ProxyVpnService : VpnService() {
 
         try {
             copyTree("ui", uiDir)
-            Log.i(TAG, "UI assets copied: $copied files to ${uiDir.absolutePath}")
+            Log.i(TAG, "UI assets replaced: $copied files to ${uiDir.absolutePath}")
         } catch (e: Exception) {
             Log.e(TAG, "copyUiAssets failed: ${e.message}")
         }

@@ -11,6 +11,8 @@ pub mod protocol;
 pub mod relay;
 pub mod runner;
 pub mod rules;
+pub mod sniff;
+pub mod tlsfragment;
 pub mod transport;
 pub mod ui;
 
