@@ -1,6 +1,6 @@
 //! Platform-specific TUN operations.
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::process::Command;
 
 #[cfg(target_os = "linux")]
@@ -12,10 +12,14 @@ pub(super) mod bypass_watcher;
 #[cfg(target_os = "android")]
 pub mod android;
 
+#[cfg(target_os = "macos")]
+pub mod macos;
+
 /// Run an arbitrary command, returning an error on non-zero exit.
 /// All shell commands from TUN routing should go through this so
 /// there is a single place with debug logging and error formatting.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[allow(dead_code)]
 pub(super) fn run_cmd(
     cmd: &str, args: &[&str],
 ) -> Result<(), Box<dyn std::error::Error>> {

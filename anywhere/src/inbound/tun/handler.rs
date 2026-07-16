@@ -188,28 +188,33 @@ pub async fn run_tun_handler(
                 .await;
             },
             IpPacket::Udp(meta) => {
-                if meta.dst_port == 53 {
-                    if let Some(ref dns) = dns_hijack {
-                        let l4_off = meta.l4_offset;
-                        let udp_hdr_end = l4_off + 8;
-                        if udp_hdr_end < meta.total_len {
-                            let payload =
-                                buf[udp_hdr_end..meta.total_len].to_vec();
-                            let dns = dns.clone();
-                            let src_ip = meta.src_ip;
-                            let src_port = meta.src_port;
-                            let dst_ip = meta.dst_ip;
-                            let dst_port = meta.dst_port;
-                            tokio::spawn(async move {
-                                dns.handle_query(
-                                    &payload, src_ip, src_port, dst_ip, dst_port,
-                                )
-                                .await;
-                            });
-                            continue;
-                        }
+            if meta.dst_port == 53 {
+                log::debug!(
+                    "TUN DNS hijack: {src}:{sp} -> {dst}:{dp}",
+                    src = meta.src_ip, sp = meta.src_port,
+                    dst = meta.dst_ip, dp = meta.dst_port,
+                );
+                if let Some(ref dns) = dns_hijack {
+                    let l4_off = meta.l4_offset;
+                    let udp_hdr_end = l4_off + 8;
+                    if udp_hdr_end < meta.total_len {
+                        let payload =
+                            buf[udp_hdr_end..meta.total_len].to_vec();
+                        let dns = dns.clone();
+                        let src_ip = meta.src_ip;
+                        let src_port = meta.src_port;
+                        let dst_ip = meta.dst_ip;
+                        let dst_port = meta.dst_port;
+                        tokio::spawn(async move {
+                            dns.handle_query(
+                                &payload, src_ip, src_port, dst_ip, dst_port,
+                            )
+                            .await;
+                        });
+                        continue;
                     }
                 }
+            }
                 let dropped = handle_udp_packet(
                     &buf[..n],
                     &meta,
@@ -257,6 +262,21 @@ async fn handle_tcp_packet(
     buf: &mut [u8], meta: &IpPacketMeta, tun_addr: &IpAddr, listener_port: u16,
     nat: &Arc<Mutex<TCPNat>>, tun: &AsyncDevice,
 ) {
+    // Extract TCP flags for diagnostic logging.
+    let tcp_flags = if meta.l4_offset + 14 <= meta.total_len {
+        let f = buf[meta.l4_offset + 13];
+        let mut s = String::new();
+        if f & 0x01 != 0 { s.push_str("F"); }
+        if f & 0x02 != 0 { s.push_str("S"); }
+        if f & 0x04 != 0 { s.push_str("R"); }
+        if f & 0x08 != 0 { s.push_str("P"); }
+        if f & 0x10 != 0 { s.push_str("A"); }
+        if s.is_empty() { s.push_str("-"); }
+        s
+    } else {
+        "?".to_string()
+    };
+
     // Check if this is a reverse-path packet (kernel sending data back
     // through TUN after NAT).
     let is_reverse = match (tun_addr, meta.src_ip) {
@@ -273,6 +293,16 @@ async fn handle_tcp_packet(
         let guard = nat.lock().await;
         if let Some(session) = guard.lookup_back(nat_port).cloned() {
             drop(guard); // Release lock before I/O
+
+            // Only log connection-level events (SYN/FIN/RST), not every ACK.
+            if tcp_flags.contains('S') || tcp_flags.contains('F') || tcp_flags.contains('R') {
+                log::debug!(
+                    "TUN TCP REV [{tcp_flags}] {src}:{sp} -> {dst}:{dp} | nat_port={nat_port} -> client={client}",
+                    src = meta.src_ip, sp = meta.src_port,
+                    dst = meta.dst_ip, dp = meta.dst_port,
+                    client = session.client_addr,
+                );
+            }
 
             // We need to set source = original target, dest = original client
             let IpAddr::V4(orig_target_ip) = session.target_addr.ip() else {
@@ -294,21 +324,21 @@ async fn handle_tcp_packet(
             if let Err(e) = tun.send(&buf[..meta.total_len]).await {
                 log::debug!("TUN write error (reverse TCP): {e}");
             }
+        } else {
+            // NAT entry already removed (connection closed). Late packets
+            // (retransmitted FIN, keepalive) are expected - drop silently.
         }
         return;
     }
 
     // Guard: if destination is the TUN address itself (and not the NAT
     // listener), this packet is a response to a local process that was
-    // just written back to TUN by the reverse path. The kernel has already
-    // delivered it to the local process via `iif tun0 lookup main`.
-    // Processing it again would create a new NAT mapping and outbound
-    // connection, causing a self-sustaining loop.
+    // just written back to TUN by the reverse path.
     if meta.dst_ip == *tun_addr && meta.dst_port != listener_port {
-        log::error!(
-            "TUN re-injection (TCP): dst={}:{} (local process response) — dropped",
-            meta.dst_ip,
-            meta.dst_port,
+        log::debug!(
+            "TUN TCP REINJECT [{tcp_flags}] {src}:{sp} -> {dst}:{dp} - dropped (local response)",
+            src = meta.src_ip, sp = meta.src_port,
+            dst = meta.dst_ip, dp = meta.dst_port,
         );
         return;
     }
@@ -317,23 +347,19 @@ async fn handle_tcp_packet(
     let target_addr = SocketAddr::new(meta.dst_ip, meta.dst_port);
 
     // Guard: packets aimed at our TUN listener must be the synthetic
-    // `tun_next:nat_port -> tun_addr:listener_port` packets created below. If
-    // the NAT entry is gone, dropping here prevents stale internal TCP flows
-    // from being fed back into the listener indefinitely.
+    // `tun_next:nat_port -> tun_addr:listener_port` packets created below.
     if meta.dst_ip == *tun_addr && meta.dst_port == listener_port {
         let tun_next = next_addr(*tun_addr);
         if meta.src_ip == tun_next {
             let guard = nat.lock().await;
             if guard.contains_port(meta.src_port) {
-                return;
+                return; // Valid NAT'd packet, already handled by listener
             }
         }
         log::debug!(
-            "stale TUN listener packet dropped: src={}:{} dst={}:{}",
-            meta.src_ip,
-            meta.src_port,
-            meta.dst_ip,
-            meta.dst_port,
+            "TUN TCP STALE [{tcp_flags}] {src}:{sp} -> {dst}:{dp} - dropped (stale listener)",
+            src = meta.src_ip, sp = meta.src_port,
+            dst = meta.dst_ip, dp = meta.dst_port,
         );
         return;
     }
@@ -342,6 +368,15 @@ async fn handle_tcp_packet(
         let mut guard = nat.lock().await;
         guard.lookup(client_addr, target_addr)
     };
+
+    // Only log connection-level events (SYN/FIN/RST), not every ACK.
+    if tcp_flags.contains('S') || tcp_flags.contains('F') || tcp_flags.contains('R') {
+        log::debug!(
+            "TUN TCP FWD [{tcp_flags}] {src}:{sp} -> {dst}:{dp} | nat_port={nat_port}",
+            src = meta.src_ip, sp = meta.src_port,
+            dst = meta.dst_ip, dp = meta.dst_port,
+        );
+    }
 
     // Calculate the "next" address for the TUN interface (used as the
     // source IP in rewritten packets so the kernel routes responses back
@@ -385,6 +420,31 @@ async fn handle_tcp_packet(
     }
 }
 
+/// Check if an IP address is a broadcast, multicast, or link-local address
+/// that should not be proxied through TUN.
+fn is_non_routable(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            // Broadcast: 255.255.255.255 or host-broadcast (x.x.x.255/24)
+            v4.is_broadcast()
+            // Multicast: 224.0.0.0/4
+            || v4.is_multicast()
+            // Link-local: 169.254.0.0/16
+            || v4.is_link_local()
+            // Unspecified: 0.0.0.0
+            || v4.is_unspecified()
+        },
+        IpAddr::V6(v6) => {
+            // Multicast: ff00::/8
+            v6.is_multicast()
+            // Link-local: fe80::/10
+            || v6.is_unicast_link_local()
+            // Unspecified: ::
+            || v6.is_unspecified()
+        },
+    }
+}
+
 /// Handle a UDP packet: dispatch via session table, or create a new
 /// relay session.
 ///
@@ -396,6 +456,14 @@ async fn handle_udp_packet(
     sessions: &mut UdpSessionTable, reverse_dns: &Option<Arc<ReverseDnsCache>>,
     dns_hijack: &Option<Arc<DnsHijack>>,
 ) -> bool {
+    // Drop broadcast / multicast / link-local packets early — these are
+    // local discovery protocols (mDNS, SSDP, NetBIOS, etc.) that must not
+    // be proxied. Without this, every SSDP/mDNS probe from local apps
+    // creates a phantom UDP connection in the UI.
+    if is_non_routable(meta.dst_ip) || is_non_routable(meta.src_ip) {
+        return false;
+    }
+
     let l4_off = meta.l4_offset;
     let udp_hdr_end = l4_off + 8; // UDP header is 8 bytes
     let udp_payload = if udp_hdr_end < meta.total_len {

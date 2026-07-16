@@ -31,8 +31,41 @@ struct Args {
 // Entrypoint
 // ---------------------------------------------------------------------------
 
+/// Raise the file descriptor soft limit to the hard limit.
+///
+/// On macOS, launchd defaults to soft=256 regardless of `kern.maxfilesperproc`,
+/// which is far too low for TUN transparent proxy (each TCP connection uses
+/// ~2 fds). This is a no-op on platforms where the soft limit already equals
+/// the hard limit.
+fn raise_fd_limit() {
+    #[cfg(unix)]
+    unsafe {
+        let mut rlim: libc::rlimit = std::mem::zeroed();
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim) != 0 {
+            log::warn!("getrlimit(RLIMIT_NOFILE) failed");
+            return;
+        }
+        let soft = rlim.rlim_cur;
+        let hard = rlim.rlim_max;
+        if soft < hard {
+            rlim.rlim_cur = hard;
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &rlim) != 0 {
+                log::warn!(
+                    "setrlimit(RLIMIT_NOFILE, {hard}) failed, keeping soft={soft}"
+                );
+            } else {
+                log::info!("Raised NOFILE soft limit from {soft} to {hard}");
+            }
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Raise fd limit before any I/O starts. Most critical on macOS (launchd
+    // caps soft at 256), but harmless on other Unix platforms.
+    raise_fd_limit();
+
     let args = Args::parse();
 
     let opts = RunOptions {

@@ -19,7 +19,7 @@ pub use platform::android::create_tun_from_fd;
 
 use std::collections::HashMap;
 use std::net::IpAddr;
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
 use std::net::Ipv4Addr;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -40,6 +40,8 @@ pub use platform::linux::BYPASS_FWMARK;
 pub use platform::linux::TunRouteManager;
 #[cfg(target_os = "android")]
 pub use platform::android::AndroidTunManager;
+#[cfg(target_os = "macos")]
+pub use platform::macos::MacosTunManager;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
@@ -93,6 +95,11 @@ pub struct TunConfig {
     /// When true, sniff TLS SNI / HTTP Host from TCP streams to recover
     /// domain information lost in TUN mode. Default: true.
     pub sniff: bool,
+    /// Proxy server IPs that should bypass TUN routing (macOS only).
+    /// On macOS, split routes capture all traffic; we install host routes
+    /// for these IPs via the original gateway so direct outbound
+    /// connections to proxy servers don't loop back through TUN.
+    pub bypass_ips: Vec<String>,
 }
 
 impl TunConfig {
@@ -138,6 +145,7 @@ impl TunConfig {
             bypass_lan_ifaces,
             local_direct,
             sniff,
+            bypass_ips: Vec::new(),
         })
     }
 }
@@ -157,7 +165,9 @@ pub struct TunGuard {
     _inner: Option<Arc<std::sync::Mutex<TunRouteManager>>>,
     #[cfg(target_os = "android")]
     _inner: Option<AndroidTunManager>,
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    #[cfg(target_os = "macos")]
+    _inner: Option<std::sync::Mutex<MacosTunManager>>,
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
     _inner: (),
 }
 
@@ -203,6 +213,17 @@ impl Drop for TunGuard {
             // AndroidTunManager::drop handles logging.
             // VpnService is responsible for closing the TUN fd and
             // tearing down the interface.
+        }
+
+        #[cfg(target_os = "macos")]
+        if let Some(mgr) = self._inner.take() {
+            if let Ok(mut mgr) = mgr.lock() {
+                mgr.cleanup_routing();
+            }
+            // utun interface is automatically destroyed when the fd is closed
+            // (which happens when the Device is dropped). No explicit deletion
+            // needed.
+            log::info!("macOS TUN interface cleaned up");
         }
     }
 }
@@ -265,16 +286,49 @@ impl TunInbound {
             Arc::new(device)
         };
 
-        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        #[cfg(target_os = "macos")]
+        let (device, _actual_name) = {
+            let mut tun_config = tun::Configuration::default();
+            tun_config
+                .address(addr)
+                .netmask(mask_to_ipv4_addr(mask_len))
+                .mtu(mtu)
+                .up();
+            // macOS: tun crate handles utun creation + PI stripping.
+            // enable_routing is false because we manage routes ourselves.
+            tun_config.platform_config(|p| {
+                p.packet_information(true);
+                p.enable_routing(false);
+            });
+            // Do NOT set tun_name on macOS — the kernel assigns utunN
+            // automatically. Requesting "tun0" fails with invalid device name.
+            let device = tun::create_as_async(&tun_config)?;
+            (Arc::new(device), String::new()) // actual name resolved below
+        };
+
+        // macOS: read the actual interface name assigned by the kernel.
+        #[cfg(target_os = "macos")]
+        let name = {
+            // The tun crate doesn't expose the fd/name directly, so we
+            // find the utun interface by matching our TUN address.
+            match find_utun_by_addr(addr) {
+                Some(n) => {
+                    log::info!("macOS TUN: kernel assigned interface {n}");
+                    n
+                },
+                None => {
+                    log::warn!("macOS TUN: could not determine interface name, using configured '{name}'");
+                    name.clone()
+                },
+            }
+        };
+
+        #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
         {
-            return Err("TUN is only supported on Linux and Android".into());
-            // Compile-time: device is unbound here, but we return above.
-            #[allow(unreachable_code)]
-            let device: Arc<tun::AsyncDevice> = unreachable!();
-            let _ = device;
+            return Err("TUN is only supported on Linux, Android, and macOS".into());
         }
 
-        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
         let device: Arc<tun::AsyncDevice> = unreachable!();
 
         log::info!("TUN device {name} created at {addr}");
@@ -361,7 +415,37 @@ impl TunInbound {
             _inner: Some(AndroidTunManager::new()),
         };
 
-        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        // macOS: manage routes + DNS hijack via shell commands.
+        #[cfg(target_os = "macos")]
+        let guard = {
+            let mut mgr = MacosTunManager::new(
+                name.clone(),
+                addr,
+            );
+
+            if let Err(e) = mgr.setup_interface() {
+                log::warn!("Failed to setup TUN interface: {e}");
+            }
+
+            if config.auto_route {
+                if let Err(e) = mgr.setup_routing(config.auto_hijack, &config.bypass_ips) {
+                    log::warn!("Failed to set up routing: {e}");
+                }
+            }
+
+            // Start DNS loopback listener when auto_hijack is enabled.
+            if config.auto_hijack {
+                if let Some(ref hijack) = dns_hijack {
+                    hijack.start_hijack_listener();
+                }
+            }
+
+            TunGuard {
+                _inner: Some(std::sync::Mutex::new(mgr)),
+            }
+        };
+
+        #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
         let guard = TunGuard { _inner: () };
 
         // 5. Create channels.
@@ -637,7 +721,9 @@ impl StreamRelay for TunTcpRelay {
         }
 
         // Update local activity (atomic, no lock). NAT touch is throttled.
-        let _ = self.touch().await;
+        if !self.touch().await {
+            return Ok(0); // NAT entry removed, close connection
+        }
         Ok(n)
     }
 
@@ -660,7 +746,12 @@ impl StreamRelay for TunTcpRelay {
         }
 
         // Update local activity (atomic, no lock). NAT touch is throttled.
-        let _ = self.touch().await;
+        if !self.touch().await {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                "NAT entry removed",
+            ));
+        }
         Ok(())
     }
 
@@ -689,7 +780,7 @@ fn ip_to_addr(ip: std::net::IpAddr) -> Address {
 }
 
 /// Convert a prefix length to an IPv4 netmask.
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
 #[allow(dead_code)]
 fn mask_to_ipv4_addr(len: u8) -> Ipv4Addr {
     let bits = if len >= 32 {
@@ -698,4 +789,48 @@ fn mask_to_ipv4_addr(len: u8) -> Ipv4Addr {
         !0u32 << (32 - len)
     };
     Ipv4Addr::from(bits.to_be_bytes())
+}
+
+/// Find the utun interface name that has the given address configured.
+/// On macOS, the kernel assigns utunN names automatically; we need to
+/// discover which one was created.
+#[cfg(target_os = "macos")]
+fn find_utun_by_addr(addr: std::net::IpAddr) -> Option<String> {
+    // Use `route -n get <addr>` to find the interface. This is more reliable
+    // than parsing ifconfig output, which may have timing issues.
+    let output = std::process::Command::new("route")
+        .args(["-n", "get", &addr.to_string()])
+        .output()
+        .ok()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    log::info!("find_utun_by_addr: route -n get {} -> {}", addr, stdout.trim());
+    for line in stdout.lines() {
+        let line = line.trim();
+        if let Some(iface) = line.strip_prefix("interface:") {
+            let iface = iface.trim();
+            if !iface.is_empty() {
+                return Some(iface.to_string());
+            }
+        }
+    }
+    // Fallback: parse ifconfig for any interface with this address.
+    let output = std::process::Command::new("ifconfig").output().ok()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let addr_str = addr.to_string();
+    let mut current_iface: Option<String> = None;
+    for line in stdout.lines() {
+        let trimmed = line.trim_start();
+        if !line.starts_with([' ', '\t']) {
+            if let Some(name) = trimmed.strip_suffix(':') {
+                current_iface = Some(name.to_string());
+            }
+        } else if let Some(ref iface) = current_iface {
+            if (trimmed.starts_with("inet ") || trimmed.starts_with("inet6 "))
+                && trimmed.contains(&addr_str)
+            {
+                return Some(iface.clone());
+            }
+        }
+    }
+    None
 }

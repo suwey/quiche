@@ -51,24 +51,24 @@ aes = "0.9"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 mach2 = "0.6"
-libc = "0.2"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 rtnetlink = "0.21"
-libc = "0.2"
-socket2 = { version = "0.5", features = ["all"] }
 
 [target.'cfg(target_env = "musl")'.dependencies]
 mimalloc = { version = "0.1.52", default-features = false }
 
 [target.'cfg(target_os = "android")'.dependencies]
 jni = "0.21"
-libc = "0.2"
-socket2 = { version = "0.5", features = ["all"] }
 android_logger = "0.14"
 # Android uses VpnService.protect() instead of SO_MARK, so no rtnetlink/socket2 needed.
 # tun crate's async feature works with a passed-in fd on Android.
 # boring-sys already supports Android NDK cross-compilation.
+
+[dependencies.libc]
+version = "0.2"
+# Used by raise_fd_limit() in main.rs for setrlimit/getrlimit on all Unix targets,
+# plus TCP keepalive / IP_BOUND_IF / poll in outbound/common.rs.
 
 [dependencies.etherparse]
 version = "0.19"

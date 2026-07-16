@@ -713,18 +713,6 @@ pub fn sniff_bittorrent(payload: &[u8]) -> Option<SniffResult> {
     if payload.len() >= 20 && payload.starts_with(b"\x13BitTorrent protocol") {
         return Some(SniffResult { domain: None, protocol: "bittorrent" });
     }
-    // uTP (BEP-20): UDP, type in first byte, connection_id in bytes 8-16
-    // uTP header: type(1) + version(1) + extension(1) + connection_id(4) + ...
-    // type values: 0=ST_DATA, 1=ST_FINAL, 2=ST_STATE, 3=ST_RESET, 4=ST_SYN
-    // version = 1
-    if payload.len() >= 20 {
-        let utp_type = payload[0] & 0x0f;
-        let utp_version = (payload[0] >> 4) & 0x0f;
-        if utp_version == 1 && utp_type <= 4 && payload.len() >= 20 {
-            // Additional check: uTP connections have a recognizable pattern
-            return Some(SniffResult { domain: None, protocol: "bittorrent" });
-        }
-    }
     None
 }
 
@@ -974,6 +962,25 @@ mod tests {
         let result = sniff_bittorrent(pkt).expect("should detect BT");
         assert_eq!(result.protocol, "bittorrent");
         assert!(result.domain.is_none());
+    }
+
+    #[test]
+    fn mqtt_connect_not_bittorrent() {
+        // MQTT CONNECT packet: type=1(CONNECT), flags=0, remaining length=...
+        // First byte 0x10 was incorrectly matched by the old uTP heuristic.
+        let pkt = [
+            0x10, 0x10,             // CONNECT, remaining length=16
+            0x00, 0x04,             // protocol name length = 4
+            b'M', b'Q', b'T', b'T', // protocol name "MQTT"
+            0x04,                   // protocol level = 4 (MQTT 3.1.1)
+            0x02,                   // connect flags (clean session)
+            0x00, 0x3c,             // keep alive = 60
+            0x00, 0x04,             // client id length = 4
+            b't', b'e', b's', b't', // client id "test"
+        ];
+        // Must NOT be detected as bittorrent.
+        assert!(sniff_bittorrent(&pkt).is_none(),
+            "MQTT CONNECT must not be misidentified as BitTorrent");
     }
 
     #[test]

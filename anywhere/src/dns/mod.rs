@@ -250,6 +250,9 @@ pub struct DnsHijack {
     /// source address — no cross-talk. A pool avoids serializing all direct
     /// DNS lookups behind a single socket.
     socket_pool: Mutex<Vec<UdpSocket>>,
+    /// Maximum number of sockets to retain in the pool. Excess sockets are
+    /// dropped (and their fds released) after use instead of being returned.
+    socket_pool_cap: usize,
 }
 
 impl DnsHijack {
@@ -359,6 +362,7 @@ impl DnsHijack {
             local_direct,
             inflight: Arc::new(Semaphore::new(MAX_INFLIGHT)),
             socket_pool: Mutex::new(Vec::new()),
+            socket_pool_cap: 8,
         })
     }
 
@@ -371,12 +375,17 @@ impl DnsHijack {
     ) -> bool {
         match self.resolve_query(query, src_ip).await {
             Some(response) => {
+                log::info!(
+                    "DNS handle_query: resolved {} bytes, sending via TUN to {src_ip}:{src_port}",
+                    response.len()
+                );
                 let _ = self
                     .send_response(&response, dst_ip, src_ip, src_port)
                     .await;
                 true
             },
             None => {
+                log::warn!("DNS handle_query: resolution failed, sending REFUSED");
                 if let Some(resp) = build_refused_response(query) {
                     let _ =
                         self.send_response(&resp, dst_ip, src_ip, src_port).await;
@@ -394,8 +403,14 @@ impl DnsHijack {
     ) -> Option<Vec<u8>> {
         let q = parse_dns_query(query)?;
 
-        // AAAA → empty answer (no v6 end-to-end yet).
+        log::info!(
+            "DNS resolve: name={} qtype={} src={}",
+            q.name, q.qtype, src_ip
+        );
+
+        // AAAA -> empty answer (no v6 end-to-end yet).
         if q.qtype == 28 {
+            log::info!("DNS resolve: {} type AAAA -> empty (no v6)", q.name);
             return build_empty_response(query);
         }
 
@@ -504,29 +519,66 @@ impl DnsHijack {
         &self, query: &[u8], upstream: &Destination,
     ) -> Option<Vec<u8>> {
         let addr: std::net::SocketAddr = upstream.to_string().parse().ok()?;
+        log::info!("resolve_direct_udp: upstream={addr}");
         let sock = {
             let mut pool = self.socket_pool.lock().await;
             pool.pop()
         };
         let sock = match sock {
-            Some(s) => s,
+            Some(s) => {
+                log::info!("resolve_direct_udp: reused pooled socket");
+                s
+            },
             None => {
-                let s =
-                    bind_udp_bypass("0.0.0.0:0".parse().unwrap()).await.ok()?;
-                s.connect(addr).await.ok()?;
+                let s = match bind_udp_bypass("0.0.0.0:0".parse().unwrap()).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        log::warn!("resolve_direct_udp: bind failed: {e}");
+                        return None;
+                    }
+                };
+                match s.connect(addr).await {
+                    Ok(()) => {},
+                    Err(e) => {
+                        log::warn!("resolve_direct_udp: connect to {addr} failed: {e}");
+                        return None;
+                    }
+                }
+                log::info!("resolve_direct_udp: socket connected to {addr}");
                 s
             },
         };
 
-        sock.send(query).await.ok()?;
+        match sock.send(query).await {
+            Ok(_) => {},
+            Err(e) => {
+                log::warn!("resolve_direct_udp: send to {addr} failed: {e}");
+                return None;
+            }
+        }
+        log::info!("resolve_direct_udp: sent {len} bytes to {addr}", len = query.len());
         let mut buf = vec![0u8; 4096];
         let result = match timeout(QUERY_TIMEOUT, sock.recv(&mut buf)).await {
-            Ok(Ok(n)) => Some(buf[..n].to_vec()),
-            _ => None,
+            Ok(Ok(n)) => {
+                log::info!("resolve_direct_udp: got {n} bytes from {addr}");
+                Some(buf[..n].to_vec())
+            }
+            Ok(Err(e)) => {
+                log::warn!("resolve_direct_udp: recv error from {addr}: {e}");
+                None
+            }
+            Err(_) => {
+                log::warn!("resolve_direct_udp: timeout waiting for {addr}");
+                None
+            }
         };
 
-        // Return socket to the pool for reuse.
-        self.socket_pool.lock().await.push(sock);
+        // Return socket to the pool for reuse (if pool not full).
+        let mut pool = self.socket_pool.lock().await;
+        if pool.len() < self.socket_pool_cap {
+            pool.push(sock);
+        }
+        // Excess sockets are dropped here, releasing their fd.
         result
     }
 
@@ -576,47 +628,88 @@ impl DnsHijack {
     /// DHCP).
     pub fn start_hijack_listener(self: &Arc<Self>) {
         let this = self.clone();
+
+        // IPv4 listener.
+        let this4 = this.clone();
         tokio::spawn(async move {
+            // On macOS, bind to 127.0.0.1 (not 0.0.0.0) so:
+            // 1) The listener receives pf `rdr`-redirected DNS (-> 127.0.0.1:1053)
+            // 2) Response source IP is 127.0.0.1, matching the rdr state for
+            //    reverse NAT. Binding 0.0.0.0 causes the kernel to pick the
+            //    destination IP as source (e.g. 10.0.0.1), breaking rdr state.
+            // On Linux/Android, bind to 0.0.0.0 with SO_MARK / VpnService
+            // protect so response traffic bypasses TUN.
+            #[cfg(target_os = "macos")]
+            let addr = std::net::SocketAddr::new(
+                std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
+                DNS_REDIRECT_PORT,
+            );
+            #[cfg(not(target_os = "macos"))]
             let addr = std::net::SocketAddr::new(
                 std::net::IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)),
                 DNS_REDIRECT_PORT,
             );
-            let socket = match bind_udp_bypass(addr).await {
-                Ok(s) => Arc::new(s),
+            Self::run_listener(this4, addr).await;
+        });
+
+        // IPv6 listener (macOS only - pf `rdr inet6` redirects to ::1:1053).
+        // Without this, IPv6 DNS queries are redirected to ::1:1053 where
+        // nobody listens, causing DNS failure for systems using IPv6 DNS.
+        #[cfg(target_os = "macos")]
+        {
+            let this6 = this.clone();
+            tokio::spawn(async move {
+                let addr = std::net::SocketAddr::new(
+                    std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+                    DNS_REDIRECT_PORT,
+                );
+                Self::run_listener(this6, addr).await;
+            });
+        }
+    }
+
+    /// Run a DNS loopback listener on the given address.
+    async fn run_listener(this: Arc<Self>, addr: std::net::SocketAddr) {
+        let socket = match {
+            #[cfg(target_os = "macos")]
+            { UdpSocket::bind(addr).await }
+            #[cfg(not(target_os = "macos"))]
+            { bind_udp_bypass(addr).await }
+        } {
+            Ok(s) => Arc::new(s),
+            Err(e) => {
+                log::error!("DNS loopback listener: bind {addr} failed: {e}");
+                return;
+            },
+        };
+
+        log::info!("DNS loopback listener on {addr}");
+        let mut buf = vec![0u8; 512];
+        loop {
+            let (n, src) = match socket.recv_from(&mut buf).await {
+                Ok(x) => x,
                 Err(e) => {
-                    log::error!(
-                        "DNS loopback listener: bind 0.0.0.0:{} failed: {e}",
-                        DNS_REDIRECT_PORT
-                    );
-                    crate::graceful_shutdown();
-                    return;
+                    log::warn!("DNS loopback recv: {e}");
+                    break;
                 },
             };
-
-            log::info!("DNS loopback listener on 0.0.0.0:{}", DNS_REDIRECT_PORT);
-            let mut buf = vec![0u8; 512];
-            loop {
-                let (n, src) = match socket.recv_from(&mut buf).await {
-                    Ok(x) => x,
-                    Err(e) => {
-                        log::warn!("DNS loopback recv: {e}");
-                        break;
-                    },
-                };
-                let query = buf[..n].to_vec();
-                let this = this.clone();
-                let sock = socket.clone();
-                tokio::spawn(async move {
-                    let response = this
-                        .resolve_query(&query, src.ip())
-                        .await
-                        .or_else(|| build_refused_response(&query));
-                    if let Some(r) = response {
-                        let _ = sock.send_to(&r, src).await;
-                    }
-                });
-            }
-        });
+            let query = buf[..n].to_vec();
+            log::info!("DNS listener: received {n} bytes from {src}");
+            let this = this.clone();
+            let sock = socket.clone();
+            tokio::spawn(async move {
+                let response = this
+                    .resolve_query(&query, src.ip())
+                    .await
+                    .or_else(|| build_refused_response(&query));
+                if let Some(r) = response {
+                    log::info!("DNS listener: sending {} bytes to {src}", r.len());
+                    let _ = sock.send_to(&r, src).await;
+                } else {
+                    log::warn!("DNS listener: no response for {src}");
+                }
+            });
+        }
     }
 
     fn plan_for(&self, tag: String) -> Plan {
@@ -660,12 +753,11 @@ impl DnsHijack {
             let up = &self.direct_doh_upstreams[idx];
             let host = match up { Upstream::Doh { host, .. } => host.as_str(), _ => "" };
             if let Some(resp) = self.doh.resolve(query, up).await {
-                log::debug!("DNS: {qname} (type {qtype}) → DoH({host})");
+                log::info!("DNS: {qname} (type {qtype}) -> DoH({host}) OK");
                 return Some(resp);
             }
-            // DoH failed — fall through to plain UDP fallback.
+            // DoH failed - fall through to plain UDP fallback.
         }
-
         // --- Plain UDP fallback phase ---
         if is_direct {
             if !self.direct_plain.is_empty() {
@@ -673,7 +765,7 @@ impl DnsHijack {
                 if let Upstream::Plain(dest) = &self.direct_plain[idx] {
                     let d = dest.to_string();
                     if let Some(resp) = self.resolve_direct_udp(query, dest).await {
-                        log::debug!("DNS: {qname} (type {qtype}) → UDP({d})");
+                        log::info!("DNS: {qname} (type {qtype}) -> UDP({d}) OK");
                         return Some(resp);
                     }
                 }
@@ -691,12 +783,13 @@ impl DnsHijack {
                 let tag = plan.outbound_tag.clone();
                 if let Some(c) = client {
                     if let Some(resp) = self.resolve_via_outbound(query, dest, c).await {
-                        log::debug!("DNS: {qname} (type {qtype}) → via {tag}({d})");
+                        log::info!("DNS: {qname} (type {qtype}) -> via {tag}({d}) OK");
                         return Some(resp);
                     }
                 }
             }
         }
+        log::warn!("DNS: {qname} (type {qtype}) -> ALL METHODS FAILED");
         None
     }
 
@@ -719,6 +812,10 @@ impl DnsHijack {
                 ));
             },
         };
+        log::info!(
+            "DNS send_response: {} bytes, src={}:53 dst={}:{} via TUN writer",
+            raw.len(), src_ip, dst_ip, dst_port
+        );
         self.writer.write(&raw).await?;
         Ok(())
     }

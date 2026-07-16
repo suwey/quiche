@@ -179,6 +179,7 @@ impl SessionHandle {
             pending: Vec::new(),
             outbound_tx: self.inner.outbound_tx.clone(),
             control_tx: self.inner.control_tx.clone(),
+            inner: self.inner.clone(),
             error,
         })
     }
@@ -193,6 +194,7 @@ pub(crate) struct StreamHandle {
     data_rx: mpsc::UnboundedReceiver<Vec<u8>>,
     outbound_tx: mpsc::UnboundedSender<OutboundMsg>,
     control_tx: mpsc::UnboundedSender<ControlFrame>,
+    inner: Arc<SessionInner>,
     pending: Vec<u8>,
     error: Arc<StdMutex<Option<String>>>,
 }
@@ -238,6 +240,17 @@ impl StreamHandle {
     }
 
     pub(super) async fn close(&self) {
+        // Remove from streams map immediately so the slot is freed even
+        // if the server never sends FIN back (network drop, server bug).
+        // The IoThread's data_tx sender is dropped here, which closes the
+        // channel — any subsequent read() on this stream returns EOF.
+        let removed = {
+            let mut map = self.inner.streams.lock().unwrap();
+            map.remove(&self.sid)
+        };
+        if removed.is_some() {
+            self.inner.active_streams.fetch_sub(1, SeqCst);
+        }
         let _ = self.control_tx.send(ControlFrame::Fin(self.sid));
     }
 }
@@ -527,9 +540,12 @@ fn handle_blocking_frame(
                         Some("server closed stream before any data".to_string());
                 }
                 drop(entry.data_tx);
+                drop(map);
+                // Only decrement if we actually removed an entry — the
+                // client-side close() path may have already removed it and
+                // decremented.
+                inner.active_streams.fetch_sub(1, SeqCst);
             }
-            drop(map);
-            inner.active_streams.fetch_sub(1, SeqCst);
         },
         CMD_HEART_RESPONSE => {},
         CMD_HEART_REQUEST => {

@@ -387,7 +387,7 @@ pub async fn run(opts: RunOptions) -> Result<(), Box<dyn std::error::Error>> {
     // --- TUN inbounds ---
     // Linux: create TUN device internally via rtnetlink.
     // Android: receive fd from VpnService via JNI.
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
     let _tun_guard: Option<crate::inbound::tun::TunGuard> = {
         use crate::dns::DnsHijack;
         use crate::inbound::tun::TunConfig;
@@ -470,10 +470,29 @@ pub async fn run(opts: RunOptions) -> Result<(), Box<dyn std::error::Error>> {
                     },
                 }
             }
+
+            #[cfg(target_os = "macos")]
+            {
+                match TunInbound::new(&tun_config, Some(dns_builder)).await {
+                    Ok((inbound, guard)) => {
+                        log::info!("Starting TUN inbound on {} (macOS)", tun_config.addr);
+                        log::info!(
+                            "DNS hijack enabled (direct={:?}, remote={:?})",
+                            dns_cfg.direct,
+                            dns_cfg.remote
+                        );
+                        tasks.push(tokio::spawn(run_inbound(inbound, ctx.clone())));
+                        last_guard = Some(guard);
+                    },
+                    Err(e) => {
+                        log::error!("Failed to start TUN inbound: {e}");
+                    },
+                }
+            }
         }
         last_guard
     };
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
     let _tun_guard: Option<crate::inbound::tun::TunGuard> = None;
 
     // Inject TUN manager into context (Linux only — Android has no route manager).
@@ -593,7 +612,7 @@ pub async fn run(opts: RunOptions) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // --- TUN mode check ---
-    let has_tun = cfg!(any(target_os = "linux", target_os = "android"))
+    let has_tun = cfg!(any(target_os = "linux", target_os = "android", target_os = "macos"))
         && !config.inbounds_by_type("tun").is_empty();
 
     // --- SOCKS5 inbounds ---
@@ -1081,10 +1100,50 @@ async fn run_inbound(mut inbound: impl Inbound + 'static, ctx: AppContext) {
             let out = match dial_result {
                 Ok(o) => o,
                 Err(msg) => {
-                    log::error!("{msg}");
-                    let _ = stream.shutdown().await;
-                    ctx.stats.remove_connection(&conn_id).await;
-                    return;
+                    // macOS fallback: direct TCP connections fail because
+                    // source IP (10.0.0.1) is not routable from gateway.
+                    // Retry through the "auto" (proxy) outbound.
+                    #[cfg(target_os = "macos")]
+                    {
+                        if tag == "direct" && network == crate::inbound::Network::Tcp {
+                            if let Some(auto_client) = ctx.registry.get("auto").cloned() {
+                                log::info!("macOS direct failed, falling back to auto: {destination}");
+                                let fallback_result = auto_client
+                                    .dial(&destination)
+                                    .await
+                                    .map_err(|e| e.to_string());
+                                match fallback_result {
+                                    Ok(o) => {
+                                        log::info!("Fallback to auto succeeded for {destination}");
+                                        o
+                                    },
+                                    Err(e2_msg) => {
+                                        log::error!("{msg}; fallback to auto also failed: {e2_msg}");
+                                        let _ = stream.shutdown().await;
+                                        ctx.stats.remove_connection(&conn_id).await;
+                                        return;
+                                    },
+                                }
+                            } else {
+                                log::error!("{msg}");
+                                let _ = stream.shutdown().await;
+                                ctx.stats.remove_connection(&conn_id).await;
+                                return;
+                            }
+                        } else {
+                            log::error!("{msg}");
+                            let _ = stream.shutdown().await;
+                            ctx.stats.remove_connection(&conn_id).await;
+                            return;
+                        }
+                    }
+                    #[cfg(not(target_os = "macos"))]
+                    {
+                        log::error!("{msg}");
+                        let _ = stream.shutdown().await;
+                        ctx.stats.remove_connection(&conn_id).await;
+                        return;
+                    }
                 },
             };
 
