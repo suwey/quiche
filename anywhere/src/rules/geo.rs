@@ -766,13 +766,27 @@ pub struct GeoRuleSet {
     update_interval: std::time::Duration,
     cache_path: std::path::PathBuf,
     matcher: tokio::sync::RwLock<Option<GeoMatcher>>,
+    /// True when the cache was stale (or absent) at construction and should be
+    /// refreshed ASAP in the background - without blocking startup.
+    needs_refresh: bool,
+    /// Plain-IP DNS upstreams (e.g. `223.5.5.5:53`) used to resolve geo-rule
+    /// download hosts via a bypass socket, so the refresh works even after
+    /// the TUN / fake-ip DNS hijack is active.
+    dns_plain: Vec<std::net::SocketAddr>,
 }
 
 impl GeoRuleSet {
-    /// Create a new GeoRuleSet: try to download first, fall back to cached
-    /// file.
+    /// Create a new GeoRuleSet.
+    ///
+    /// Cache-first (stale-while-revalidate): if a cached file exists it is
+    /// loaded immediately so engine startup is not blocked on network I/O.
+    /// A stale cache (older than `update_interval`) is marked for a background
+    /// refresh via [`start_background_update`]. Only when there is no cache at
+    /// all does this block on a download (first run; on Android the Kotlin
+    /// prefetch usually populates the cache before the engine starts).
     pub async fn new(
         url: &str, update_interval_str: Option<&str>, cache_dir: &std::path::Path,
+        dns_plain: Vec<std::net::SocketAddr>,
     ) -> Self {
         let source_name = extract_source_name(url);
         let update_interval = update_interval_str
@@ -795,8 +809,12 @@ impl GeoRuleSet {
             format!("{cache_filename}.srs")
         };
         let cache_path = cache_dir.join("rule_set").join(&cache_filename);
-        // Use cached file if it exists and is recent enough.
-        let matcher = if cache_path.exists() {
+
+        // Cache-first: load immediately for fast startup. The blocking download
+        // that used to happen here would fail on Android anyway (TUN/DNS not
+        // ready during engine init) and burn ~30s of DNS timeouts before
+        // falling back to this same cache.
+        let (matcher, needs_refresh) = if cache_path.exists() {
             let age = std::time::SystemTime::now()
                 .duration_since(
                     cache_path
@@ -805,41 +823,29 @@ impl GeoRuleSet {
                         .unwrap_or(std::time::SystemTime::UNIX_EPOCH),
                 )
                 .unwrap_or(std::time::Duration::ZERO);
-
-            if age < update_interval {
+            let stale = age >= update_interval;
+            if stale {
+                log::info!(
+                    "Using cached geo rule set (stale, age={}s; will refresh in background): {url}",
+                    age.as_secs(),
+                );
+            } else {
                 log::info!(
                     "Using cached geo rule set (age={}s): {url}",
                     age.as_secs(),
                 );
-                Self::load_cache(&cache_path, &source_name).await
-            } else {
-                // Cache exists but stale — try download, fall back to cache.
-                let _ = std::fs::create_dir_all(
-                    cache_path.parent().unwrap_or(std::path::Path::new("")),
-                );
-                match Self::fetch_and_cache(url, &cache_path, &source_name).await
-                {
-                    Ok(m) => Some(m),
-                    Err(e) => {
-                        log::warn!(
-                            "Download failed for {url}: {e}; using stale cache"
-                        );
-                        Self::load_cache(&cache_path, &source_name).await
-                    },
-                }
             }
+            (Self::load_cache(&cache_path, &source_name).await, stale)
         } else {
-            // No cache — download, fall back to nothing.
+            // No cache - must download now (first run only).
             if let Some(dir) = cache_path.parent() {
                 let _ = std::fs::create_dir_all(dir);
             }
-            match Self::fetch_and_cache(url, &cache_path, &source_name).await {
-                Ok(m) => Some(m),
+            match Self::fetch_and_cache(url, &cache_path, &source_name, &dns_plain).await {
+                Ok(m) => (Some(m), false),
                 Err(e) => {
-                    log::warn!(
-                        "Download failed for {url}: {e}; no cache available"
-                    );
-                    None
+                    log::warn!("Download failed for {url}: {e}; no cache available");
+                    (None, true)
                 },
             }
         };
@@ -850,6 +856,8 @@ impl GeoRuleSet {
             update_interval,
             cache_path,
             matcher: tokio::sync::RwLock::new(matcher),
+            needs_refresh,
+            dns_plain,
         }
     }
 
@@ -862,8 +870,9 @@ impl GeoRuleSet {
     /// ready.
     async fn fetch_and_cache(
         url: &str, cache_path: &std::path::Path, source_name: &str,
+        dns_plain: &[std::net::SocketAddr],
     ) -> Result<GeoMatcher, String> {
-        let data = Self::http_get_bypass(url)
+        let data = Self::http_get_bypass(url, dns_plain)
             .await
             .map_err(|e| format!("HTTP GET {url}: {e}"))?;
 
@@ -883,7 +892,9 @@ impl GeoRuleSet {
     /// properly protected on Android (via `VpnService.protect`) and marked
     /// with `SO_MARK` on Linux, consistent with all other outbound
     /// connections.
-    async fn http_get_bypass(url: &str) -> Result<Vec<u8>, String> {
+    async fn http_get_bypass(
+        url: &str, dns_plain: &[std::net::SocketAddr],
+    ) -> Result<Vec<u8>, String> {
         use std::sync::Arc;
         use std::time::Duration;
 
@@ -905,11 +916,29 @@ impl GeoRuleSet {
         let query = parsed.query().map(|q| format!("?{q}")).unwrap_or_default();
         let path_query = format!("{path}{query}");
 
-        // Resolve host to IP via system resolver.
-        let ips = tokio::net::lookup_host(format!("{host}:{port}")).await
-            .map_err(|e| format!("DNS lookup {host}: {e}"))?;
-        let addr: std::net::SocketAddr = ips.into_iter().next()
-            .ok_or_else(|| format!("no addresses for {host}"))?;
+        // Resolve host to an IP. On Android the system resolver is hijacked
+        // by the engine's fake-ip DNS (query source is the TUN address, not
+        // loopback, so local_direct doesn't apply) and returns a non-routable
+        // 198.18.x.x. Try a direct UDP query to a configured plain upstream
+        // over a bypass (protected) socket first; fall back to the system
+        // resolver if that fails or returns a fake-ip (e.g. pf rdr on macOS
+        // still redirected the bypass query to the hijack). On desktop (no
+        // TUN) the system resolver is fine either way.
+        let ip = if !dns_plain.is_empty() {
+            Self::resolve_bypass(host, dns_plain).await
+        } else {
+            None
+        };
+        let ip = match ip {
+            Some(ip) => ip,
+            None => tokio::net::lookup_host(format!("{host}:{port}"))
+                .await
+                .ok()
+                .and_then(|mut it| it.next())
+                .map(|sa| sa.ip())
+                .ok_or_else(|| format!("DNS resolution failed for {host}"))?,
+        };
+        let addr = std::net::SocketAddr::new(ip, port);
 
         // TCP connect with bypass (protect on Android / SO_MARK on Linux).
         let tcp = crate::outbound::common::connect_tcp_bypass(addr)
@@ -980,6 +1009,66 @@ impl GeoRuleSet {
         Ok(body.to_bytes().to_vec())
     }
 
+    /// True if `ip` is in the default fake-ip range 198.18.0.0/15 (what the
+    /// engine's fake-ip DNS hands out for proxied domains).
+    fn is_fakeip(ip: &std::net::IpAddr) -> bool {
+        match ip {
+            std::net::IpAddr::V4(v4) => {
+                let o = v4.octets();
+                o[0] == 198 && (18..=19).contains(&o[1])
+            },
+            _ => false,
+        }
+    }
+
+    /// Resolve `host` to an IP via a direct UDP DNS query to one of
+    /// `dns_plain`, over a bypass (TUN-protected) socket. Returns the first
+    /// A record found; tries each upstream in order.
+    async fn resolve_bypass(
+        host: &str, dns_plain: &[std::net::SocketAddr],
+    ) -> Option<std::net::IpAddr> {
+        use crate::dns::wire::{build_a_query, first_a_record};
+        use crate::outbound::common::bind_udp_bypass;
+        use tokio::time::timeout;
+
+        let query = build_a_query(host);
+        for up in dns_plain {
+            let sock = match bind_udp_bypass("0.0.0.0:0".parse().unwrap()).await {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            if sock.connect(*up).await.is_err() {
+                continue;
+            }
+            if sock.send(&query).await.is_err() {
+                continue;
+            }
+            let mut buf = vec![0u8; 512];
+            if let Ok(Ok(n)) = timeout(
+                std::time::Duration::from_secs(3),
+                sock.recv(&mut buf),
+            )
+            .await
+            {
+                if let Some(ip) = first_a_record(&buf[..n]) {
+                    // Reject fake-ip (198.18.0.0/15): the bypass query didn't
+                    // escape the engine's DNS hijack (e.g. pf rdr on macOS
+                    // still redirected it). Fall through so the caller retries
+                    // via the system resolver.
+                    if !Self::is_fakeip(&ip) {
+                        log::debug!("geo DNS bypass: {host} -> {ip} via {up}");
+                        return Some(ip);
+                    }
+                    log::warn!(
+                        "geo DNS bypass: {host} -> fake-ip {ip} via {up} \
+                         (bypass leaked to hijack)"
+                    );
+                }
+            }
+        }
+        None
+    }
+
     async fn load_cache(
         cache_path: &std::path::Path, source_name: &str,
     ) -> Option<GeoMatcher> {
@@ -1000,35 +1089,45 @@ impl GeoRuleSet {
     }
 
     /// Start background refresh loop.
+    ///
+    /// If the cache was stale at construction, refresh immediately first (by
+    /// then the TUN/DNS is up so the download can actually succeed), then
+    /// loop on `update_interval`.
     pub fn start_background_update(self: std::sync::Arc<Self>) {
         let interval = self.update_interval;
         let this = self.clone();
         tokio::spawn(async move {
+            if this.needs_refresh {
+                Self::refresh_once(&this).await;
+            }
             loop {
                 tokio::time::sleep(interval).await;
-                match Self::fetch_and_cache(
-                    &this.url,
-                    &this.cache_path,
-                    &this.source_name,
-                )
-                .await
-                {
-                    Ok(matcher) => {
-                        *this.matcher.write().await = Some(matcher);
-                        log::info!(
-                            "Refreshed geo rule set: {}",
-                            this.source_name
-                        );
-                    },
-                    Err(e) => {
-                        log::warn!(
-                            "Failed to refresh geo rule set {}: {e}",
-                            this.source_name
-                        );
-                    },
-                }
+                Self::refresh_once(&this).await;
             }
         });
+    }
+
+    /// Download, parse, write to cache, and swap in the new matcher.
+    async fn refresh_once(this: &std::sync::Arc<Self>) {
+        match Self::fetch_and_cache(
+            &this.url,
+            &this.cache_path,
+            &this.source_name,
+            &this.dns_plain,
+        )
+        .await
+        {
+            Ok(matcher) => {
+                *this.matcher.write().await = Some(matcher);
+                log::info!("Refreshed geo rule set: {}", this.source_name);
+            },
+            Err(e) => {
+                log::warn!(
+                    "Failed to refresh geo rule set {}: {e}",
+                    this.source_name
+                );
+            },
+        }
     }
 }
 

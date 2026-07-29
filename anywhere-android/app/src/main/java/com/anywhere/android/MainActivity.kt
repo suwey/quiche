@@ -29,6 +29,7 @@ import java.net.NetworkInterface
 private val AnywhereBlack = Color(0xFF000000)
 private val AnywhereWhite = Color(0xFFFFFFFF)
 private val AnywhereYellow = Color(0xFFFF9900)
+private const val UI_POLL_TIMEOUT_SEC = 90
 
 /**
  * Main screen: Start/Stop VPN + Web UI access info.
@@ -77,29 +78,37 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
-        // Check if VPN service is actually running (handles Activity recreation
-        // after background -> foreground, config changes, process death recovery).
+        // Read engine status JSON for notices (always refresh).
+        notices.value = readEngineNotices()
+
+        // If a readiness poll is already running (started by startVpnService,
+        // e.g. just after returning from the VPN permission dialog), do NOT
+        // clobber it. isVpnServiceRunning() can transiently return false right
+        // after startForegroundService (the service isn't registered with
+        // ActivityManager until the next main-looper iteration), which would
+        // otherwise interrupt the poll and clear state. Trust the running poll.
+        if (uiPollThread?.isAlive == true) {
+            return
+        }
+
+        // No active poll - (re)derive state. Handles Activity recreation,
+        // process-death recovery, and resume-after-background.
         val running = isVpnServiceRunning()
         isRunning.value = running
         val port = if (running) getUiPort() else 9090
         uiUrl.value = if (running) "http://${getLanIp()}:$port" else null
-        // Read engine status JSON for notices
-        notices.value = readEngineNotices()
-        // Quick one-shot check if server is already up (no countdown on resume)
-        startCountdown.value = 0
         if (running) {
-            Thread {
-                try {
-                    java.net.Socket().use { s ->
-                        s.connect(java.net.InetSocketAddress("127.0.0.1", port), 1000)
-                    }
-                    uiReady.value = true
-                } catch (_: Exception) {
-                    uiReady.value = false
-                }
-            }.start()
+            if (uiReady.value) {
+                // UI was ready - verify it's still up (the engine may have
+                // restarted while we were backgrounded, e.g. after a config
+                // edit via the Web UI). If it went down, re-poll until back.
+                verifyUiAndRepollIfNeeded(port)
+            } else {
+                startUiPolling(port)
+            }
         } else {
             uiReady.value = false
+            startCountdown.value = 0
         }
     }
 
@@ -168,17 +177,25 @@ class MainActivity : ComponentActivity() {
     }
 
     /**
-     * Poll the Web UI TCP port until it's open, with a 30s countdown.
+     * Poll the Web UI TCP port until it's open.
+     *
      * Uses 127.0.0.1 to bypass VPN TUN routing. Re-reads port from config
-     * each iteration (config file may be created during polling).
-     * Runs on a background thread; interrupted when VPN stops.
+     * each iteration (config file may be created during polling). Runs on a
+     * background thread; interrupted when VPN stops.
+     *
+     * The engine (and thus the Web UI server) can take a while to come up -
+     * especially on a cold start or after a config-edit restart. So we poll
+     * eagerly for [UI_POLL_TIMEOUT_SEC] seconds; if the service is *still*
+     * running past that (proxy works, UI just not up yet) we do NOT mark the
+     * start as failed - we keep retrying with a backoff until the UI appears.
      */
     private fun startUiPolling(port: Int) {
         uiPollThread?.interrupt()
         uiReady.value = false
-        startCountdown.value = 30
+        startCountdown.value = UI_POLL_TIMEOUT_SEC
         uiPollThread = Thread {
-            while (startCountdown.value > 0 && !Thread.currentThread().isInterrupted) {
+            var elapsed = 0
+            while (!Thread.currentThread().isInterrupted && isRunning.value && !uiReady.value) {
                 try {
                     val p = getUiPort()
                     java.net.Socket().use { s ->
@@ -188,14 +205,42 @@ class MainActivity : ComponentActivity() {
                     startCountdown.value = 0
                     return@Thread
                 } catch (_: Exception) {}
-                startCountdown.value = startCountdown.value - 1
-                if (startCountdown.value <= 0) {
-                    startCountdown.value = -1 // failed
+                elapsed++
+                if (elapsed < UI_POLL_TIMEOUT_SEC) {
+                    startCountdown.value = UI_POLL_TIMEOUT_SEC - elapsed
+                } else {
+                    // Timed out but the service is still running - the proxy
+                    // works, the Web UI just isn't up yet. Show "Connected"
+                    // (startCountdown = 0) and keep retrying with a backoff.
+                    startCountdown.value = 0
+                }
+                try {
+                    Thread.sleep(if (elapsed < UI_POLL_TIMEOUT_SEC) 1000 else 3000)
+                } catch (_: InterruptedException) {
                     return@Thread
                 }
-                Thread.sleep(1000)
             }
         }.also { it.start() }
+    }
+
+    /**
+     * One-shot verify that the Web UI is still reachable; if not, start a
+     * fresh poll loop. Used on resume when [uiReady] was already true, to
+     * detect an engine restart that happened while backgrounded.
+     */
+    private fun verifyUiAndRepollIfNeeded(port: Int) {
+        Thread {
+            try {
+                java.net.Socket().use { s ->
+                    s.connect(java.net.InetSocketAddress("127.0.0.1", port), 1000)
+                }
+                uiReady.value = true
+                startCountdown.value = 0
+            } catch (_: Exception) {
+                uiReady.value = false
+                startUiPolling(port)
+            }
+        }.start()
     }
 
     private fun getUiPort(): Int {

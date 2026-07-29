@@ -316,12 +316,12 @@ impl OutboundClient for UrlTestOutboundClient {
 /// latency test runs immediately on start, then every `interval_secs`.
 pub fn spawn_test_loop(
     client: Arc<dyn OutboundClient>, test_url: String, interval_secs: u64,
-) {
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         // Test immediately, then every interval.
         loop {
             client.test_latency(&test_url, 443).await;
             tokio::time::sleep(Duration::from_secs(interval_secs)).await;
         }
-    });
+    })
 }

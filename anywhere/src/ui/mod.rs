@@ -65,7 +65,7 @@ pub async fn start(config: UiConfig, ctx: AppContext) {
         .route("/configs/file", get(config_file_handler))
         .route("/rules", get(rules_handler))
         .route("/proxies", get(proxies_handler))
-        .route("/group/:tag/delay", get(group_delay_handler))
+        .route("/group/{tag}/delay", get(group_delay_handler))
         .route("/providers/rules", get(providers_rules_handler))
         .route("/providers/proxies", get(providers_proxies_handler))
         .route("/logs", get(ws_logs_handler))
@@ -154,7 +154,7 @@ async fn auth_middleware(
 
 async fn version_handler() -> Json<serde_json::Value> {
     Json(serde_json::json!({
-        "version": concat!("anywhere/v", env!("CARGO_PKG_VERSION"))
+        "version": concat!("v", env!("CARGO_PKG_VERSION"))
     }))
 }
 
@@ -286,21 +286,29 @@ fn trigger_restart(state: &AppContext) -> StatusCode {
                 },
             }
         } else {
-            // Self re-exec via execve: no external process manager needed.
-            // The kernel replaces the current process image, so all memory,
-            // fds, and tokio tasks are instantly reclaimed — cleaner than
-            // graceful shutdown.
-            //
-            // We collect args *before* spawning the delay so that
-            // `std::env::args()` is read from the main thread.
-            let exe_str = exe.to_string_lossy().to_string();
-            let args: Vec<String> = std::env::args().collect();
-            ::log::info!("Restarting via execve: {exe_str} {:?}", args);
-            tokio::spawn(async move {
-                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                do_execve(&exe_str, &args);
-            });
-            StatusCode::NO_CONTENT
+            // No start_cmd: self re-exec via execve (Unix only).
+            // Windows has no execve equivalent; spawn+exit skips TUN/DNS
+            // cleanup and conflicts with the old process's Wintun adapter /
+            // bound ports. Require -s (external service manager) for
+            // restart on Windows.
+            #[cfg(unix)]
+            {
+                let exe_str = exe.to_string_lossy().to_string();
+                let args: Vec<String> = std::env::args().collect();
+                ::log::info!("Restarting via execve: {exe_str} {:?}", args);
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    do_execve(&exe_str, &args);
+                });
+                StatusCode::NO_CONTENT
+            }
+            #[cfg(not(unix))]
+            {
+                ::log::error!(
+                    "restart requires -s flag on Windows (no execve equivalent)"
+                );
+                StatusCode::NOT_IMPLEMENTED
+            }
         }
     }
 
@@ -319,13 +327,26 @@ fn trigger_restart(state: &AppContext) -> StatusCode {
     }
 }
 
+/// In-process reload: gracefully shut down run() and let main() re-call
+/// run() with the (potentially updated) config file. No process exit -
+/// ports/TUN are released via drop guards before the next run() iteration.
+fn trigger_reload(state: &AppContext) -> StatusCode {
+    ::log::info!("Reload requested via in-process restart");
+    crate::runner::RESTART_REQUESTED.store(
+        true,
+        std::sync::atomic::Ordering::SeqCst,
+    );
+    state.shutdown_signal.notify_waiters();
+    StatusCode::NO_CONTENT
+}
+
 /// Re-execute the current binary, replacing the process image.
 ///
 /// Uses `execve` via `std::os::unix::process::CommandExt::exec()`.
 /// On success, this function never returns (the process image is replaced).
 /// On failure, logs the error and exits with code 1.
-#[cfg(not(target_os = "android"))]
-fn do_execve(exe: &str, args: &[String]) {
+#[cfg(unix)]
+pub(crate) fn do_execve(exe: &str, args: &[String]) {
     use std::os::unix::process::CommandExt;
     let err = std::process::Command::new(exe)
         .args(&args[1..])
@@ -395,8 +416,8 @@ async fn put_configs_handler(
         }
     }
 
-    // Trigger restart with the (potentially updated) config file.
-    let status = trigger_restart(&state.ctx);
+    // Trigger in-process reload with the (potentially updated) config file.
+    let status = trigger_reload(&state.ctx);
     (status, "")
 }
 

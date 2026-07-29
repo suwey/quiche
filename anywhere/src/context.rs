@@ -9,13 +9,14 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 use std::sync::Mutex;
 #[cfg(target_os = "linux")]
 use std::sync::atomic::Ordering;
 
 use tokio::sync::broadcast;
 use tokio::sync::mpsc;
+use tokio::sync::Notify;
 
 use crate::command::StateEvent;
 use crate::command::UiCommand;
@@ -27,6 +28,10 @@ use crate::ui::state::AppStats;
 
 #[cfg(target_os = "linux")]
 use crate::inbound::tun::TunRouteManager;
+#[cfg(target_os = "macos")]
+use crate::inbound::tun::MacosTunManager;
+#[cfg(target_os = "windows")]
+use crate::inbound::tun::WindowsTunManager;
 
 /// Global application context.
 ///
@@ -38,16 +43,27 @@ pub struct AppContext {
     pub stats: Arc<AppStats>,
     pub logs_tx: broadcast::Sender<LogMsg>,
     pub start_cmd: Option<String>,
+    pub shutdown_signal: Arc<Notify>,
     pub outbound_tags: Vec<(String, String)>,
     pub urltest_states: HashMap<String, Arc<UrlTestState>>,
     pub cmd_tx: mpsc::Sender<UiCommand>,
     pub event_tx: broadcast::Sender<StateEvent>,
+    /// JoinHandles of per-connection relay tasks spawned by `run_inbound`.
+    /// On in-process reload these are aborted so the outbound clients they
+    /// hold (esp. the mless multiplexer's WebSocket) are dropped before the
+    /// next `run()` iteration reconnects - otherwise the proxy server sees
+    /// two connections and throttles the new one.
+    pub conn_handles: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
     /// Absolute path to the config file (for reload/restart).
-    /// Always set to an absolute path — resolved from -c argument,
+    /// Always set to an absolute path - resolved from -c argument,
     /// inline content fallback, or Android filesDir.
     pub config_path: Option<String>,
     #[cfg(target_os = "linux")]
     tun_mgr: Option<Arc<Mutex<TunRouteManager>>>,
+    #[cfg(target_os = "macos")]
+    tun_mgr: Option<Arc<Mutex<MacosTunManager>>>,
+    #[cfg(target_os = "windows")]
+    tun_mgr: Option<Arc<Mutex<WindowsTunManager>>>,
 }
 impl Clone for AppContext {
     fn clone(&self) -> Self {
@@ -57,12 +73,18 @@ impl Clone for AppContext {
             stats: self.stats.clone(),
             logs_tx: self.logs_tx.clone(),
             start_cmd: self.start_cmd.clone(),
+            shutdown_signal: self.shutdown_signal.clone(),
             outbound_tags: self.outbound_tags.clone(),
             urltest_states: self.urltest_states.clone(),
             cmd_tx: self.cmd_tx.clone(),
             event_tx: self.event_tx.clone(),
+            conn_handles: self.conn_handles.clone(),
             config_path: self.config_path.clone(),
             #[cfg(target_os = "linux")]
+            tun_mgr: self.tun_mgr.clone(),
+            #[cfg(target_os = "macos")]
+            tun_mgr: self.tun_mgr.clone(),
+            #[cfg(target_os = "windows")]
             tun_mgr: self.tun_mgr.clone(),
         }
     }
@@ -83,12 +105,18 @@ impl AppContext {
             stats,
             logs_tx,
             start_cmd,
+            shutdown_signal: Arc::new(Notify::new()),
             outbound_tags,
             urltest_states,
             cmd_tx,
             event_tx,
+            conn_handles: Arc::new(std::sync::Mutex::new(Vec::new())),
             config_path: None,
             #[cfg(target_os = "linux")]
+            tun_mgr: None,
+            #[cfg(target_os = "macos")]
+            tun_mgr: None,
+            #[cfg(target_os = "windows")]
             tun_mgr: None,
         }
     }
@@ -96,6 +124,16 @@ impl AppContext {
     /// Inject the TUN manager after TUN initialization.
     #[cfg(target_os = "linux")]
     pub fn set_tun_mgr(&mut self, mgr: Arc<Mutex<TunRouteManager>>) {
+        self.tun_mgr = Some(mgr);
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn set_tun_mgr(&mut self, mgr: Arc<Mutex<MacosTunManager>>) {
+        self.tun_mgr = Some(mgr);
+    }
+
+    #[cfg(target_os = "windows")]
+    pub fn set_tun_mgr(&mut self, mgr: Arc<Mutex<WindowsTunManager>>) {
         self.tun_mgr = Some(mgr);
     }
 
@@ -124,7 +162,8 @@ impl AppContext {
         changed
     }
 
-    /// Enable TUN capture using the manager's `auto_hijack` setting.
+    /// Enable TUN routing (Linux: ip rule + iptables; macOS/Windows:
+    /// split-default routes + DNS hijack via enable_routing).
     #[cfg(target_os = "linux")]
     pub fn tun_routing_enable(&self) -> Result<(), String> {
         let mgr = self.tun_mgr.as_ref().ok_or("TUN manager not available")?;
@@ -134,12 +173,27 @@ impl AppContext {
         Ok(())
     }
 
-    /// Disable TUN capture without tearing down bypass rules.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    pub fn tun_routing_enable(&self) -> Result<(), String> {
+        let mgr = self.tun_mgr.as_ref().ok_or("TUN manager not available")?;
+        let mut mgr = mgr.lock().map_err(|e| e.to_string())?;
+        mgr.enable_routing().map_err(|e| e.to_string())
+    }
+
+    /// Disable TUN routing without tearing down the TUN interface.
     #[cfg(target_os = "linux")]
     pub fn tun_routing_disable(&self) -> Result<(), String> {
         let mgr = self.tun_mgr.as_ref().ok_or("TUN manager not available")?;
         let mut mgr = mgr.lock().map_err(|e| e.to_string())?;
         mgr.disable_tun_capture();
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    pub fn tun_routing_disable(&self) -> Result<(), String> {
+        let mgr = self.tun_mgr.as_ref().ok_or("TUN manager not available")?;
+        let mut mgr = mgr.lock().map_err(|e| e.to_string())?;
+        mgr.disable_routing();
         Ok(())
     }
 
@@ -153,21 +207,29 @@ impl AppContext {
             .unwrap_or(false)
     }
 
-    /// TUN routing is not available on non-Linux/Android.
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    pub fn tun_routing_enabled(&self) -> bool {
+        self.tun_mgr
+            .as_ref()
+            .and_then(|mgr| mgr.lock().ok())
+            .map(|mgr| mgr.is_routing_enabled())
+            .unwrap_or(false)
+    }
+
+    // Android + other platforms: TUN routing toggle not supported
+    // (Android uses VpnService; toggle requires re-establish).
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    pub fn tun_routing_enable(&self) -> Result<(), String> {
+        Err("TUN routing toggle is not supported on this platform".into())
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    pub fn tun_routing_disable(&self) -> Result<(), String> {
+        Err("TUN routing toggle is not supported on this platform".into())
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     pub fn tun_routing_enabled(&self) -> bool {
         false
-    }
-
-    /// Enable TUN routing (no-op on non-Linux).
-    #[cfg(not(target_os = "linux"))]
-    pub fn tun_routing_enable(&self) -> Result<(), String> {
-        Err("TUN routing is only supported on Linux".into())
-    }
-
-    /// Disable TUN routing (no-op on non-Linux).
-    #[cfg(not(target_os = "linux"))]
-    pub fn tun_routing_disable(&self) -> Result<(), String> {
-        Err("TUN routing is only supported on Linux".into())
     }
 }

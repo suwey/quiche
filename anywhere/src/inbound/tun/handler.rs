@@ -20,6 +20,7 @@ use async_trait::async_trait;
 use tokio::sync::Mutex;
 use tokio::sync::mpsc;
 use tun::AsyncDevice;
+use tokio_util::sync::CancellationToken;
 
 use crate::dns::DnsHijack;
 use crate::inbound::Address;
@@ -136,6 +137,7 @@ pub async fn run_tun_handler(
     listener_port: u16, conn_tx: mpsc::Sender<InboundConn>,
     dns_hijack: Option<Arc<DnsHijack>>,
     reverse_dns: Option<Arc<ReverseDnsCache>>,
+    shutdown: CancellationToken,
 ) {
     let writer = TunWriter::new(tun.clone());
 
@@ -160,6 +162,15 @@ pub async fn run_tun_handler(
         // Apply backpressure sleep before reading the next packet.
         if !backoff.is_zero() {
             tokio::time::sleep(backoff).await;
+        }
+
+        // Cheap atomic check; the real shutdown is handle.abort() in
+        // TunLifecycle::shutdown (which cancels the .await below). Avoid
+        // tokio::select! here - it would create+register+deregister a
+        // cancellation future on every packet, which is costly in debug
+        // builds at high packet rates.
+        if shutdown.is_cancelled() {
+            return;
         }
 
         let n = match tun.recv(&mut buf).await {
@@ -201,15 +212,22 @@ pub async fn run_tun_handler(
                         let payload =
                             buf[udp_hdr_end..meta.total_len].to_vec();
                         let dns = dns.clone();
+                        let dns_shutdown = dns.shutdown.clone();
                         let src_ip = meta.src_ip;
                         let src_port = meta.src_port;
                         let dst_ip = meta.dst_ip;
                         let dst_port = meta.dst_port;
                         tokio::spawn(async move {
-                            dns.handle_query(
-                                &payload, src_ip, src_port, dst_ip, dst_port,
-                            )
-                            .await;
+                            // Exit promptly on shutdown so the cloned
+                            // `Arc<DnsHijack>` (and the `TunWriter` ->
+                            // `Arc<AsyncDevice>` it owns) is released before
+                            // the next `run()` recreates the TUN device.
+                            tokio::select! {
+                                _ = dns_shutdown.cancelled() => {},
+                                _ = dns.handle_query(
+                                    &payload, src_ip, src_port, dst_ip, dst_port,
+                                ) => {},
+                            }
                         });
                         continue;
                     }
@@ -718,6 +736,30 @@ impl PacketRelay for TunUdpSessionRelay {
     }
 
     async fn close(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    async fn send_port_unreachable(&mut self) -> std::io::Result<()> {
+        log::debug!(
+            "TUN: injecting ICMP port-unreachable for udp/{} {}:{} -> {}:{}",
+            self.resp_src_port, self.resp_dst_ip, self.resp_dst_port,
+            self.resp_src_ip, self.resp_src_port,
+        );
+        // Build an ICMP port-unreachable sourced from the server (resp_src)
+        // and addressed to the client (resp_dst), embedding the original
+        // UDP 5-tuple so the client's QUIC stack aborts and falls back to TCP.
+        let raw = match (self.resp_dst_ip, self.resp_src_ip) {
+            (IpAddr::V4(app), IpAddr::V4(srv)) =>
+                packet::build_icmp_port_unreachable_ipv4(
+                    app, self.resp_dst_port, srv, self.resp_src_port,
+                ),
+            (IpAddr::V6(app), IpAddr::V6(srv)) =>
+                packet::build_icmp_port_unreachable_ipv6(
+                    app, self.resp_dst_port, srv, self.resp_src_port,
+                ),
+            _ => return Ok(()),
+        };
+        self.writer.write(&raw).await?;
         Ok(())
     }
 }

@@ -13,13 +13,15 @@ pub use handler::TunWriter;
 
 #[cfg(target_os = "linux")]
 pub use platform::linux::cleanup_stale_routing;
+#[cfg(target_os = "windows")]
+pub use platform::windows::cleanup_stale_routing;
 
 #[cfg(target_os = "android")]
 pub use platform::android::create_tun_from_fd;
 
 use std::collections::HashMap;
 use std::net::IpAddr;
-#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "windows"))]
 use std::net::Ipv4Addr;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -42,12 +44,14 @@ pub use platform::linux::TunRouteManager;
 pub use platform::android::AndroidTunManager;
 #[cfg(target_os = "macos")]
 pub use platform::macos::MacosTunManager;
+#[cfg(target_os = "windows")]
+pub use platform::windows::WindowsTunManager;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use tokio::sync::mpsc;
-use tokio::sync::oneshot;
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::InboundConfig;
@@ -153,7 +157,6 @@ impl TunConfig {
 /// TUN inbound: captures all machine traffic via a virtual network interface.
 pub struct TunInbound {
     conn_rx: mpsc::Receiver<InboundConn>,
-    _shutdown_tx: oneshot::Sender<()>,
 }
 
 /// RAII guard that deletes the TUN interface on drop.
@@ -166,8 +169,10 @@ pub struct TunGuard {
     #[cfg(target_os = "android")]
     _inner: Option<AndroidTunManager>,
     #[cfg(target_os = "macos")]
-    _inner: Option<std::sync::Mutex<MacosTunManager>>,
-    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+    _inner: Option<Arc<std::sync::Mutex<MacosTunManager>>>,
+    #[cfg(target_os = "windows")]
+    _inner: Option<Arc<std::sync::Mutex<WindowsTunManager>>>,
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "windows")))]
     _inner: (),
 }
 
@@ -175,6 +180,14 @@ impl TunGuard {
     /// Return a clone of the inner TUN route manager, if available.
     #[cfg(target_os = "linux")]
     pub fn tun_mgr(&self) -> Option<Arc<std::sync::Mutex<TunRouteManager>>> {
+        self._inner.clone()
+    }
+    #[cfg(target_os = "macos")]
+    pub fn tun_mgr(&self) -> Option<Arc<std::sync::Mutex<MacosTunManager>>> {
+        self._inner.clone()
+    }
+    #[cfg(target_os = "windows")]
+    pub fn tun_mgr(&self) -> Option<Arc<std::sync::Mutex<WindowsTunManager>>> {
         self._inner.clone()
     }
 }
@@ -186,19 +199,18 @@ impl Drop for TunGuard {
             if let Ok(mut mgr) = mgr.lock() {
                 mgr.cleanup_routing();
 
-                let output = std::process::Command::new("ip")
+                let status = std::process::Command::new("ip")
                     .args(["link", "delete", &mgr.iface_name])
-                    .output();
-                match output {
-                    Ok(out) if out.status.success() => {
+                    .status();
+                match status {
+                    Ok(s) if s.success() => {
                         log::info!("TUN interface {} deleted", mgr.iface_name);
                     },
-                    Ok(out) => {
-                        let stderr = String::from_utf8_lossy(&out.stderr);
+                    Ok(s) => {
                         log::warn!(
-                            "Failed to delete TUN interface {}: {}",
+                            "Failed to delete TUN interface {} (exit {})",
                             mgr.iface_name,
-                            stderr.trim()
+                            s.code().unwrap_or(-1)
                         );
                     },
                     Err(e) => {
@@ -225,6 +237,15 @@ impl Drop for TunGuard {
             // needed.
             log::info!("macOS TUN interface cleaned up");
         }
+
+        #[cfg(target_os = "windows")]
+        if let Some(mgr) = self._inner.take() {
+            if let Ok(mut mgr) = mgr.lock() {
+                mgr.cleanup_routing();
+            }
+            // Wintun adapter is destroyed when the session closes (Device drop).
+            log::info!("Windows TUN interface cleaned up");
+        }
     }
 }
 
@@ -235,18 +256,75 @@ impl Inbound for TunInbound {
     }
 }
 
+/// Owned handles to the background tasks spawned by `TunInbound::new`
+/// (the TUN I/O reader, the NAT accept loop, the NAT cleanup loop, and the
+/// DNS hijack listeners), plus the shared shutdown token.
+///
+/// `shutdown()` cancels the token and aborts+awaits every task so the
+/// `Arc<AsyncDevice>` (and on Windows the Wintun session/adapter) is fully
+/// released **before** the next `run()` iteration recreates the TUN device.
+/// Without this, the orphaned tasks keep the old adapter open; the next
+/// `tun::create` reopens it and starts a second session that never receives
+/// traffic, leaving the UI with no connections after an in-process reload.
+pub struct TunLifecycle {
+    shutdown: CancellationToken,
+    handles: Vec<JoinHandle<()>>,
+}
+
+impl TunLifecycle {
+    /// Cancel all TUN tasks, abort their join handles, and wait for them to
+    /// finish (bounded) so the device handle is dropped before returning.
+    pub async fn shutdown(mut self) {
+        let n = self.handles.len();
+        log::info!("TUN lifecycle shutdown: cancelling token + aborting {n} task(s)");
+        self.shutdown.cancel();
+        // Take the handles out so Drop (which runs on `self` at the end of
+        // this method) sees an empty vec and the join_all can consume them.
+        let handles = std::mem::take(&mut self.handles);
+        for handle in &handles {
+            handle.abort();
+        }
+        // Await so the task futures (and the `Arc<AsyncDevice>` they hold)
+        // are actually dropped before the caller proceeds. Bounded so a
+        // stuck task cannot hang shutdown.
+        let _ = tokio::time::timeout(
+            Duration::from_secs(2),
+            futures_util::future::join_all(handles),
+        )
+        .await;
+        log::info!("TUN lifecycle shutdown: complete (device handle should be released)");
+    }
+}
+
+impl Drop for TunLifecycle {
+    fn drop(&mut self) {
+        // Best-effort cleanup if shutdown() wasn't awaited explicitly (e.g.
+        // run() returns early on a config error after TUN setup). Cancels
+        // the token so transient DNS tasks exit and aborts the long-running
+        // tasks so they don't outlive the TUN device they reference.
+        self.shutdown.cancel();
+        for handle in &self.handles {
+            handle.abort();
+        }
+    }
+}
+
 impl TunInbound {
-    /// Create TUN device, set up routing, and return (inbound, guard).
+    /// Create TUN device, set up routing, and return (inbound, guard,
+    /// lifecycle).
     ///
     /// The caller MUST keep `guard` alive for the lifetime of the inbound.
     /// When `guard` is dropped, the TUN interface is deleted and routes
-    /// are cleaned up.
+    /// are cleaned up. The caller MUST call `lifecycle.shutdown().await`
+    /// before dropping the guard (and before recreating the TUN device) so
+    /// the background I/O tasks release the device handle.
     ///
-    /// The `dns_hijack_builder` receives a `TunWriter` and the
-    /// TUN-owned `ReverseDnsCache` so the DNS hijack can populate
-    /// IP→domain mappings.
+    /// The `dns_hijack_builder` receives a `TunWriter`, the TUN-owned
+    /// `ReverseDnsCache`, and the shared shutdown `CancellationToken` (so
+    /// in-flight DNS query tasks exit promptly on reload) so the DNS hijack
+    /// can populate IP->domain mappings.
     ///
-    /// On Android, `tun_fd` must be `Some(fd)` — the fd comes from
+    /// On Android, `tun_fd` must be `Some(fd)` - the fd comes from
     /// VpnService.establish() via JNI. On Linux, `tun_fd` is ignored
     /// (the TUN device is created internally via rtnetlink).
     #[allow(unused_variables)]
@@ -254,12 +332,16 @@ impl TunInbound {
         config: &TunConfig,
         dns_hijack_builder: Option<
             Box<
-                dyn FnOnce(handler::TunWriter, Arc<ReverseDnsCache>) -> DnsHijack
+                dyn FnOnce(
+                        handler::TunWriter,
+                        Arc<ReverseDnsCache>,
+                        CancellationToken,
+                    ) -> DnsHijack
                     + Send,
             >,
         >,
         #[cfg(target_os = "android")] tun_fd: Option<RawFd>,
-    ) -> Result<(Self, TunGuard), Box<dyn std::error::Error>> {
+    ) -> Result<(Self, TunGuard, TunLifecycle), Box<dyn std::error::Error>> {
         let addr = config.addr;
         let mask_len = config.mask_len;
         let mtu = config.mtu;
@@ -306,6 +388,21 @@ impl TunInbound {
             (Arc::new(device), String::new()) // actual name resolved below
         };
 
+        #[cfg(target_os = "windows")]
+        let device = {
+            let mut tun_config = tun::Configuration::default();
+            tun_config
+                .address(addr)
+                .netmask(mask_to_ipv4_addr(mask_len))
+                .mtu(mtu)
+                .up();
+            // Wintun adapter: the `tun` crate loads wintun.dll from the
+            // working directory (override via platform_config.wintun_file).
+            // The adapter is identified by GUID, not the configured name.
+            let device = tun::create_as_async(&tun_config)?;
+            Arc::new(device)
+        };
+
         // macOS: read the actual interface name assigned by the kernel.
         #[cfg(target_os = "macos")]
         let name = {
@@ -323,12 +420,12 @@ impl TunInbound {
             }
         };
 
-        #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+        #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "windows")))]
         {
-            return Err("TUN is only supported on Linux, Android, and macOS".into());
+            return Err("TUN is only supported on Linux, Android, macOS, and Windows".into());
         }
 
-        #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+        #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "windows")))]
         let device: Arc<tun::AsyncDevice> = unreachable!();
 
         log::info!("TUN device {name} created at {addr}");
@@ -347,10 +444,19 @@ impl TunInbound {
 
         // Create DNS hijack handle early — it's needed inside the guard block
         // for the loopback listener on routers.
+        // Shared shutdown token for all TUN background tasks. Cancelling it
+        // (via TunLifecycle::shutdown) makes the I/O reader, accept loop,
+        // NAT cleanup, and DNS hijack listeners/tasks exit promptly so the
+        // `Arc<AsyncDevice>` is released before the next run() iteration.
+        let shutdown = CancellationToken::new();
+        // Join handles for every task spawned below; owned by TunLifecycle.
+        let mut tun_handles: Vec<JoinHandle<()>> = Vec::new();
+
         let dns_hijack = dns_hijack_builder.map(|b| {
             Arc::new(b(
                 handler::TunWriter::new(device.clone()),
                 reverse_dns.clone(),
+                shutdown.clone(),
             ))
         });
 
@@ -402,7 +508,7 @@ impl TunInbound {
             // listener.
             if config.auto_hijack {
                 if let Some(ref hijack) = dns_hijack {
-                    hijack.start_hijack_listener();
+                    tun_handles.extend(hijack.start_hijack_listener());
                 }
             }
             let mgr = Arc::new(std::sync::Mutex::new(mgr));
@@ -421,6 +527,7 @@ impl TunInbound {
             let mut mgr = MacosTunManager::new(
                 name.clone(),
                 addr,
+                config.auto_hijack,
             );
 
             if let Err(e) = mgr.setup_interface() {
@@ -436,28 +543,54 @@ impl TunInbound {
             // Start DNS loopback listener when auto_hijack is enabled.
             if config.auto_hijack {
                 if let Some(ref hijack) = dns_hijack {
-                    hijack.start_hijack_listener();
+                    tun_handles.extend(hijack.start_hijack_listener());
                 }
             }
 
             TunGuard {
-                _inner: Some(std::sync::Mutex::new(mgr)),
+                _inner: Some(Arc::new(std::sync::Mutex::new(mgr))),
             }
         };
 
-        #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+        // Windows: manage routes + DNS via shell commands (route/netsh).
+        #[cfg(target_os = "windows")]
+        let guard = {
+            let mut mgr = WindowsTunManager::new(name.clone(), addr, config.auto_hijack);
+
+            if let Err(e) = mgr.setup_interface() {
+                log::warn!("Failed to setup TUN interface: {e}");
+            }
+
+            if config.auto_route {
+                if let Err(e) = mgr.setup_routing(config.auto_hijack, &config.bypass_ips) {
+                    log::warn!("Failed to set up routing: {e}");
+                }
+            }
+
+            if config.auto_hijack {
+                if let Some(hijack) = &dns_hijack {
+                    tun_handles.extend(hijack.start_hijack_listener());
+                }
+            }
+
+            TunGuard {
+                _inner: Some(Arc::new(std::sync::Mutex::new(mgr))),
+            }
+        };
+
+        #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "windows")))]
         let guard = TunGuard { _inner: () };
 
         // 5. Create channels.
         let (conn_tx, conn_rx) = mpsc::channel::<InboundConn>(1024);
-        let (_shutdown_tx, _shutdown_rx) = oneshot::channel::<()>();
 
         // 6. Spawn the TUN I/O handler.
         let tun_clone = device.clone();
         let nat_clone = nat.clone();
         let conn_tx_handler = conn_tx.clone();
         let dns_hijack_clone = dns_hijack.clone();
-        tokio::spawn(async move {
+        let shutdown_handler = shutdown.clone();
+        tun_handles.push(tokio::spawn(async move {
             handler::run_tun_handler(
                 tun_clone,
                 addr,
@@ -466,9 +599,10 @@ impl TunInbound {
                 conn_tx_handler,
                 dns_hijack,
                 Some(reverse_dns_for_handler),
+                shutdown_handler,
             )
             .await;
-        });
+        }));
 
         // 7. Spawn the accept loop.
         let cancel_registry: TcpCancelRegistry =
@@ -478,7 +612,8 @@ impl TunInbound {
         let conn_tx_accept = conn_tx.clone();
         let reverse_dns_accept = reverse_dns.clone();
         let sniff_enabled = config.sniff;
-        tokio::spawn(async move {
+        let shutdown_accept = shutdown.clone();
+        tun_handles.push(tokio::spawn(async move {
             accept_loop(
                 listener,
                 nat_accept,
@@ -487,15 +622,20 @@ impl TunInbound {
                 Some(reverse_dns_accept),
                 dns_hijack_clone,
                 sniff_enabled,
+                shutdown_accept,
             )
             .await;
-        });
+        }));
 
         let nat_cleanup = nat.clone();
         let cancel_cleanup = cancel_registry.clone();
-        tokio::spawn(async move {
+        let shutdown_cleanup = shutdown.clone();
+        tun_handles.push(tokio::spawn(async move {
             loop {
                 tokio::time::sleep(TUN_TCP_NAT_CLEANUP_INTERVAL).await;
+                if shutdown_cleanup.is_cancelled() {
+                    return;
+                }
                 let expired = {
                     let mut guard = nat_cleanup.lock().await;
                     guard.cleanup_expired()
@@ -512,14 +652,15 @@ impl TunInbound {
                     }
                 }
             }
-        });
+        }));
 
         Ok((
-            Self {
-                conn_rx,
-                _shutdown_tx,
-            },
+            Self { conn_rx },
             guard,
+            TunLifecycle {
+                shutdown,
+                handles: tun_handles,
+            },
         ))
     }
 }
@@ -532,9 +673,13 @@ async fn accept_loop(
     reverse_dns: Option<Arc<ReverseDnsCache>>,
     dns_hijack: Option<Arc<DnsHijack>>,
     sniff_enabled: bool,
+    shutdown: CancellationToken,
 ) {
     let mut backoff = Duration::from_millis(100);
     loop {
+        if shutdown.is_cancelled() {
+            return;
+        }
         let (stream, remote) = match listener.accept().await {
             Ok(accepted) => {
                 backoff = Duration::from_millis(100);
@@ -770,6 +915,12 @@ impl StreamRelay for TunTcpRelay {
         // for the 120s idle timeout.
         self.close_nat().await;
     }
+
+    async fn finish(&mut self) {
+        // Normal end-of-connection: reclaim the NAT port immediately. The
+        // underlying socket is closed (FIN) when TunTcpRelay is dropped.
+        self.close_nat().await;
+    }
 }
 
 fn ip_to_addr(ip: std::net::IpAddr) -> Address {
@@ -780,7 +931,7 @@ fn ip_to_addr(ip: std::net::IpAddr) -> Address {
 }
 
 /// Convert a prefix length to an IPv4 netmask.
-#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "windows"))]
 #[allow(dead_code)]
 fn mask_to_ipv4_addr(len: u8) -> Ipv4Addr {
     let bits = if len >= 32 {

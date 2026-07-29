@@ -21,6 +21,10 @@ pub struct OutboundRegistry {
     clients: Arc<HashMap<String, Arc<dyn OutboundClient>>>,
     /// Per-urltest-node shared states for UI access.
     pub urltest_states: HashMap<String, Arc<UrlTestState>>,
+    /// JoinHandles of urltest background test loops. Aborted on in-process
+    /// reload so the outbound clients they hold (esp. mless/vless mux
+    /// persistent connections) are released before the next run() iteration.
+    test_loop_handles: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
 
 impl OutboundRegistry {
@@ -133,6 +137,8 @@ impl OutboundRegistry {
         // registered) ---
         let mut urltest_states: HashMap<String, Arc<UrlTestState>> =
             HashMap::new();
+        let mut test_loop_handles: Vec<tokio::task::JoinHandle<()>> =
+            Vec::new();
 
         for cfg in config.outbounds.iter().filter(|o| o.type_ == "urltest") {
             let tag = Self::tag(cfg)?.to_string();
@@ -177,12 +183,11 @@ impl OutboundRegistry {
             urltest_states.insert(tag.clone(), state.clone());
 
             let client_arc = Arc::new(client) as Arc<dyn OutboundClient>;
-
-            urltest::spawn_test_loop(
+            test_loop_handles.push(urltest::spawn_test_loop(
                 Arc::clone(&client_arc),
                 test_url_for_loop,
                 interval,
-            );
+            ));
 
             clients.insert(tag.clone(), client_arc);
         }
@@ -196,6 +201,7 @@ impl OutboundRegistry {
         Ok(Self {
             clients: Arc::new(clients),
             urltest_states,
+            test_loop_handles: std::sync::Mutex::new(test_loop_handles),
         })
     }
 
@@ -204,10 +210,25 @@ impl OutboundRegistry {
         self.clients.get(tag)
     }
 
-    /// Shared handle to the underlying tag→client map. Used by DnsHijack
+    /// Shared handle to the underlying tag->client map. Used by DnsHijack
     /// to dispatch DNS queries through the same outbound pool.
     pub fn clients_arc(&self) -> Arc<HashMap<String, Arc<dyn OutboundClient>>> {
         self.clients.clone()
+    }
+
+    /// Abort all urltest background test loops so the outbound clients they
+    /// reference (esp. mless/vless mux persistent connections) are released.
+    /// Called during in-process reload shutdown.
+    pub fn shutdown_test_loops(&self) {
+        let handles = self
+            .test_loop_handles
+            .lock()
+            .expect("test_loop_handles poisoned")
+            .drain(..)
+            .collect::<Vec<_>>();
+        for h in handles {
+            h.abort();
+        }
     }
 }
 

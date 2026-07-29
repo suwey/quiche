@@ -29,7 +29,7 @@ pub fn graceful_shutdown() {
     let pid = std::process::id();
     let _ = Command::new("kill")
         .args(["-INT", &pid.to_string()])
-        .output();
+        .status();
 }
 
 /// On Android, graceful shutdown is handled by the JNI layer (Kotlin

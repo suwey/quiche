@@ -15,25 +15,32 @@ use std::process::Command;
 pub struct MacosTunManager {
     pub iface_name: String,
     pub tun_addr: IpAddr,
-    /// Whether we installed pf rules (for cleanup).
+    /// Whether we installed pf bypass rules (for cleanup).
+    pf_bypass_installed: bool,
+    /// Whether we installed pf DNS hijack rules (for cleanup).
     pf_rules_installed: bool,
     /// Whether we installed routes.
     routes_installed: bool,
     /// Original default gateway (if captured).
     original_gateway: Option<IpAddr>,
+    /// Whether DNS hijacking is active (copied from config at startup).
+    auto_hijack: bool,
 }
 
 impl MacosTunManager {
     pub fn new(
         iface_name: String,
         tun_addr: IpAddr,
+        auto_hijack: bool,
     ) -> Self {
         Self {
             iface_name,
             tun_addr,
+            pf_bypass_installed: false,
             pf_rules_installed: false,
             routes_installed: false,
             original_gateway: None,
+            auto_hijack,
         }
     }
 
@@ -136,13 +143,12 @@ impl MacosTunManager {
         // address (10.0.0.1) via en0, making IP_BOUND_IF ineffective
         // (split routes' gateway resolves via en0, not utun).
         // The host route (/32) is more specific than the /8 bypass route.
-        let tun_iface_name = find_tun_interface_name();
         let _ = run_route_cmd(&[
             "-n", "add",
             "-host", &self.tun_addr.to_string(),
-            "-interface", &tun_iface_name,
+            "-interface", &tun_iface,
         ]);
-        log::info!("Added host route {} via {}", self.tun_addr, tun_iface_name);
+        log::info!("Added host route {} via {}", self.tun_addr, tun_iface);
         // Add default routes scoped to en0 for IP_BOUND_IF.
         // macOS IP_BOUND_IF may require scoped routes to find a path.
         if let Some(gw) = self.original_gateway {
@@ -150,10 +156,6 @@ impl MacosTunManager {
             let _ = run_route_cmd(&["-n", "add", "-net", "0.0.0.0/1", "-ifscope", "en0", &gw_s]);
             let _ = run_route_cmd(&["-n", "add", "-net", "128.0.0.0/1", "-ifscope", "en0", &gw_s]);
             log::info!("Added en0-scoped default routes via {gw_s}");
-        }
-        // Log routing state for debugging.
-        if let Ok(o) = Command::new("route").args(["-n", "get", "8.8.8.8"]).output() {
-            log::info!("route get 8.8.8.8: {}", String::from_utf8_lossy(&o.stdout));
         }
 
         self.routes_installed = true;
@@ -214,29 +216,10 @@ impl MacosTunManager {
             .unwrap_or_else(|_| String::new());
 
         // Find the actual TUN interface name. The tun crate creates a utun
-        // device but doesn't expose the name. route -n get doesn't work
-        // because 10.0.0.1 is the point-to-point peer, not a local address.
-        // Use ifconfig -l to list all interfaces, then pick the highest utun.
-        let tun_iface = {
-            let ifaces_out = Command::new("ifconfig")
-                .arg("-l")
-                .output()
-                .ok();
-            let mut utun_ifaces: Vec<String> = Vec::new();
-            if let Some(o) = ifaces_out {
-                let s = String::from_utf8_lossy(&o.stdout);
-                log::info!("all interfaces: {s}");
-                for name in s.split_whitespace() {
-                    if name.starts_with("utun") {
-                        utun_ifaces.push(name.to_string());
-                    }
-                }
-            }
-            utun_ifaces.sort();
-            let tun = utun_ifaces.last().cloned().unwrap_or_else(|| self.iface_name.clone());
-            log::info!("TUN interface detected: {tun}");
-            tun
-        };
+        // device but doesn't expose the name. Reuse find_tun_interface_name
+        // to avoid a duplicate ifconfig fork.
+        let tun_iface = find_tun_interface_name();
+        log::info!("TUN interface detected: {tun_iface}");
         log::info!("setup_bypass_pf: tun_iface={tun_iface}, en0_ip={en0_ip}, gw={gw_str}, iface={iface}");
 
         // With IP_BOUND_IF + host route, no pf route-to/nat rules needed.
@@ -274,31 +257,12 @@ impl MacosTunManager {
         let _ = run_pfctl_cmd(&["-d"]);
 
         log::debug!("Loading pf ruleset (combined with bypass + DNS anchors)");
-        log::info!("pf combined conf:\n{}", combined);
-        let output = Command::new("pfctl")
-            .args(["-f", "/tmp/anywhere_combined.pf"])
-            .output()
-            .map_err(|e| format!("Failed to spawn pfctl: {e}"))?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            return Err(format!("pfctl -f failed: stdout={stdout} stderr={stderr}"));
-        }
-        log::info!("pfctl -f output: {}", String::from_utf8_lossy(&output.stdout));
+        run_pfctl_cmd(&["-f", "/tmp/anywhere_combined.pf"])?;
 
         // Ensure pf is enabled.
         let _ = run_pfctl_cmd(&["-E"]);
-        // Log current pf rules for debugging.
-        let dbg = Command::new("pfctl").args(["-s", "rules"]).output();
-        if let Ok(o) = dbg {
-            log::info!("pf rules after load: {}", String::from_utf8_lossy(&o.stdout));
-        }
-        // Log translation rules (nat, rdr) for debugging.
-        let nat_dbg = Command::new("pfctl").args(["-s", "nat"]).output();
-        if let Ok(o) = nat_dbg {
-            log::info!("pf nat/rdr rules after load: {}", String::from_utf8_lossy(&o.stdout));
-        }
 
+        self.pf_bypass_installed = true;
         log::info!(
             "macOS pf bypass installed: nat on {tun_iface} + route-to {iface} via {gw_str} (en0_ip={en0_ip})"
         );
@@ -373,15 +337,7 @@ impl MacosTunManager {
 
         // Disable pf, reload, re-enable.
         let _ = run_pfctl_cmd(&["-d"]);
-        let output = Command::new("pfctl")
-            .args(["-f", "/tmp/anywhere_combined.pf"])
-            .output()
-            .map_err(|e| format!("Failed to spawn pfctl: {e}"))?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            return Err(format!("pfctl -f failed: stdout={stdout} stderr={stderr}"));
-        }
+        run_pfctl_cmd(&["-f", "/tmp/anywhere_combined.pf"])?;
         let _ = run_pfctl_cmd(&["-E"]);
 
         self.pf_rules_installed = true;
@@ -391,13 +347,18 @@ impl MacosTunManager {
 
     /// Remove all installed routes and pf rules.
     pub fn cleanup_routing(&mut self) {
-        // Remove pf bypass: reload original /etc/pf.conf to flush our anchor.
-        let _ = run_pfctl_cmd(&["-f", "/etc/pf.conf"]);
-        let _ = std::fs::remove_file("/tmp/anywhere_bypass.pf");
-        let _ = std::fs::remove_file("/tmp/anywhere_dns.pf");
-        let _ = std::fs::remove_file("/tmp/anywhere_combined.pf");
-        log::info!("macOS pf bypass removed (restored /etc/pf.conf)");
-        // No alias cleanup needed (using nat-to instead of alias).
+        // Remove pf bypass: reload original /etc/pf.conf to flush our rules.
+        // Guarded by `pf_bypass_installed` so the second cleanup (from Drop)
+        // doesn't run pfctl again — `fork()` is O(RSS) and the double call
+        // was a major source of shutdown latency.
+        if self.pf_bypass_installed {
+            let _ = run_pfctl_cmd(&["-f", "/etc/pf.conf"]);
+            let _ = std::fs::remove_file("/tmp/anywhere_bypass.pf");
+            let _ = std::fs::remove_file("/tmp/anywhere_dns.pf");
+            let _ = std::fs::remove_file("/tmp/anywhere_combined.pf");
+            log::info!("macOS pf bypass removed (restored /etc/pf.conf)");
+            self.pf_bypass_installed = false;
+        }
 
         if self.pf_rules_installed {
             log::info!("macOS DNS hijack rules removed");
@@ -439,6 +400,30 @@ impl MacosTunManager {
             log::info!("macOS TUN routes removed");
             self.routes_installed = false;
         }
+    }
+
+    /// Enable TUN routing (install routes + pf rules + DNS hijack).
+    /// Idempotent: no-op if already enabled. Used by the runtime
+    /// `tun_routing_enable` API; the TUN interface itself stays up.
+    pub fn enable_routing(&mut self) -> Result<(), String> {
+        if self.routes_installed {
+            return Ok(());
+        }
+        self.setup_routing(self.auto_hijack, &[])
+    }
+
+    /// Disable TUN routing (remove routes + pf rules + DNS).
+    /// Idempotent: no-op if already disabled. The TUN interface stays up.
+    pub fn disable_routing(&mut self) {
+        if !self.routes_installed {
+            return;
+        }
+        self.cleanup_routing()
+    }
+
+    /// Whether TUN routing (routes + pf rules + DNS) is currently active.
+    pub fn is_routing_enabled(&self) -> bool {
+        self.routes_installed
     }
 }
 
@@ -489,35 +474,40 @@ fn get_default_gateway() -> Option<IpAddr> {
 }
 
 /// Run a `route` command, returning an error on non-zero exit.
+///
+/// Uses `status()` (not `output()`) so macOS uses `posix_spawn` instead of
+/// `fork()+exec()`. `fork()` is O(RSS): it copies the entire page table even
+/// though pages are copy-on-write. With hundreds of MB of RSS this makes each
+/// command take 0.5-2s instead of ~1ms.
 fn run_route_cmd(args: &[&str]) -> Result<(), String> {
     log::debug!("route {}", args.join(" "));
-    let output = Command::new("route").args(args).output().map_err(|e| e.to_string())?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
+    let status = Command::new("route").args(args).status().map_err(|e| e.to_string())?;
+    if !status.success() {
         // "route delete" may fail if route doesn't exist; log but don't error.
         if args.iter().any(|&a| a == "delete") {
-            log::debug!("route delete (may be already gone): {}", stderr.trim());
+            log::debug!("route delete (may be already gone)");
             return Ok(());
         }
         return Err(format!(
-            "route {} failed: {}",
+            "route {} failed (exit {})",
             args.join(" "),
-            stderr.trim()
+            status.code().unwrap_or(-1)
         ));
     }
     Ok(())
 }
-
 /// Run a `pfctl` command, returning an error on non-zero exit.
+///
+/// Uses `status()` (not `output()`) so macOS uses `posix_spawn` instead of
+/// `fork()+exec()`. See [`run_route_cmd`] for rationale.
 fn run_pfctl_cmd(args: &[&str]) -> Result<(), String> {
     log::debug!("pfctl {}", args.join(" "));
-    let output = Command::new("pfctl").args(args).output().map_err(|e| e.to_string())?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
+    let status = Command::new("pfctl").args(args).status().map_err(|e| e.to_string())?;
+    if !status.success() {
         return Err(format!(
-            "pfctl {} failed: {}",
+            "pfctl {} failed (exit {})",
             args.join(" "),
-            stderr.trim()
+            status.code().unwrap_or(-1)
         ));
     }
     Ok(())

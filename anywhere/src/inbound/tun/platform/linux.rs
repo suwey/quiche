@@ -491,19 +491,18 @@ impl Drop for TunRouteManager {
         // the TUN device is about to be deleted, so no traffic can loop.
         teardown_routing(Some(&self.iface_name));
 
-        let output = Command::new("ip")
+        let status = Command::new("ip")
             .args(["link", "delete", &self.iface_name])
-            .output();
-        match output {
-            Ok(out) if out.status.success() => {
+            .status();
+        match status {
+            Ok(s) if s.success() => {
                 log::info!("TUN interface {} deleted", self.iface_name);
             },
-            Ok(out) => {
-                let stderr = String::from_utf8_lossy(&out.stderr);
+            Ok(s) => {
                 log::warn!(
-                    "Failed to delete TUN interface {}: {}",
+                    "Failed to delete TUN interface {} (exit {})",
                     self.iface_name,
-                    stderr.trim()
+                    s.code().unwrap_or(-1)
                 );
             },
             Err(e) => {

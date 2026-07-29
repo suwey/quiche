@@ -29,7 +29,7 @@ async fn keepalive_loop<T: Clone + Send + 'static>(
                 { break; }
             }
             _ = ping_interval.tick() => {
-                if socket.send(Message::Ping(vec![])).await.is_err() {
+                if socket.send(Message::Ping(bytes::Bytes::new())).await.is_err() {
                     break;
                 }
             }

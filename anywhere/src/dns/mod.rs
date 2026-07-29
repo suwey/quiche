@@ -28,7 +28,9 @@ use serde::Deserialize;
 use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
 use tokio::sync::Semaphore;
+use tokio::task::JoinHandle;
 use tokio::time::timeout;
+use tokio_util::sync::CancellationToken;
 
 use crate::inbound::Address;
 use crate::inbound::Destination;
@@ -253,6 +255,11 @@ pub struct DnsHijack {
     /// Maximum number of sockets to retain in the pool. Excess sockets are
     /// dropped (and their fds released) after use instead of being returned.
     socket_pool_cap: usize,
+    /// Cancellation token shared with the TUN inbound. When cancelled, the
+    /// loopback listener and all in-flight query tasks exit promptly so the
+    /// `Arc<AsyncDevice>` (held via `writer`) is released before the next
+    /// `run()` iteration recreates the TUN device.
+    pub(crate) shutdown: CancellationToken,
 }
 
 impl DnsHijack {
@@ -266,6 +273,7 @@ impl DnsHijack {
         config: &DnsConfig, local_direct: bool, rules: Arc<Rules>,
         registry: Arc<HashMap<String, Arc<dyn OutboundClient>>>,
         writer: TunWriter, reverse_cache: Arc<ReverseDnsCache>,
+        shutdown: CancellationToken,
     ) -> Result<Self, String> {
         let mut direct_upstreams = parse_upstreams_ordered(&config.direct)?;
 
@@ -363,6 +371,7 @@ impl DnsHijack {
             inflight: Arc::new(Semaphore::new(MAX_INFLIGHT)),
             socket_pool: Mutex::new(Vec::new()),
             socket_pool_cap: 8,
+            shutdown,
         })
     }
 
@@ -626,12 +635,13 @@ impl DnsHijack {
     /// Listens on port 1053 (not 53) — iptables REDIRECT forwards port 53
     /// traffic here, avoiding conflicts with dnsmasq (which may also serve
     /// DHCP).
-    pub fn start_hijack_listener(self: &Arc<Self>) {
+    pub fn start_hijack_listener(self: &Arc<Self>) -> Vec<JoinHandle<()>> {
         let this = self.clone();
+        let mut handles = Vec::new();
 
         // IPv4 listener.
         let this4 = this.clone();
-        tokio::spawn(async move {
+        handles.push(tokio::spawn(async move {
             // On macOS, bind to 127.0.0.1 (not 0.0.0.0) so:
             // 1) The listener receives pf `rdr`-redirected DNS (-> 127.0.0.1:1053)
             // 2) Response source IP is 127.0.0.1, matching the rdr state for
@@ -650,7 +660,7 @@ impl DnsHijack {
                 DNS_REDIRECT_PORT,
             );
             Self::run_listener(this4, addr).await;
-        });
+        }));
 
         // IPv6 listener (macOS only - pf `rdr inet6` redirects to ::1:1053).
         // Without this, IPv6 DNS queries are redirected to ::1:1053 where
@@ -658,14 +668,15 @@ impl DnsHijack {
         #[cfg(target_os = "macos")]
         {
             let this6 = this.clone();
-            tokio::spawn(async move {
+            handles.push(tokio::spawn(async move {
                 let addr = std::net::SocketAddr::new(
                     std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
                     DNS_REDIRECT_PORT,
                 );
                 Self::run_listener(this6, addr).await;
-            });
+            }));
         }
+        handles
     }
 
     /// Run a DNS loopback listener on the given address.
@@ -686,11 +697,14 @@ impl DnsHijack {
         log::info!("DNS loopback listener on {addr}");
         let mut buf = vec![0u8; 512];
         loop {
-            let (n, src) = match socket.recv_from(&mut buf).await {
-                Ok(x) => x,
-                Err(e) => {
-                    log::warn!("DNS loopback recv: {e}");
-                    break;
+            let (n, src) = tokio::select! {
+                _ = this.shutdown.cancelled() => break,
+                res = socket.recv_from(&mut buf) => match res {
+                    Ok(x) => x,
+                    Err(e) => {
+                        log::warn!("DNS loopback recv: {e}");
+                        break;
+                    },
                 },
             };
             let query = buf[..n].to_vec();
@@ -698,15 +712,22 @@ impl DnsHijack {
             let this = this.clone();
             let sock = socket.clone();
             tokio::spawn(async move {
-                let response = this
-                    .resolve_query(&query, src.ip())
-                    .await
-                    .or_else(|| build_refused_response(&query));
-                if let Some(r) = response {
-                    log::info!("DNS listener: sending {} bytes to {src}", r.len());
-                    let _ = sock.send_to(&r, src).await;
-                } else {
-                    log::warn!("DNS listener: no response for {src}");
+                // Exit promptly on shutdown so the `Arc<DnsHijack>` (and the
+                // `TunWriter` -> `Arc<AsyncDevice>` it owns) is released.
+                tokio::select! {
+                    _ = this.shutdown.cancelled() => {},
+                    _ = async {
+                        let response = this
+                            .resolve_query(&query, src.ip())
+                            .await
+                            .or_else(|| build_refused_response(&query));
+                        if let Some(r) = response {
+                            log::info!("DNS listener: sending {} bytes to {src}", r.len());
+                            let _ = sock.send_to(&r, src).await;
+                        } else {
+                            log::warn!("DNS listener: no response for {src}");
+                        }
+                    } => {},
                 }
             });
         }

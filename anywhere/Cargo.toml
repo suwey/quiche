@@ -28,9 +28,9 @@ boring-sys = "4.3.0"
 tokio-rustls = { version = "0.26", features = ["ring"] }
 webpki-roots = "1"
 foreign-types-shared = "0.3"
-axum = { version = "0.7", features = ["ws"] }
+axum = { version = "0.8", features = ["ws"] }
 chrono = { version = "0.4", features = ["serde"] }
-tower-http = { version = "0.5", features = ["cors", "set-header", "fs"] }
+tower-http = { version = "0.7", features = ["cors", "set-header", "fs"] }
 uuid = { version = "1", features = ["v4"] }
 serde_json = { workspace = true }
 hyper = { version = "1", features = ["client", "http1", "http2"] }
@@ -44,7 +44,7 @@ sha2 = "0.11"
 lru = "0.18"
 parking_lot = "0.12"
 once_cell = "1"
-redb = "2"
+redb = "4"
 aes-gcm = "0.11"
 hkdf = "0.13"
 aes = "0.9"
@@ -59,11 +59,24 @@ rtnetlink = "0.21"
 mimalloc = { version = "0.1.52", default-features = false }
 
 [target.'cfg(target_os = "android")'.dependencies]
-jni = "0.21"
-android_logger = "0.14"
+jni = "0.22"
+android_logger = "0.15"
 # Android uses VpnService.protect() instead of SO_MARK, so no rtnetlink/socket2 needed.
 # tun crate's async feature works with a passed-in fd on Android.
 # boring-sys already supports Android NDK cross-compilation.
+
+[target.'cfg(target_os = "windows")'.dependencies]
+# windows-sys: GetIpForwardTable (default-route interface index for
+# IP_UNICAST_IF bypass) and Win32 socket constants. Zero-runtime FFI bindings.
+# Win32_System_ProcessStatus + Win32_System_Threading: GetProcessMemoryInfo for
+# RSS memory display in the UI stats ticker.
+windows-sys = { version = "0.61", features = [
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_Networking_WinSock",
+    "Win32_Foundation",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Threading",
+] }
 
 [dependencies.libc]
 version = "0.2"
@@ -71,17 +84,17 @@ version = "0.2"
 # plus TCP keepalive / IP_BOUND_IF / poll in outbound/common.rs.
 
 [dependencies.etherparse]
-version = "0.19"
+version = "0.20"
 
 [dependencies.socket2]
-version = "0.5"
+version = "0.6"
 features = ["all"]
 
 [dependencies.tun]
 version = "0.8"
 features = ["async"]
 # On Android, tun crate needs to support opening from a raw fd.
-# The "async" feature is sufficient — AsyncDevice::from_fd is not in 0.8,
+# The "async" feature is sufficient - AsyncDevice::from_fd is not in 0.8,
 # so we construct AsyncDevice from a std::fs::File wrapping the fd.
 [dependencies.clap]
 version = "4"

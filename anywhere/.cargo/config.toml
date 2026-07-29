@@ -1,0 +1,37 @@
+# ============================================================================
+# Windows 交叉编译配置（macOS -> x86_64-pc-windows-gnu）
+# ============================================================================
+#
+# 一次性环境准备：
+#   1. 安装 Rust 目标：
+#        rustup target add x86_64-pc-windows-gnu
+#
+#   2. 安装 MinGW-w64 工具链（提供 linker/ar/windres）：
+#        brew install mingw-w64
+#      验证：x86_64-w64-mingw32-gcc --version
+#
+#   3. 安装 NASM（BoringSSL 在 Windows x86_64 上 CMake 需 ASM_NASM）：
+#        brew install nasm
+#
+#   4. 设置 BINDGEN_EXTRA_CLANG_ARGS（boring-sys 的 bindgen 用 libclang
+#      生成 Windows 绑定，需 MinGW sysroot 头文件如 sys/types.h）：
+#        export BINDGEN_EXTRA_CLANG_ARGS="--target=x86_64-pc-windows-gnu \
+#          -isystem $(brew --prefix mingw-w64)/toolchain-x86_64/x86_64-w64-mingw32/include"
+#      注意：该变量不能放进本文件的 [env] 段（[env] 非目标相关，会破坏
+#      原生 macOS 构建）。请在 shell 环境 / 构建脚本中导出。
+#
+# 编译命令（在 anywhere/ 目录下）：
+#   cargo build --target x86_64-pc-windows-gnu --bin anywhere
+#   # 产物：target/x86_64-pc-windows-gnu/debug/anywhere.exe (PE32+ x86-64)
+#
+# 运行时依赖：将 wintun.dll（amd64）放到 anywhere.exe 同目录，
+# tun crate 默认从工作目录加载。
+# ============================================================================
+[target.x86_64-pc-windows-gnu]
+linker = "x86_64-w64-mingw32-gcc"
+ar = "x86_64-w64-mingw32-ar"
+# Suppress mingw's automatic export of all symbols (144k+ in debug builds
+# exceeds the 65535 export-ordinal limit). Rust already passes an explicit
+# list.def with the symbols to export, so --exclude-all-symbols only kills
+# the runaway auto-export while preserving intended cdylib exports.
+rustflags = ["-C", "link-arg=-Wl,--exclude-all-symbols"]

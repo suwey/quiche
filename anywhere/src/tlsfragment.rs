@@ -61,7 +61,7 @@ fn wait_for_ack(fd: std::os::fd::RawFd) {
     log::warn!("tls fragment: ACK wait timed out, proceeding");
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(unix, not(target_os = "linux")))]
 fn wait_for_ack(_fd: std::os::fd::RawFd) {
     // Non-Linux platforms: no reliable ACK detection, use sleep fallback.
     std::thread::sleep(Duration::from_millis(FRAGMENT_SLEEP_DELAY_MS));
@@ -244,11 +244,13 @@ fn compute_split_points(
 /// After the first `write()`, all I/O passes through unchanged.
 pub struct FragmentTcpStream<S> {
     inner: S,
+    #[cfg(unix)]
     fd: Option<std::os::fd::RawFd>,
     fragment_enabled: bool,
     first_write_done: bool,
 }
 
+#[cfg(unix)]
 impl<S: std::os::fd::AsRawFd> FragmentTcpStream<S> {
     pub fn new(inner: S, config: Option<FragmentConfig>) -> Self {
         Self {
@@ -264,6 +266,7 @@ impl<S> FragmentTcpStream<S> {
     /// Construct without ACK detection (sleep fallback always).
     pub fn new_no_ack(inner: S, config: Option<FragmentConfig>) -> Self {
         Self {
+            #[cfg(unix)]
             fd: None,
             fragment_enabled: config.is_some(),
             first_write_done: false,
@@ -315,10 +318,17 @@ impl<S: Write> Write for FragmentTcpStream<S> {
                         self.inner.flush()?;
                         total_written += chunk.len();
                         if i < splits.len() - 1 {
-                            if let Some(fd) = self.fd {
-                                wait_for_ack(fd);
-                            } else {
-                                // No fd available — sleep fallback.
+                            #[cfg(unix)]
+                            {
+                                if let Some(fd) = self.fd {
+                                    wait_for_ack(fd);
+                                } else {
+                                    // No fd available - sleep fallback.
+                                    std::thread::sleep(Duration::from_millis(FRAGMENT_SLEEP_DELAY_MS));
+                                }
+                            }
+                            #[cfg(not(unix))]
+                            {
                                 std::thread::sleep(Duration::from_millis(FRAGMENT_SLEEP_DELAY_MS));
                             }
                         }

@@ -88,6 +88,86 @@ fn physical_iface_ipv4() -> Option<std::net::Ipv4Addr> {
     *CACHED
 }
 
+/// Cached index of the physical (default-route) interface on Windows.
+///
+/// Queries the IP forwarding table for the original 0.0.0.0/0 default route
+/// (dwForwardMask == 0). The TUN's split routes (0.0.0.0/1, 128.0.0.0/1)
+/// carry a /1 mask (0x80000000), so they are excluded - we get the physical
+/// interface even after TUN routes are installed.
+#[cfg(target_os = "windows")]
+fn physical_iface_index() -> Option<u32> {
+    use std::sync::LazyLock;
+    use windows_sys::Win32::NetworkManagement::IpHelper::{
+        GetIpForwardTable, MIB_IPFORWARDTABLE,
+    };
+
+    static CACHED: LazyLock<Option<u32>> = LazyLock::new(|| unsafe {
+        let mut size: u32 = 0;
+        GetIpForwardTable(std::ptr::null_mut(), &mut size, 0);
+        if size == 0 {
+            return None;
+        }
+        let mut buf = vec![0u8; size as usize];
+        let table = buf.as_mut_ptr() as *mut MIB_IPFORWARDTABLE;
+        if GetIpForwardTable(table, &mut size, 0) != 0 {
+            return None;
+        }
+        let table = &*table;
+        let entries = std::slice::from_raw_parts(
+            table.table.as_ptr(),
+            table.dwNumEntries as usize,
+        );
+        entries
+            .iter()
+            .find(|e| e.dwForwardDest == 0 && e.dwForwardMask == 0)
+            .map(|e| e.dwForwardIfIndex)
+    });
+    *CACHED
+}
+
+/// On Windows, set IP_UNICAST_IF (IPv4) / IPV6_UNICAST_IF (IPv6) on a raw
+/// socket so its traffic egresses via the physical interface, bypassing the
+/// TUN split routes. Best-effort: logs on failure, never returns an error.
+#[cfg(target_os = "windows")]
+fn set_unicast_if_raw(raw: libc::SOCKET, ipv4: bool) {
+    let Some(idx) = physical_iface_index() else {
+        return;
+    };
+    let idx = idx as u32;
+    // IP_UNICAST_IF / IPV6_UNICAST_IF expect the interface index in NETWORK
+    // byte order (per MSDN). Passing host order on little-endian Windows
+    // makes the kernel read a garbled index and fail with WSAEINVAL.
+    let idx_be: u32 = idx.to_be();
+    let ret = unsafe {
+        if ipv4 {
+            const IPPROTO_IP: libc::c_int = 0;
+            const IP_UNICAST_IF: libc::c_int = 31;
+            libc::setsockopt(
+                raw,
+                IPPROTO_IP,
+                IP_UNICAST_IF,
+                &idx_be as *const _ as *const libc::c_char,
+                std::mem::size_of::<u32>() as libc::c_int,
+            )
+        } else {
+            const IPPROTO_IPV6: libc::c_int = 41;
+            const IPV6_UNICAST_IF: libc::c_int = 31;
+            libc::setsockopt(
+                raw,
+                IPPROTO_IPV6,
+                IPV6_UNICAST_IF,
+                &idx_be as *const _ as *const libc::c_char,
+                std::mem::size_of::<u32>() as libc::c_int,
+            )
+        }
+    };
+    if ret != 0 {
+        log::warn!("Windows: IP_UNICAST_IF failed (idx={idx})");
+    } else {
+        log::debug!("Windows: IP_UNICAST_IF set ok (idx={idx})");
+    }
+}
+
 /// On macOS, bind a socket to the physical interface using IP_BOUND_IF
 /// so its traffic bypasses the TUN device.
 ///
@@ -155,7 +235,7 @@ pub async fn connect_tcp_bypass(
             let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
             socket.set_mark(fwmark)?;
             // Disable Nagle for low-latency protocols (DoH, proxy handshakes).
-            socket.set_nodelay(true)?;
+            socket.set_tcp_nodelay(true)?;
             // Enable TCP keepalive to detect half-open connections.
             socket.set_keepalive(true)?;
             socket.set_tcp_keepalive(&socket2::TcpKeepalive::new()
@@ -200,7 +280,7 @@ pub async fn connect_tcp_bypass(
             } else {
                 log::debug!("protect(fd={fd}) ok, connecting to {addr}");
             }
-            socket.set_nodelay(true)?;
+            socket.set_tcp_nodelay(true)?;
             // Enable TCP keepalive to detect half-open connections.
             socket.set_keepalive(true)?;
             socket.set_tcp_keepalive(&socket2::TcpKeepalive::new()
@@ -277,7 +357,7 @@ pub async fn connect_tcp_bypass(
             Domain::IPV6
         };
         let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
-        socket.set_nodelay(true)?;
+        socket.set_tcp_nodelay(true)?;
         socket.set_keepalive(true)?;
         socket.set_tcp_keepalive(&socket2::TcpKeepalive::new()
             .with_time(std::time::Duration::from_secs(60))
@@ -320,7 +400,52 @@ pub async fn connect_tcp_bypass(
         let std_stream: std::net::TcpStream = socket.into();
         Ok(TcpStream::from_std(std_stream)?)
     }
-    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+    #[cfg(target_os = "windows")]
+    {
+        use socket2::Domain;
+        use socket2::Protocol;
+        use socket2::Socket;
+        use socket2::Type;
+        use std::os::windows::io::AsRawSocket;
+
+        // Windows: bind the socket to the physical interface via IP_UNICAST_IF
+        // so outbound traffic bypasses the TUN split routes.
+        let domain = if addr.is_ipv4() {
+            Domain::IPV4
+        } else {
+            Domain::IPV6
+        };
+        let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
+        socket.set_tcp_nodelay(true)?;
+        socket.set_keepalive(true)?;
+        socket.set_tcp_keepalive(&socket2::TcpKeepalive::new()
+            .with_time(std::time::Duration::from_secs(60))
+            .with_interval(std::time::Duration::from_secs(15))
+            .with_retries(3))?;
+
+        let ipv4 = addr.is_ipv4();
+        set_unicast_if_raw(socket.as_raw_socket() as libc::SOCKET, ipv4);
+
+        // Blocking connect on a cloned handle; the original retains the
+        // IP_UNICAST_IF setting (duplicated sockets share the same state).
+        let socket_clone = socket.try_clone()?;
+        let connect_result = tokio::task::spawn_blocking(move || {
+            socket_clone.connect(&addr.into())
+        }).await;
+        match connect_result {
+            Ok(Ok(())) => {},
+            Ok(Err(e)) => {
+                log::warn!("Windows TCP bypass: connect to {addr} failed: {e}");
+                return Err(e);
+            },
+            Err(e) => return Err(io::Error::new(io::ErrorKind::Other, e)),
+        }
+
+        socket.set_nonblocking(true)?;
+        let std_stream: std::net::TcpStream = socket.into();
+        Ok(TcpStream::from_std(std_stream)?)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "windows")))]
     {
         let stream = TcpStream::connect(addr).await?;
         let sock_ref = socket2::SockRef::from(&stream);
@@ -404,7 +529,17 @@ pub async fn bind_udp_bypass(
         }
         Ok(socket)
     }
-    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::io::AsRawSocket;
+        // Bind the UDP socket, then pin it to the physical interface so
+        // responses route back via the physical NIC (bypassing TUN).
+        let ipv4 = bind_addr.is_ipv4();
+        let socket = UdpSocket::bind(bind_addr).await?;
+        set_unicast_if_raw(socket.as_raw_socket() as libc::SOCKET, ipv4);
+        Ok(socket)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "windows")))]
     {
         UdpSocket::bind(bind_addr).await
     }
@@ -431,7 +566,7 @@ pub fn connect_tcp_bypass_sync(
         };
         let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
         socket.set_mark(BYPASS_FWMARK)?;
-        socket.set_nodelay(true)?;
+        socket.set_tcp_nodelay(true)?;
         socket.set_keepalive(true)?;
         socket.set_tcp_keepalive(&socket2::TcpKeepalive::new()
             .with_time(std::time::Duration::from_secs(60))
@@ -484,7 +619,7 @@ pub fn connect_tcp_bypass_sync(
             Domain::IPV6
         };
         let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
-        socket.set_nodelay(true)?;
+        socket.set_tcp_nodelay(true)?;
         socket.set_keepalive(true)?;
         socket.set_tcp_keepalive(&socket2::TcpKeepalive::new()
             .with_time(std::time::Duration::from_secs(60))
@@ -510,7 +645,33 @@ pub fn connect_tcp_bypass_sync(
         Ok(socket.into())
 
     }
-    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+    #[cfg(target_os = "windows")]
+    {
+        use socket2::Domain;
+        use socket2::Protocol;
+        use socket2::Socket;
+        use socket2::Type;
+        use std::os::windows::io::AsRawSocket;
+
+        let domain = if addr.is_ipv4() {
+            Domain::IPV4
+        } else {
+            Domain::IPV6
+        };
+        let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
+        socket.set_tcp_nodelay(true)?;
+        socket.set_keepalive(true)?;
+        socket.set_tcp_keepalive(&socket2::TcpKeepalive::new()
+            .with_time(std::time::Duration::from_secs(60))
+            .with_interval(std::time::Duration::from_secs(15))
+            .with_retries(3))?;
+
+        set_unicast_if_raw(socket.as_raw_socket() as libc::SOCKET, addr.is_ipv4());
+
+        socket.connect(&addr.into())?;
+        Ok(socket.into())
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "windows")))]
     {
         let stream = std::net::TcpStream::connect(addr)?;
         let sock_ref = socket2::SockRef::from(&stream);
@@ -621,7 +782,10 @@ pub fn create_tls_stream(
     }
     // Always wrap with FragmentTcpStream.  When fragment is None,
     // fragment_enabled is false and all writes pass through unchanged.
+    #[cfg(unix)]
     let frag_stream = FragmentTcpStream::new(tcp, fragment.cloned());
+    #[cfg(not(unix))]
+    let frag_stream = FragmentTcpStream::new_no_ack(tcp, fragment.cloned());
     let mut stream = SslStream::new(ssl, frag_stream)
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
     stream

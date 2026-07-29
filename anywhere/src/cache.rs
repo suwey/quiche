@@ -23,6 +23,7 @@ use std::sync::Arc;
 
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
+use redb::ReadableDatabase;
 
 // ---------------------------------------------------------------------------
 // StatusSink trait — what modules depend on

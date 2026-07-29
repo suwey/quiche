@@ -9,6 +9,7 @@ use std::net::Ipv4Addr;
 use std::net::Ipv6Addr;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use crate::config::Config;
@@ -45,9 +46,15 @@ use crate::sniff;
 use crate::ui::AppStats;
 use crate::ui::state as ui_state;
 
+/// Flag set by `trigger_restart` / `UiCommand::Reload` to signal that the
+/// engine should restart after graceful shutdown (rather than stop completely).
+/// Checked by `main()` (desktop) and `android/jni.rs` after `run()` returns.
+pub static RESTART_REQUESTED: AtomicBool = AtomicBool::new(false);
+
 use uuid::Uuid;
 
 /// Options for the engine runner.
+#[derive(Clone)]
 pub struct RunOptions {
     /// Path to the configuration file (desktop) or inline config content
     /// (Android, when config_path is None).
@@ -58,6 +65,7 @@ pub struct RunOptions {
 
     /// TUN file descriptor from Android VpnService.
     /// On Linux/macOS this is None (TUN device is created internally).
+    #[cfg(unix)]
     pub tun_fd: Option<std::os::fd::RawFd>,
 
     /// Cache directory for geo rule-set downloads.
@@ -76,6 +84,7 @@ impl Default for RunOptions {
         Self {
             config_path: None,
             config_content: None,
+            #[cfg(unix)]
             tun_fd: None,
             cache_dir: None,
             start_cmd: None,
@@ -268,8 +277,13 @@ pub async fn run(opts: RunOptions) -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
-    // --- Stale routing cleanup (Linux only) ---
+    // --- Stale routing cleanup (Linux + Windows) ---
     #[cfg(target_os = "linux")]
+    {
+        crate::inbound::tun::cleanup_stale_routing();
+    }
+
+    #[cfg(target_os = "windows")]
     {
         crate::inbound::tun::cleanup_stale_routing();
     }
@@ -312,9 +326,31 @@ pub async fn run(opts: RunOptions) -> Result<(), Box<dyn std::error::Error>> {
 
     log::info!("Cache directory: {}", cache_dir.display());
 
+    // Plain-IP DNS upstreams for geo-rule refresh. The refresh downloads rule
+    // files over a bypass (TUN-protected) socket, but it must resolve the
+    // download host the same way - the system resolver is hijacked by the
+    // fake-ip DNS once the TUN is up and would return 198.18.x.x. Pick the
+    // plain-IP entries from [dns].direct; fall back to 223.5.5.5 if none.
+    let dns_plain: Vec<std::net::SocketAddr> = {
+        let mut v: Vec<std::net::SocketAddr> = config
+            .dns
+            .direct
+            .iter()
+            .filter_map(|s| s.trim().parse::<std::net::IpAddr>().ok())
+            .map(|ip| std::net::SocketAddr::new(ip, 53))
+            .collect();
+        if v.is_empty() {
+            v.push(std::net::SocketAddr::new(
+                std::net::IpAddr::V4(std::net::Ipv4Addr::new(223, 5, 5, 5)),
+                53,
+            ));
+        }
+        v
+    };
+    log::info!("Geo refresh DNS upstreams: {:?}", dns_plain);
     log::info!("Loading rules...");
     let rules = Arc::new(
-        Rules::from_config(&config.rules, &config.outbounds, &cache_dir, sink.as_ref())
+        Rules::from_config(&config.rules, &config.outbounds, &cache_dir, sink.as_ref(), &dns_plain)
             .await
             .map_err(|e| {
                 sink.emit(cache::StatusEvent::Notice { level: cache::NoticeLevel::Error, msg: format!("Failed to initialize rules: {e}") });
@@ -341,6 +377,8 @@ pub async fn run(opts: RunOptions) -> Result<(), Box<dyn std::error::Error>> {
             ui_state::read_linux_memory
         } else if cfg!(target_os = "macos") {
             ui_state::read_macos_memory
+        } else if cfg!(target_os = "windows") {
+            ui_state::read_windows_memory
         } else {
             || 0
         };
@@ -387,15 +425,20 @@ pub async fn run(opts: RunOptions) -> Result<(), Box<dyn std::error::Error>> {
     // --- TUN inbounds ---
     // Linux: create TUN device internally via rtnetlink.
     // Android: receive fd from VpnService via JNI.
-    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
-    let _tun_guard: Option<crate::inbound::tun::TunGuard> = {
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "windows"))]
+    let (_tun_guard, tun_lifecycle): (
+        Option<crate::inbound::tun::TunGuard>,
+        Option<crate::inbound::tun::TunLifecycle>,
+    ) = {
         use crate::dns::DnsHijack;
         use crate::inbound::tun::TunConfig;
         use crate::inbound::tun::TunInbound;
+        use tokio_util::sync::CancellationToken;
 
         let dns_cfg = config.dns.clone();
 
         let mut last_guard = None;
+        let mut last_lifecycle = None;
 
         for cfg in config.inbounds_by_type("tun") {
             let tun_config = match TunConfig::from_inbound_config(cfg) {
@@ -416,9 +459,10 @@ pub async fn run(opts: RunOptions) -> Result<(), Box<dyn std::error::Error>> {
                         std::sync::Arc<
                             crate::inbound::tun::reverse_dns::ReverseDnsCache,
                         >,
+                        CancellationToken,
                     ) -> DnsHijack
                     + Send,
-            > = Box::new(move |writer, reverse_cache| {
+            > = Box::new(move |writer, reverse_cache, shutdown| {
                 DnsHijack::new(
                     &dns_cfg_for_builder,
                     local_direct,
@@ -426,6 +470,7 @@ pub async fn run(opts: RunOptions) -> Result<(), Box<dyn std::error::Error>> {
                     registry_clients,
                     writer,
                     reverse_cache,
+                    shutdown,
                 )
                 .expect("invalid dns upstream")
             });
@@ -433,7 +478,7 @@ pub async fn run(opts: RunOptions) -> Result<(), Box<dyn std::error::Error>> {
             #[cfg(target_os = "linux")]
             {
                 match TunInbound::new(&tun_config, Some(dns_builder)).await {
-                    Ok((inbound, guard)) => {
+                    Ok((inbound, guard, lifecycle)) => {
                         log::info!("Starting TUN inbound on {}", tun_config.addr);
                         log::info!(
                             "DNS hijack enabled (direct={:?}, remote={:?})",
@@ -442,6 +487,7 @@ pub async fn run(opts: RunOptions) -> Result<(), Box<dyn std::error::Error>> {
                         );
                         tasks.push(tokio::spawn(run_inbound(inbound, ctx.clone())));
                         last_guard = Some(guard);
+                        last_lifecycle = Some(lifecycle);
                     },
                     Err(e) => {
                         log::error!("Failed to start TUN inbound: {e}");
@@ -455,7 +501,7 @@ pub async fn run(opts: RunOptions) -> Result<(), Box<dyn std::error::Error>> {
                     "TUN inbound configured but no fd provided from VpnService"
                 })?;
                 match TunInbound::new(&tun_config, Some(dns_builder), Some(fd)).await {
-                    Ok((inbound, guard)) => {
+                    Ok((inbound, guard, lifecycle)) => {
                         log::info!("Starting TUN inbound on Android (fd={})", fd);
                         log::info!(
                             "DNS hijack enabled (direct={:?}, remote={:?})",
@@ -464,6 +510,7 @@ pub async fn run(opts: RunOptions) -> Result<(), Box<dyn std::error::Error>> {
                         );
                         tasks.push(tokio::spawn(run_inbound(inbound, ctx.clone())));
                         last_guard = Some(guard);
+                        last_lifecycle = Some(lifecycle);
                     },
                     Err(e) => {
                         log::error!("Failed to start TUN inbound: {e}");
@@ -474,7 +521,7 @@ pub async fn run(opts: RunOptions) -> Result<(), Box<dyn std::error::Error>> {
             #[cfg(target_os = "macos")]
             {
                 match TunInbound::new(&tun_config, Some(dns_builder)).await {
-                    Ok((inbound, guard)) => {
+                    Ok((inbound, guard, lifecycle)) => {
                         log::info!("Starting TUN inbound on {} (macOS)", tun_config.addr);
                         log::info!(
                             "DNS hijack enabled (direct={:?}, remote={:?})",
@@ -483,6 +530,26 @@ pub async fn run(opts: RunOptions) -> Result<(), Box<dyn std::error::Error>> {
                         );
                         tasks.push(tokio::spawn(run_inbound(inbound, ctx.clone())));
                         last_guard = Some(guard);
+                        last_lifecycle = Some(lifecycle);
+                    },
+                    Err(e) => {
+                        log::error!("Failed to start TUN inbound: {e}");
+                    },
+                }
+            }
+            #[cfg(target_os = "windows")]
+            {
+                match TunInbound::new(&tun_config, Some(dns_builder)).await {
+                    Ok((inbound, guard, lifecycle)) => {
+                        log::info!("Starting TUN inbound on {} (Windows)", tun_config.addr);
+                        log::info!(
+                            "DNS hijack enabled (direct={:?}, remote={:?})",
+                            dns_cfg.direct,
+                            dns_cfg.remote
+                        );
+                        tasks.push(tokio::spawn(run_inbound(inbound, ctx.clone())));
+                        last_guard = Some(guard);
+                        last_lifecycle = Some(lifecycle);
                     },
                     Err(e) => {
                         log::error!("Failed to start TUN inbound: {e}");
@@ -490,14 +557,30 @@ pub async fn run(opts: RunOptions) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
-        last_guard
+        (last_guard, last_lifecycle)
     };
-    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
-    let _tun_guard: Option<crate::inbound::tun::TunGuard> = None;
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "windows")))]
+    let (_tun_guard, tun_lifecycle): (
+        Option<crate::inbound::tun::TunGuard>,
+        Option<crate::inbound::tun::TunLifecycle>,
+    ) = (None, None);
 
-    // Inject TUN manager into context (Linux only — Android has no route manager).
+    // Inject TUN manager into context (Linux/macOS/Windows - Android has no
+    // route manager; its TUN routing is handled by VpnService).
     #[cfg(target_os = "linux")]
-    if let Some(ref guard) = _tun_guard {
+    if let Some(guard) = &_tun_guard {
+        if let Some(mgr) = guard.tun_mgr() {
+            ctx.set_tun_mgr(mgr);
+        }
+    }
+    #[cfg(target_os = "macos")]
+    if let Some(guard) = &_tun_guard {
+        if let Some(mgr) = guard.tun_mgr() {
+            ctx.set_tun_mgr(mgr);
+        }
+    }
+    #[cfg(target_os = "windows")]
+    if let Some(guard) = &_tun_guard {
         if let Some(mgr) = guard.tun_mgr() {
             ctx.set_tun_mgr(mgr);
         }
@@ -542,69 +625,17 @@ pub async fn run(opts: RunOptions) -> Result<(), Box<dyn std::error::Error>> {
                     },
                     UiCommand::Reload => {
                         ::log::info!(
-                            "Reload command received — requesting process restart"
+                            "Reload command received - in-process restart"
                         );
                         #[cfg(not(target_os = "android"))]
                         {
-                            let exe = match std::env::current_exe() {
-                                Ok(p) => p,
-                                Err(e) => {
-                                    ::log::error!("Failed to get exe path: {e}");
-                                    continue;
-                                },
-                            };
-                            if let Some(ref start_cmd) = ctx_for_actor.start_cmd {
-                                // External restart via `start_cmd restart <service_name>`.
-                                // Do NOT exit ourselves — let the service manager
-                                // send SIGTERM for graceful shutdown.
-                                let service_name = exe
-                                    .file_stem()
-                                    .unwrap_or_default()
-                                    .to_string_lossy()
-                                    .to_string();
-                                match std::process::Command::new(start_cmd)
-                                    .arg("restart")
-                                    .arg(&service_name)
-                                    .spawn()
-                                {
-                                    Ok(_) => {
-                                        ::log::info!(
-                                            "Restart requested via {start_cmd} restart {service_name}, waiting for SIGTERM..."
-                                        );
-                                    },
-                                    Err(e) => {
-                                        ::log::error!("Failed to restart: {e}");
-                                    },
-                                }
-                            } else {
-                                // Self re-exec via execve.
-                                let exe_str = exe.to_string_lossy().to_string();
-                                let args: Vec<String> = std::env::args().collect();
-                                ::log::info!(
-                                    "Restarting via execve: {exe_str} {:?}",
-                                    args
-                                );
-                                tokio::spawn(async move {
-                                    tokio::time::sleep(
-                                        std::time::Duration::from_millis(200),
-                                    )
-                                    .await;
-                                    use std::os::unix::process::CommandExt;
-                                    let err = std::process::Command::new(&exe_str)
-                                        .args(&args[1..])
-                                        .exec();
-                                    ::log::error!("execve failed: {err}");
-                                    std::process::exit(1);
-                                });
-                            }
+                            RESTART_REQUESTED.store(true, Ordering::SeqCst);
+                            ctx_for_actor.shutdown_signal.notify_waiters();
                         }
-                        // Android: trigger_restart() in the UI handler calls
-                        // process::exit(0) directly. This arm should not be
-                        // reached on Android, but if it is, just log.
                         #[cfg(target_os = "android")]
-                        ::log::warn!(
-                            "Reload via command bus should not happen on Android"
-                        );
+                        {
+                            crate::android::jni::request_restart();
+                        }
                     },
                 }
             }
@@ -612,7 +643,7 @@ pub async fn run(opts: RunOptions) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // --- TUN mode check ---
-    let has_tun = cfg!(any(target_os = "linux", target_os = "android", target_os = "macos"))
+    let has_tun = cfg!(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "windows"))
         && !config.inbounds_by_type("tun").is_empty();
 
     // --- SOCKS5 inbounds ---
@@ -687,10 +718,18 @@ pub async fn run(opts: RunOptions) -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(not(target_os = "android"))]
     {
         tokio::select! {
-            _ = futures_util::future::join_all(tasks) => {},
+            _ = futures_util::future::join_all(tasks.iter_mut()) => {},
             _ = tokio::signal::ctrl_c() => {
                 log::info!("Shutdown signal received, exiting...");
             },
+            _ = ctx.shutdown_signal.notified() => {
+                log::info!("In-process restart requested, shutting down...");
+            },
+        }
+        // Abort spawned tasks so ports/resources are released before the
+        // next run() iteration (in-process restart) or process exit.
+        for handle in tasks {
+            handle.abort();
         }
     }
     #[cfg(target_os = "android")]
@@ -700,7 +739,42 @@ pub async fn run(opts: RunOptions) -> Result<(), Box<dyn std::error::Error>> {
         futures_util::future::join_all(tasks).await;
     }
 
+    // Abort per-connection relay tasks (spawned by run_inbound) so they
+    // release their `Arc<dyn OutboundClient>` clones - especially the mless
+    // multiplexer, whose WebSocket must close before the next run() reconnects.
+    // Without this the old mless WS lingers and the proxy server throttles the
+    // new connection (~100x slower after reload, refresh doesn't help).
+    let drained_conns: Vec<tokio::task::JoinHandle<()>> = ctx
+        .conn_handles
+        .lock()
+        .expect("conn_handles poisoned")
+        .drain(..)
+        .collect();
+    for h in &drained_conns {
+        h.abort();
+    }
+    let _ = tokio::time::timeout(
+        Duration::from_secs(2),
+        futures_util::future::join_all(drained_conns),
+    )
+    .await;
+    // Abort urltest background test loops so the outbound clients they hold
+    // (esp. mless/vless mux persistent connections) are released. Together
+    // with the per-connection task abort above and run() dropping the old
+    // registry, this fully releases the old proxy WebSocket before the next
+    // run() iteration reconnects.
+    ctx.registry.shutdown_test_loops();
+
     sink.emit(cache::StatusEvent::Phase(cache::EnginePhase::Stopping));
+    // Shut down TUN background tasks (reader, accept loop, NAT cleanup, DNS
+    // listeners) and wait for them to release the `Arc<AsyncDevice>` before
+    // the next run() iteration recreates the TUN device. Without this the
+    // orphaned tasks keep the Wintun adapter/session open on Windows; the
+    // reopened adapter then starts a second session that never receives
+    // traffic, leaving the UI with no connections after an in-process reload.
+    if let Some(tun_lifecycle) = tun_lifecycle {
+        tun_lifecycle.shutdown().await;
+    }
     drop(_tun_guard);
     log::info!("Shutdown complete.");
     Ok(())
@@ -765,8 +839,9 @@ async fn run_inbound(mut inbound: impl Inbound + 'static, ctx: AppContext) {
         };
 
         let ctx = ctx.clone();
+        let conn_handles = ctx.conn_handles.clone();
 
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             let network = conn.network();
             let source = *conn.source();
             let type_name = conn.type_name().to_string();
@@ -1164,13 +1239,14 @@ async fn run_inbound(mut inbound: impl Inbound + 'static, ctx: AppContext) {
                 log::info!("Relaying tcp {destination} via {tag}");
             }
             bidirectional_relay(&mut *stream, &mut counted_out).await;
-            // After relay completes, reset the inbound stream to release
-            // any associated resources (e.g. TUN NAT table entries).
-            // Only reset the inbound side — the outbound side is cleaned
-            // up by shutdown()/drop.
-            stream.reset().await;
+            // After relay completes, gracefully finish the inbound stream to
+            // release associated resources (e.g. TUN NAT table entries) and
+            // close cleanly (FIN). RST (`reset()`) is reserved for the
+            // `reject` rule only.
+            stream.finish().await;
             ctx.stats.remove_connection(&conn_id).await;
         });
+        conn_handles.lock().expect("conn_handles poisoned").push(handle);
     }
 }
 

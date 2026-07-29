@@ -229,3 +229,28 @@ pub fn read_macos_memory() -> u64 {
     }
     0
 }
+
+/// Reads RSS memory on Windows via GetProcessMemoryInfo (WorkingSetSize).
+/// Returns 0 on other platforms.
+pub fn read_windows_memory() -> u64 {
+    #[cfg(target_os = "windows")]
+    {
+        use windows_sys::Win32::System::ProcessStatus::{
+            GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+        };
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+        let mut counters: PROCESS_MEMORY_COUNTERS = unsafe { std::mem::zeroed() };
+        let ok = unsafe {
+            GetProcessMemoryInfo(
+                GetCurrentProcess(),
+                &mut counters,
+                std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+            )
+        };
+        if ok != 0 {
+            return counters.WorkingSetSize as u64;
+        }
+    }
+    0
+}

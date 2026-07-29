@@ -68,6 +68,14 @@ pub trait StreamRelay: Send {
     async fn reset(&mut self) {
         let _ = self.shutdown().await;
     }
+
+    /// Graceful teardown after the relay completes: release any associated
+    /// resources (e.g. TUN NAT entries) and close cleanly (FIN). This is the
+    /// normal end-of-connection path; `reset()` (RST) is reserved for the
+    /// `reject` rule. Default: `shutdown()`.
+    async fn finish(&mut self) {
+        let _ = self.shutdown().await;
+    }
 }
 
 /// Multi-target async datagram relay abstraction.
@@ -90,6 +98,14 @@ pub trait PacketRelay: Send {
 
     /// Closes the session.
     async fn close(&mut self) -> io::Result<()>;
+
+    /// Signal that the outbound rejected this UDP session (e.g. QUIC/443 not
+    /// supported). TUN relays inject an ICMP port-unreachable back to the
+    /// client so it falls back to TCP instead of retrying. Default: no-op
+    /// (non-TUN relays have no raw-packet path).
+    async fn send_port_unreachable(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 /// Wraps a [`TcpStream`] as a [`StreamRelay`].
@@ -497,6 +513,10 @@ impl StreamRelay for PrependStreamRelay {
     async fn reset(&mut self) {
         self.inner.reset().await;
     }
+
+    async fn finish(&mut self) {
+        self.inner.finish().await;
+    }
 }
 
 /// Wraps a [`Box<dyn PacketRelay>`] and replays a buffered first datagram
@@ -541,6 +561,10 @@ impl PacketRelay for PrependPacketRelay {
 
     async fn close(&mut self) -> io::Result<()> {
         self.inner.close().await
+    }
+
+    async fn send_port_unreachable(&mut self) -> io::Result<()> {
+        self.inner.send_port_unreachable().await
     }
 }
 
@@ -590,6 +614,10 @@ impl StreamRelay for CountedStreamRelay {
     async fn reset(&mut self) {
         self.inner.reset().await;
     }
+
+    async fn finish(&mut self) {
+        self.inner.finish().await;
+    }
 }
 
 /// Wraps a Box<dyn PacketRelay> and counts bytes flowing through.
@@ -635,5 +663,9 @@ impl PacketRelay for CountedPacketRelay {
 
     async fn close(&mut self) -> io::Result<()> {
         self.inner.close().await
+    }
+
+    async fn send_port_unreachable(&mut self) -> io::Result<()> {
+        self.inner.send_port_unreachable().await
     }
 }

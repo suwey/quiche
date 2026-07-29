@@ -207,7 +207,7 @@ impl Rules {
     /// and expanded inline. Background refresh is started for each.
     pub async fn from_config(
         configs: &[RuleConfig], outbounds: &[OutboundConfig], cache_dir: &Path,
-        sink: &dyn StatusSink,
+        sink: &dyn StatusSink, dns_plain: &[std::net::SocketAddr],
     ) -> Result<Self, String> {
         let mut rules = Self::builtin_private_rules();
 
@@ -275,6 +275,7 @@ impl Rules {
                     url,
                     config.update_interval.as_deref(),
                     cache_dir,
+                    dns_plain.to_vec(),
                 )
                 .await;
                 let source_name = geo_set.source_name().to_string();

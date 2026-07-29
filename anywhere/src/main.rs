@@ -71,10 +71,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let opts = RunOptions {
         config_path: Some(args.config.clone()),
         config_content: None,
+        #[cfg(unix)]
         tun_fd: None,
         cache_dir: None, // desktop: use config's [common].cache_dir or CWD
         start_cmd: args.start_cmd,
     };
 
-    run(opts).await
+    loop {
+        run(opts.clone()).await?;
+        if !anywhere::runner::RESTART_REQUESTED.swap(
+            false,
+            std::sync::atomic::Ordering::SeqCst,
+        ) {
+            break;
+        }
+        log::info!("In-process restart: re-running run()");
+    }
+    Ok(())
 }
