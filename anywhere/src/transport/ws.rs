@@ -687,3 +687,143 @@ mod tests {
         assert_eq!(compute_accept(key), expected);
     }
 }
+
+// ---------------------------------------------------------------------------
+// WsTransportSession — TransportSession 适配器
+// ---------------------------------------------------------------------------
+//
+// 包装现有 WsStream，实现 TransportSession trait。
+// M0 阶段：此适配器仅用于验证 trait 设计的可行性，不替换现有调用路径。
+// 后续阶段（M4）重构 mless/vless 时才会真正使用。
+//
+// WsStream 的 send/recv/close 是同步阻塞方法，而 trait 是 async。
+// M0 用 tokio::task::spawn_blocking 包装同步调用。
+// M4 阶段会改为 channel 通信模式。
+
+use std::collections::VecDeque;
+use std::sync::Arc;
+use std::io;
+use parking_lot::Mutex;
+use async_trait::async_trait;
+use crate::transport::{TransportSession, UplinkWriter, DownlinkReader};
+
+/// WebSocket 传输会话适配器
+#[allow(dead_code)]
+pub struct WsTransportSession {
+    inner: Arc<Mutex<crate::outbound::vless::WsStream>>,
+}
+
+#[allow(dead_code)]
+impl WsTransportSession {
+    pub(crate) fn new(ws: crate::outbound::vless::WsStream) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(ws)),
+        }
+    }
+}
+
+/// 上行写入器
+pub struct WsUplinkWriter {
+    inner: Arc<Mutex<crate::outbound::vless::WsStream>>,
+}
+
+#[async_trait]
+#[async_trait]
+impl UplinkWriter for WsUplinkWriter {
+    async fn write(&mut self, data: &[u8]) -> io::Result<()> {
+        let ws = self.inner.clone();
+        let data = data.to_vec();
+        tokio::task::spawn_blocking(move || {
+            let mut ws = ws.lock();
+            ws.send(&data)
+        })
+        .await
+        .map_err(|e| io::Error::other(e.to_string()))?
+    }
+
+    async fn shutdown(&mut self) -> io::Result<()> {
+        let ws = self.inner.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut ws = ws.lock();
+            ws.close()
+        })
+        .await
+        .map_err(|e| io::Error::other(e.to_string()))?
+    }
+}
+
+/// 下行读取器
+pub struct WsDownlinkReader {
+    inner: Arc<Mutex<crate::outbound::vless::WsStream>>,
+    recv_buf: VecDeque<u8>,
+}
+
+#[async_trait]
+#[async_trait]
+impl DownlinkReader for WsDownlinkReader {
+    async fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        // 先消费缓冲区
+        if !self.recv_buf.is_empty() {
+            let n = self.recv_buf.len().min(buf.len());
+            for (i, item) in self.recv_buf.drain(..n).enumerate() {
+                buf[i] = item;
+            }
+            // drain 可能改变了 Vec 内部状态，确保剩余部分还在
+            // 注意：drain(..n) 会移除前 n 个元素，剩余元素自动前移
+            return Ok(n);
+        }
+        // 从 WsStream 读取
+        let ws = self.inner.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            let mut ws = ws.lock();
+            ws.recv()
+        })
+        .await
+        .map_err(|e| io::Error::other(e.to_string()))?;
+
+        match result {
+            Ok(data) => {
+                let n = data.len().min(buf.len());
+                buf[..n].copy_from_slice(&data[..n]);
+                if n < data.len() {
+                    self.recv_buf.extend(&data[n..]);
+                }
+                Ok(n)
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock
+                  || e.kind() == io::ErrorKind::TimedOut => Err(e),
+            Err(e) => Err(e),
+        }
+    }
+}
+
+#[async_trait]
+#[async_trait]
+impl TransportSession for WsTransportSession {
+    async fn uplink(&mut self) -> io::Result<Box<dyn UplinkWriter>> {
+        Ok(Box::new(WsUplinkWriter {
+            inner: self.inner.clone(),
+        }))
+    }
+
+    async fn downlink(&mut self) -> io::Result<Box<dyn DownlinkReader>> {
+        Ok(Box::new(WsDownlinkReader {
+            inner: self.inner.clone(),
+            recv_buf: VecDeque::new(),
+        }))
+    }
+
+    async fn close(&mut self) -> io::Result<()> {
+        let ws = self.inner.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut ws = ws.lock();
+            ws.close()
+        })
+        .await
+        .map_err(|e| io::Error::other(e.to_string()))?
+    }
+
+    fn kind(&self) -> &'static str {
+        "websocket"
+    }
+}

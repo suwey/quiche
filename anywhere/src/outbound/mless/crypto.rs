@@ -187,3 +187,61 @@ mod tests {
         assert_eq!(ct1, ct2_first);
     }
 }
+
+// ---------------------------------------------------------------------------
+// CryptoLayer trait implementation
+// ---------------------------------------------------------------------------
+
+use crate::crypto::CryptoLayer;
+
+#[async_trait::async_trait]
+impl CryptoLayer for Obfuscation {
+    async fn encrypt(&mut self, plaintext: &[u8]) -> std::io::Result<Vec<u8>> {
+        Ok(Obfuscation::encrypt(self, plaintext))
+    }
+
+    async fn decrypt(&mut self, ciphertext: &[u8]) -> std::io::Result<Vec<u8>> {
+        Ok(Obfuscation::decrypt(self, ciphertext))
+    }
+
+    fn reset(&mut self) {
+        self.send_counter = 0;
+        self.recv_counter = 0;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CryptoLayer trait tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod crypto_trait_tests {
+    use super::*;
+    use crate::crypto::CryptoLayer;
+
+    #[tokio::test]
+    async fn obfuscation_impl_cryptolayer() {
+        let obf: &mut dyn CryptoLayer = &mut Obfuscation::new("00000000-0000-4000-8000-000000000000");
+        let payload = b"test CryptoLayer trait";
+
+        let ct = obf.encrypt(payload).await.unwrap();
+        assert_ne!(ct, payload);
+
+        let pt = obf.decrypt(&ct).await.unwrap();
+        assert_eq!(pt, payload);
+    }
+
+    #[tokio::test]
+    async fn obfuscation_reset() {
+        let mut obf = Obfuscation::new("00000000-0000-4000-8000-000000000000");
+        let payload = b"reset test";
+
+        // 先加密两次（counter 递增，密文不同）
+        let ct1 = CryptoLayer::encrypt(&mut obf, payload).await.unwrap();
+        obf.reset();
+        let ct2 = CryptoLayer::encrypt(&mut obf, payload).await.unwrap();
+
+        // reset 后 counter 回到 0，应该产生相同的密文
+        assert_eq!(ct1, ct2);
+    }
+}
