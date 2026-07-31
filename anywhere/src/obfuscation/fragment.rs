@@ -13,13 +13,90 @@
 use std::io::{self, Read, Write};
 use std::time::Duration;
 
+use crate::obfuscation::range::{Range, SegmentRange};
+
 const TLS_CONTENT_TYPE_HANDSHAKE: u8 = 0x16;
 const TLS_HANDSHAKE_TYPE_CLIENT_HELLO: u8 = 0x01;
 const TLS_SNI_EXTENSION_TYPE: u16 = 0x0000;
 
 /// Configuration for TLS fragmentation.
-#[derive(Debug, Clone, Default)]
-pub struct FragmentConfig;
+///
+/// When all fields are `None` (the `Default`), fragmentation uses the
+/// legacy behavior: split ClientHello at SNI label boundaries with a
+/// fixed 100ms delay (or ACK-wait on Linux).
+///
+/// When fields are set, the enhanced mode activates:
+/// - `packets`: which packet numbers to fragment (0-indexed)
+/// - `max_split`: random maximum number of split segments
+/// - `lengths`: per-segment random length range
+/// - `delays`: per-segment random delay range
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct FragmentConfig {
+    /// Packet number range to fragment (e.g. `0-1` = only first packet).
+    /// `None` means fragment all packets (legacy behavior: first only).
+    #[serde(default)]
+    pub packets: Option<Range>,
+
+    /// Maximum number of segments to split into.
+    /// `None` means use SNI label count (legacy behavior).
+    #[serde(default)]
+    pub max_split: Option<Range>,
+
+    /// Per-segment length range. If set, segments are padded/truncated
+    /// to fall within these ranges. `None` means natural SNI-boundary sizes.
+    #[serde(default)]
+    pub lengths: Option<SegmentRange>,
+
+    /// Per-segment delay range. `None` means legacy 100ms / ACK-wait.
+    #[serde(default)]
+    pub delays: Option<SegmentRange>,
+}
+
+impl FragmentConfig {
+    /// Whether enhanced fragmentation is enabled (any field is set).
+    pub fn is_enhanced(&self) -> bool {
+        self.packets.is_some()
+            || self.max_split.is_some()
+            || self.lengths.is_some()
+            || self.delays.is_some()
+    }
+
+    /// Whether a given packet index should be fragmented.
+    pub fn should_fragment_packet(&self, pkt_idx: usize) -> bool {
+        match &self.packets {
+            Some(r) => {
+                let lo = r.from as usize;
+                let hi = r.to as usize;
+                pkt_idx >= lo && pkt_idx <= hi
+            }
+            None => pkt_idx == 0, // legacy: first packet only
+        }
+    }
+
+    /// Return the delay for a given segment index.
+    ///
+    /// Returns `None` if no delays configured (caller uses legacy behavior).
+    pub fn delay_for_segment(&self, seg_idx: usize) -> Option<Duration> {
+        self.delays.as_ref().map(|sr| {
+            let ms = sr.rand_for_segment(seg_idx);
+            std::time::Duration::from_millis(ms as u64)
+        })
+    }
+
+    /// Return the target length for a given segment index.
+    ///
+    /// Returns `None` if no lengths configured.
+    pub fn length_for_segment(&self, seg_idx: usize) -> Option<usize> {
+        self.lengths.as_ref().map(|sr| sr.rand_for_segment(seg_idx) as usize)
+    }
+
+    /// Return the maximum number of split segments.
+    ///
+    /// Returns `None` if not configured (caller uses SNI label count).
+    pub fn max_splits(&self) -> Option<usize> {
+        self.max_split.as_ref().map(|r| r.rand_usize())
+    }
+}
 
 /// Delay used on platforms without ACK detection (ms).
 const FRAGMENT_SLEEP_DELAY_MS: u64 = 100;
@@ -260,6 +337,16 @@ impl<S: std::os::fd::AsRawFd> FragmentTcpStream<S> {
             inner,
         }
     }
+
+    /// Construct with ACK detection and a `FragmentConfig` (enhanced mode).
+    pub fn with_config(inner: S, _config: FragmentConfig) -> Self {
+        Self {
+            fd: Some(inner.as_raw_fd()),
+            fragment_enabled: true,
+            first_write_done: false,
+            inner,
+        }
+    }
 }
 
 impl<S> FragmentTcpStream<S> {
@@ -269,6 +356,17 @@ impl<S> FragmentTcpStream<S> {
             #[cfg(unix)]
             fd: None,
             fragment_enabled: config.is_some(),
+            first_write_done: false,
+            inner,
+        }
+    }
+
+    /// Construct without ACK detection, with a `FragmentConfig` (enhanced mode).
+    pub fn new_no_ack_with_config(inner: S, _config: FragmentConfig) -> Self {
+        Self {
+            #[cfg(unix)]
+            fd: None,
+            fragment_enabled: true,
             first_write_done: false,
             inner,
         }
@@ -458,7 +556,7 @@ mod tests {
         };
         let mut stream = FragmentTcpStream::new_no_ack(
             mock,
-            Some(FragmentConfig),
+            Some(FragmentConfig::default()),
         );
 
         stream.write_all(&hello).unwrap();
@@ -476,7 +574,7 @@ mod tests {
         let mock = MockStream {
             writes: writes.clone(),
         };
-        let mut stream = FragmentTcpStream::new_no_ack(mock, Some(FragmentConfig));
+        let mut stream = FragmentTcpStream::new_no_ack(mock, Some(FragmentConfig::default()));
 
         let payload = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
         stream.write_all(payload).unwrap();
@@ -495,7 +593,7 @@ mod tests {
         };
         let mut stream = FragmentTcpStream::new_no_ack(
             mock,
-            Some(FragmentConfig),
+            Some(FragmentConfig::default()),
         );
 
         // First write: ClientHello → fragmented.
@@ -560,7 +658,7 @@ mod obfuscation_trait_tests {
 
     #[tokio::test]
     async fn fragment_impl_obfuscation_layer() {
-        let mut frag = FragmentConfig;
+        let mut frag = FragmentConfig::default();
         let ctx = ObfContext {
             request_url: None,
             is_first: true,

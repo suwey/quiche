@@ -735,7 +735,7 @@ impl AnyTlsOutboundClient {
         let padding_cache = Arc::new(StdMutex::new(PaddingCache::from_default()));
 
         let fragment = if config.tls_fragment {
-            Some(FragmentConfig)
+            Some(FragmentConfig::default())
         } else {
             None
         };

@@ -258,7 +258,7 @@ impl VlessOutboundClient {
             .or_insert_with(|| tls_server.clone());
         let mux = cfg.mux;
         let fragment = if cfg.tls_fragment {
-            Some(FragmentConfig)
+            Some(FragmentConfig::default())
         } else {
             None
         };

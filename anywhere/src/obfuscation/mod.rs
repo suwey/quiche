@@ -6,6 +6,9 @@ use std::io;
 use async_trait::async_trait;
 
 pub mod fragment;
+pub mod jitter;
+pub mod noise;
+pub mod range;
 
 /// 混淆层接口
 #[async_trait]

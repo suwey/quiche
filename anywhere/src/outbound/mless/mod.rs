@@ -73,7 +73,7 @@ impl MlessOutboundClient {
         let insecure = cfg.insecure;
         let tls_fp = cfg.fp;
         let fragment = if cfg.tls_fragment {
-            Some(FragmentConfig)
+            Some(FragmentConfig::default())
         } else {
             None
         };
