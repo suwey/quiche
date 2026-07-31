@@ -174,13 +174,38 @@ const CHARSET_BASE62: &[u8] =
 
 /// Generate a random base62 string of length `n` using the thread-local LCG.
 fn rand_base62(n: usize) -> String {
-    let m = CHARSET_BASE62.len() as i64; // 62
-    (0..n)
-        .map(|_| {
-            let v = crate::obfuscation::range::rand_range(0, m - 1);
-            CHARSET_BASE62[v as usize] as char
-        })
-        .collect()
+    if n == 0 {
+        return String::new();
+    }
+    // Batch-generate random bytes in one syscall, then map to base62
+    // with rejection sampling to avoid modulo bias.
+    let m = CHARSET_BASE62.len(); // 62
+    let limit = 256 - (256 % m); // 248: bytes < 248 map uniformly
+    let mut result = Vec::with_capacity(n);
+    // Oversize buffer: ~1.03x rejection rate for 62, so n*2 is plenty
+    let mut buf = vec![0u8; n * 2];
+    crate::obfuscation::range::fill_random(&mut buf);
+
+    for &b in &buf {
+        if result.len() == n {
+            break;
+        }
+        if b < limit as u8 {
+            result.push(CHARSET_BASE62[(b as usize) % m]);
+        }
+    }
+
+    // Extremely unlikely: if rejection rate exhausted the buffer,
+    // fall back to per-byte generation.
+    while result.len() < n {
+        let mut b = [0u8; 1];
+        crate::obfuscation::range::fill_random(&mut b);
+        if b[0] < limit as u8 {
+            result.push(CHARSET_BASE62[(b[0] as usize) % m]);
+        }
+    }
+
+    result.into_iter().map(|b| b as char).collect()
 }
 
 /// Generate tokenish padding: a random base62 string whose HPACK

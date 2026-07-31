@@ -1,42 +1,44 @@
 //! Range and SegmentRange — interval random primitives for obfuscation.
 //!
-//! Uses a thread-local LCG PRNG (same algorithm as `protocol::anytls::LcgGen`)
-//! to avoid pulling in the `rand` crate. Seeded from system nanos on first use.
-
-use std::cell::RefCell;
+//! Uses the system CSPRNG via `getrandom` for cryptographically secure
+//! random values. This ensures padding lengths and timing jitter are
+//! unpredictable to traffic-analysis adversaries.
 
 // ---------------------------------------------------------------------------
-// LCG PRNG (same constants as protocol/anytls.rs LcgGen)
+// CSPRNG — system random via getrandom
 // ---------------------------------------------------------------------------
 
-thread_local! {
-    static LCG: RefCell<u64> = RefCell::new(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(1),
-    );
+/// Fill a buffer with cryptographically secure random bytes from the OS.
+pub(crate) fn fill_random(buf: &mut [u8]) {
+    // getrandom::fill never fails on supported platforms (Linux, macOS,
+    // Windows, Android, iOS). If it somehow does, the system is broken
+    // and panicking is the only safe option.
+    getrandom::fill(buf).expect("getrandom: system CSPRNG failed");
 }
 
-fn lcg_next() -> u64 {
-    LCG.with(|cell| {
-        let mut state = cell.borrow_mut();
-        *state = state
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
-        *state
-    })
+/// Return a cryptographically secure random `u64`.
+fn crypto_random_u64() -> u64 {
+    let mut buf = [0u8; 8];
+    fill_random(&mut buf);
+    u64::from_ne_bytes(buf)
 }
 
 /// Random integer in [min, max] (inclusive).
+///
+/// Uses rejection sampling to avoid modulo bias.
 pub(crate) fn rand_range(min: i64, max: i64) -> i64 {
     if min >= max {
         return min;
     }
-    // Use upper 32 bits of LCG output for better quality
-    // (lower bits of LCG have shorter periods)
-    let raw = lcg_next();
-    min + ((raw >> 32) % (max - min + 1) as u64) as i64
+    let range = (max - min + 1) as u64;
+    // Rejection sampling: discard values that would introduce modulo bias
+    let threshold = u64::MAX - (u64::MAX % range);
+    loop {
+        let r = crypto_random_u64();
+        if r < threshold {
+            return min + (r % range) as i64;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -246,10 +248,10 @@ mod tests {
     }
 
     #[test]
-    fn lcgproduces_different_values() {
+    fn crypto_random_produces_different_values() {
         // Two consecutive calls should (almost certainly) differ.
-        let a = lcg_next();
-        let b = lcg_next();
-        assert_ne!(a, b, "LCG produced same value twice");
+        let a = crypto_random_u64();
+        let b = crypto_random_u64();
+        assert_ne!(a, b, "CSPRNG produced same value twice");
     }
 }
