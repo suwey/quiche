@@ -33,7 +33,10 @@ pub(crate) fn rand_range(min: i64, max: i64) -> i64 {
     if min >= max {
         return min;
     }
-    min + (lcg_next() % (max - min + 1) as u64) as i64
+    // Use upper 32 bits of LCG output for better quality
+    // (lower bits of LCG have shorter periods)
+    let raw = lcg_next();
+    min + ((raw >> 32) % (max - min + 1) as u64) as i64
 }
 
 // ---------------------------------------------------------------------------

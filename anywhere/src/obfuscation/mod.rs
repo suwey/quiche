@@ -8,6 +8,7 @@ use async_trait::async_trait;
 pub mod fragment;
 pub mod jitter;
 pub mod noise;
+pub mod padding;
 pub mod range;
 
 /// 混淆层接口
