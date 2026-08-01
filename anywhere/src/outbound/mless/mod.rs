@@ -3,7 +3,6 @@
 
 //! Mless outbound — VLESS over multiplexed WebSocket (Hermes protocol).
 
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::Weak;
 
@@ -11,6 +10,8 @@ use async_trait::async_trait;
 use tokio::sync::mpsc;
 
 use crate::config::OutboundConfig;
+use crate::connection::ConnectionManager;
+use crate::crypto::CryptoFactory;
 use crate::inbound::Destination;
 use crate::outbound::OutboundClient;
 use crate::outbound::common::resolve_sni;
@@ -18,10 +19,9 @@ use crate::outbound::direct::DirectOutboundClient;
 use crate::outbound::vless::parse_uuid;
 use crate::relay::PacketRelay;
 use crate::relay::StreamRelay;
-use crate::tlsfragment::FragmentConfig;
 
 use self::frame::FLAG_FIRST;
-use self::frame::encode_frame;
+use self::multiplexer::MlessMessage;
 use self::multiplexer::MlessMultiplexer;
 use self::multiplexer::MlessStreamHandle;
 use self::vless::build_vless_header;
@@ -32,21 +32,19 @@ pub mod multiplexer;
 pub mod vless;
 
 /// Mless outbound client.
+///
+/// M4: Uses pluggable `ConnectionManager` + `CryptoFactory` instead of
+/// raw connection parameters. Supports both WS and XHTTP transports.
 pub struct MlessOutboundClient {
     multiplexer: tokio::sync::Mutex<Arc<MlessMultiplexer>>,
     uuid: [u8; 16],
     uuid_str: String,
-    addr: SocketAddr,
-    tls_server: String,
-    insecure: bool,
-    tls_fp: bool,
-    fragment: Option<FragmentConfig>,
-    transport_path: String,
-    transport_headers: std::collections::HashMap<String, String>,
+    /// Pluggable connection manager (for reconnection).
+    conn_mgr: Arc<dyn ConnectionManager>,
+    /// Pluggable crypto factory.
+    crypto_factory: Arc<dyn CryptoFactory>,
     consecutive_fails: std::sync::atomic::AtomicU32,
     /// Direct outbound used for UDP ports that mless can't tunnel (e.g. NTP).
-    /// Hermes server only supports TCP, so non-DNS UDP must either drop
-    /// (QUIC — forces browser TCP fallback) or go direct (NTP, mDNS).
     direct_fallback: DirectOutboundClient,
 }
 
@@ -70,53 +68,67 @@ impl MlessOutboundClient {
             .ok_or("mless: missing password (uuid)")?;
         let uuid = parse_uuid(uuid_str)?;
         let uuid_str = uuid_str.to_string();
-        let insecure = cfg.insecure;
-        let tls_fp = cfg.fp;
-        let fragment = if cfg.tls_fragment {
-            Some(FragmentConfig::default())
-        } else {
-            None
+
+        // Build connection manager from nested [transport] config
+        let transport = cfg.transport.as_ref().ok_or("mless: missing [transport] config")?;
+        let conn_mgr: Arc<dyn ConnectionManager> = match transport.type_.as_str() {
+            "ws" => {
+                use crate::connection::SingleConnectionManager;
+                use crate::transport::{TransportContext, ws::WsTransportFactory};
+                let ws = transport.ws.as_ref().ok_or("mless: missing [transport.ws] config")?;
+                let path = ws.path.clone().unwrap_or_else(|| "/".to_string());
+                let mut headers = ws.headers.clone().unwrap_or_default();
+                headers.entry("Host".to_string()).or_insert_with(|| tls_server.clone());
+                let ctx = TransportContext {
+                    server: addr.ip().to_string(),
+                    port: addr.port(),
+                    tls_server: tls_server.clone(),
+                    insecure: cfg.insecure,
+                    tls_fp: cfg.fp,
+                    path,
+                    headers,
+                    fragment: if cfg.tls_fragment {
+                        Some(crate::tlsfragment::FragmentConfig::default())
+                    } else { None },
+                };
+                Arc::new(SingleConnectionManager::new(Box::new(WsTransportFactory), ctx))
+            }
+            "xhttp" => {
+                use crate::transport::xhttp::{config::HttpVersionPref, xmux::XmuxConnectionManager};
+                let xc = transport.xhttp.as_ref().ok_or("mless: missing [transport.xhttp] config")?;
+                let mut xhttp_config = xc.clone();
+                if xhttp_config.host.is_empty() { xhttp_config.host = tls_server.clone(); }
+                if xhttp_config.port == 0 { xhttp_config.port = addr.port(); }
+                xhttp_config.insecure = cfg.insecure;
+                let xhttp_config = Arc::new(xhttp_config);
+                if xhttp_config.http_version == HttpVersionPref::Http3 {
+                    use crate::transport::xhttp::h3::H3ConnectionManager;
+                    Arc::new(H3ConnectionManager::new(xhttp_config))
+                } else {
+                    Arc::new(XmuxConnectionManager::from_config(xhttp_config).await?)
+                }
+            }
+            other => return Err(format!("mless: unsupported transport type '{other}'").into()),
         };
 
-        let transport_type = cfg.transport_type.as_deref().unwrap_or("ws");
-        if transport_type != "ws" {
-            return Err(format!(
-                "mless: unsupported transport type '{transport_type}'"
-            )
-            .into());
-        }
-        let transport_path = cfg
-            .transport_path
-            .clone()
-            .unwrap_or_else(|| "/".to_string());
-        let mut transport_headers =
-            cfg.transport_headers.clone().unwrap_or_default();
-        transport_headers
-            .entry("Host".to_string())
-            .or_insert_with(|| tls_server.clone());
+        // Build crypto factory
+        let crypto_factory: Arc<dyn CryptoFactory> =
+            Arc::new(self::crypto::AheadXorFactory);
 
-        let multiplexer = MlessMultiplexer::connect(
-            addr,
+        // Connect via pluggable architecture
+        let multiplexer = MlessMultiplexer::connect_pluggable(
+            conn_mgr.clone(),
+            crypto_factory.clone(),
             &uuid_str,
-            &tls_server,
-            insecure,
-            tls_fp,
-            fragment.as_ref(),
-            &transport_path,
-            &transport_headers,
         )
         .await?;
+
         Ok(Self {
             multiplexer: tokio::sync::Mutex::new(multiplexer),
             uuid,
             uuid_str,
-            addr,
-            tls_server,
-            insecure,
-            tls_fp,
-            fragment,
-            transport_path,
-            transport_headers,
+            conn_mgr,
+            crypto_factory,
             consecutive_fails: std::sync::atomic::AtomicU32::new(0),
             direct_fallback: DirectOutboundClient,
         })
@@ -149,15 +161,10 @@ impl MlessOutboundClient {
             delay_secs,
         );
         tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
-        let result = MlessMultiplexer::connect(
-            self.addr,
+        let result = MlessMultiplexer::connect_pluggable(
+            self.conn_mgr.clone(),
+            self.crypto_factory.clone(),
             &self.uuid_str,
-            &self.tls_server,
-            self.insecure,
-            self.tls_fp,
-            self.fragment.as_ref(),
-            &self.transport_path,
-            &self.transport_headers,
         )
         .await;
         let new_mux = result.ok();
@@ -396,12 +403,12 @@ impl StreamRelay for MlessStreamRelay {
                     Vec::with_capacity(self.vless_header.len() + buf.len());
                 combined.extend_from_slice(&self.vless_header);
                 combined.extend_from_slice(buf);
-                let encrypted = {
-                    let mut inner = mux.inner.lock();
-                    inner.obfuscation.encrypt(&combined)
-                };
-                let frame = encode_frame(self.stream_id, FLAG_FIRST, &encrypted);
-                let _ = mux.ws_tx.send(frame);
+                // Send plaintext - io_loop handles encryption
+                let _ = mux.ws_tx.send(MlessMessage::Data {
+                    stream_id: self.stream_id,
+                    flags: FLAG_FIRST,
+                    payload: combined,
+                });
                 self.first_write = false;
             } else {
                 mux.send_data(self.stream_id, buf);
@@ -462,13 +469,12 @@ impl PacketRelay for MlessPacketRelay {
                     Vec::with_capacity(self.vless_header.len() + buf.len());
                 combined.extend_from_slice(&self.vless_header);
                 combined.extend_from_slice(buf);
-                let encrypted = {
-                    let mut inner = mux.inner.lock();
-                    inner.obfuscation.encrypt(&combined)
-                };
-                let frame =
-                    encode_frame(self.handle.stream_id, FLAG_FIRST, &encrypted);
-                let _ = mux.ws_tx.send(frame);
+                // Send plaintext - io_loop handles encryption
+                let _ = mux.ws_tx.send(MlessMessage::Data {
+                    stream_id: self.handle.stream_id,
+                    flags: FLAG_FIRST,
+                    payload: combined,
+                });
                 self.first_write = false;
             } else {
                 mux.send_data(self.handle.stream_id, buf);
@@ -480,5 +486,187 @@ impl PacketRelay for MlessPacketRelay {
     async fn close(&mut self) -> std::io::Result<()> {
         self.handle.close().await;
         Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// End-to-end test: mless over XHTTP stream-one
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod mless_xhttp_tests {
+    use super::*;
+    use crate::crypto::CryptoFactory;
+    use crate::transport::xhttp::h2::{make_stream_body, H2SendRequest};
+    use crate::transport::xhttp::{config::XhttpConfig, xmux::XmuxConnectionManager};
+    use bytes::Bytes;
+    use http_body::Frame;
+    use http_body_util::BodyExt;
+    use hyper::body::Incoming;
+    use hyper::server::conn::http2;
+    use hyper::service::service_fn;
+    use hyper::Request;
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+
+    /// Streaming echo server: echoes H2 POST body frames back as response
+    /// body frames, without waiting for the full request body.
+    async fn start_streaming_echo() -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((tcp, _)) = listener.accept().await else { break };
+                let io = TokioIo::new(tcp);
+                let exec = TokioExecutor::new();
+                let _ = http2::Builder::new(exec)
+                    .serve_connection(
+                        io,
+                        service_fn(|req: Request<Incoming>| async move {
+                            let (tx, body) = make_stream_body(16);
+                            let mut req_body = req.into_body();
+                            tokio::spawn(async move {
+                                loop {
+                                    match req_body.frame().await {
+                                        Some(Ok(frame)) => {
+                                            if let Some(data) = frame.data_ref() {
+                                                if tx
+                                                    .send(Ok(Frame::data(data.clone())))
+                                                    .await
+                                                    .is_err()
+                                                {
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                        Some(Err(_)) => break,
+                                        None => break,
+                                    }
+                                }
+                            });
+                            Ok::<_, std::convert::Infallible>(
+                                hyper::Response::builder()
+                                    .status(200)
+                                    .body(body)
+                                    .unwrap(),
+                            )
+                        }),
+                    )
+                    .await;
+            }
+        });
+        addr
+    }
+
+    async fn connect_plain_h2(addr: std::net::SocketAddr) -> H2SendRequest {
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let io = TokioIo::new(tcp);
+        let exec = TokioExecutor::new();
+        let (send_req, conn) =
+            hyper::client::conn::http2::handshake(exec, io).await.unwrap();
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        send_req
+    }
+
+    #[tokio::test]
+    async fn mless_over_xhttp_echo() {
+        let addr = start_streaming_echo().await;
+        let send_req = connect_plain_h2(addr).await;
+
+        // Build XHTTP connection manager with injected SendRequest
+        let xhttp_config = Arc::new(XhttpConfig {
+            host: "localhost".to_string(),
+            port: addr.port(),
+            path: "/xhttp".to_string(),
+            ..Default::default()
+        });
+        let mgr = XmuxConnectionManager::new(xhttp_config, addr);
+        *mgr.canonical.lock() = Some(send_req);
+        let conn_mgr: Arc<dyn ConnectionManager> = Arc::new(mgr);
+
+        // Build crypto factory
+        let crypto_factory: Arc<dyn CryptoFactory> =
+            Arc::new(self::crypto::AheadXorFactory);
+        let uuid_str = "00000000-0000-4000-8000-000000000000";
+
+        // Connect multiplexer via pluggable architecture
+        let mux = MlessMultiplexer::connect_pluggable(
+            conn_mgr,
+            crypto_factory,
+            uuid_str,
+        )
+        .await
+        .unwrap();
+
+        // Register a stream
+        let (stream_id, mut rx) = mux.register_stream();
+
+        // Send plaintext data - io_loop will encrypt and write to transport
+        mux.send_data(stream_id, b"hello mless over xhttp");
+
+        // Read echoed data back (with timeout - the io_loop needs time to process)
+        let received = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            rx.recv(),
+        )
+        .await
+        .expect("timeout waiting for echo")
+        .expect("stream channel closed");
+
+        assert_eq!(received, b"hello mless over xhttp");
+    }
+
+    #[tokio::test]
+    async fn mless_over_xhttp_multiple_frames() {
+        let addr = start_streaming_echo().await;
+        let send_req = connect_plain_h2(addr).await;
+
+        let xhttp_config = Arc::new(XhttpConfig {
+            host: "localhost".to_string(),
+            port: addr.port(),
+            path: "/xhttp".to_string(),
+            ..Default::default()
+        });
+        let mgr = XmuxConnectionManager::new(xhttp_config, addr);
+        *mgr.canonical.lock() = Some(send_req);
+        let conn_mgr: Arc<dyn ConnectionManager> = Arc::new(mgr);
+
+        let crypto_factory: Arc<dyn CryptoFactory> =
+            Arc::new(self::crypto::AheadXorFactory);
+        let uuid_str = "00000000-0000-4000-8000-000000000000";
+
+        let mux = MlessMultiplexer::connect_pluggable(
+            conn_mgr,
+            crypto_factory,
+            uuid_str,
+        )
+        .await
+        .unwrap();
+
+        let (stream_id, mut rx) = mux.register_stream();
+
+        // Send multiple frames
+        mux.send_data(stream_id, b"frame1");
+        mux.send_data(stream_id, b"frame2");
+        mux.send_data(stream_id, b"frame3");
+
+        // Read all frames back
+        let r1 = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("timeout 1")
+            .expect("channel closed 1");
+        let r2 = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("timeout 2")
+            .expect("channel closed 2");
+        let r3 = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("timeout 3")
+            .expect("channel closed 3");
+
+        assert_eq!(r1, b"frame1");
+        assert_eq!(r2, b"frame2");
+        assert_eq!(r3, b"frame3");
     }
 }

@@ -1,4 +1,5 @@
 pub mod ws;
+pub mod xhttp;
 
 use std::collections::HashMap;
 use std::io;
@@ -38,8 +39,8 @@ pub trait TransportSession: Send {
     fn kind(&self) -> &'static str;
 }
 
-/// 传输创建上下文（M0 定义但不使用）
-#[allow(dead_code)]
+/// 传输创建上下文
+#[derive(Clone)]
 pub struct TransportContext {
     pub server: String,
     pub port: u16,
@@ -48,6 +49,7 @@ pub struct TransportContext {
     pub tls_fp: bool,
     pub path: String,
     pub headers: HashMap<String, String>,
+    pub fragment: Option<crate::tlsfragment::FragmentConfig>,
 }
 
 /// 传输层工厂 trait（M0 定义但不使用）

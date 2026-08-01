@@ -1039,12 +1039,10 @@ mod tests {
             url: None,
             mux: false,
             insecure: false,
-            transport_type: None,
-            transport_path: None,
-            transport_headers: None,
             idle_session_check_interval: None,
             idle_session_timeout: None,
             min_idle_session: None,
+            transport: None,
             tls_fragment: false,
         };
         assert!(SshOutboundClient::from_config(&cfg).await.is_err());
@@ -1067,12 +1065,10 @@ mod tests {
             url: None,
             mux: false,
             insecure: false,
-            transport_type: None,
-            transport_path: None,
-            transport_headers: None,
             idle_session_check_interval: None,
             idle_session_timeout: None,
             min_idle_session: None,
+            transport: None,
             tls_fragment: false,
         };
         assert!(SshOutboundClient::from_config(&cfg).await.is_err());
@@ -1098,10 +1094,8 @@ mod tests {
             idle_session_check_interval: None,
             idle_session_timeout: None,
             min_idle_session: None,
+            transport: None,
             tls_fragment: false,
-            transport_type: None,
-            transport_path: None,
-            transport_headers: None,
         };
         // from_config does NOT fail on spawn failure or port timeout — it
         // logs a warning and returns the client.

@@ -18,13 +18,13 @@ pub trait ObfuscationLayer: Send {
     async fn pre_send(
         &mut self,
         data: &[u8],
-        ctx: &ObfContext,
+        ctx: &ObfContext<'_>,
     ) -> io::Result<Vec<u8>>;
     /// 在下行数据接收后调用
     async fn post_recv(
         &mut self,
         data: &[u8],
-        ctx: &ObfContext,
+        ctx: &ObfContext<'_>,
     ) -> io::Result<Vec<u8>>;
     /// 此混淆层是否需要 HTTP 请求上下文
     #[allow(dead_code)]
@@ -34,12 +34,17 @@ pub trait ObfuscationLayer: Send {
     fn name(&self) -> &'static str;
 }
 
-/// 混淆上下文（M0 定义但不使用）
+/// 混淆上下文：传递跨层信息
 #[allow(dead_code)]
-pub struct ObfContext {
-    pub request_url: Option<&'static str>,
+pub struct ObfContext<'a> {
+    /// 当前 HTTP 请求的 URL（XPadding 用）
+    pub request_url: Option<&'a str>,
+    /// 当前是首包还是后续包
     pub is_first: bool,
+    /// 当前包序号（packet-up 模式）
     pub seq: Option<u64>,
+    /// HTTP 响应头（下行 padding 校验用）
+    pub response_headers: Option<&'a http::HeaderMap>,
 }
 
 /// 混淆链（M0 定义但不使用）

@@ -111,7 +111,6 @@ mod router;
 
 use self::connection::ApplicationOverQuic;
 use self::connection::ConnectionIdGenerator as _;
-use self::connection::QuicConnection;
 use self::router::InboundPacketRouter;
 use self::router::acceptor::ConnectionAcceptor;
 use self::router::acceptor::ConnectionAcceptorConfig;
@@ -122,6 +121,7 @@ pub use self::connection::HandshakeError;
 pub use self::connection::HandshakeInfo;
 pub use self::connection::Incoming;
 pub use self::connection::QuicCommand;
+pub use self::connection::QuicConnection;
 pub use self::connection::QuicConnectionStats;
 pub use self::connection::SimpleConnectionIdGenerator;
 pub use self::hooks::ConnectionHook;

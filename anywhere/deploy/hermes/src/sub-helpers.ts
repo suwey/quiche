@@ -8,10 +8,17 @@ export interface 传输协议Info {
 	域名字段名: string;
 }
 
-export function 获取传输协议配置(配置: { 传输协议?: string; gRPC模式?: string } = {}): 传输协议Info {
+export function 获取传输协议配置(配置: { 传输协议?: string; gRPC模式?: string; XHTTP模式?: string } = {}): 传输协议Info {
 	const 是gRPC = 配置.传输协议 === 'grpc';
+	const 是XHTTP = 配置.传输协议 === 'xhttp';
+	// XHTTP 模式: stream-one (默认) / stream-up / packet-up
+	const xhttpMode = 配置.XHTTP模式 || 'stream-one';
 	return {
-		type: 是gRPC ? (配置.gRPC模式 === 'multi' ? 'grpc&mode=multi' : 'grpc&mode=gun') : 配置.传输协议 === 'xhttp' ? 'xhttp&mode=stream-one' : 'ws',
+		type: 是gRPC
+			? (配置.gRPC模式 === 'multi' ? 'grpc&mode=multi' : 'grpc&mode=gun')
+			: 是XHTTP
+				? `xhttp&mode=${xhttpMode}`
+				: 'ws',
 		路径字段名: 是gRPC ? 'serviceName' : 'path',
 		域名字段名: 是gRPC ? 'authority' : 'host',
 	};

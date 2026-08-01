@@ -63,15 +63,70 @@ password = "15e023sae"
 sni = "fafeg.qq.com"
 
 [[outbounds]]
+type = "mless"
+tag = "M1"
+server = "11.11.1.11:2083"
+password = "00000000-0000-4000-8000-000000000000"
+sni = "h.p.dev"
+
+[outbounds.transport]
+type = "xhttp"
+
+[outbounds.transport.xhttp]
+host = "h.p.dev"
+path = "/xhttp"
+mode = "auto"
+http_version = "auto"
+no_grpc_header = false
+no_sse_header = false
+
+[outbounds.transport.xhttp.padding]
+bytes = { from = 100, to = 1000 }
+method = "repeat-x"
+obfs_mode = false
+placement = "query"
+key = "x_padding"
+header = "X-Padding"
+
+[outbounds.transport.xhttp.session]
+id_placement = "path"
+id_key = "session"
+seq_placement = "query"
+seq_key = "seq"
+
+[outbounds.transport.xhttp.uplink]
+method = "POST"
+data_placement = "auto"
+data_key = ""
+chunk_size = { from = 1000000, to = 1000000 }
+
+[outbounds.transport.xhttp.throttle]
+max_each_post_bytes = { from = 1000000, to = 1000000 }
+min_posts_interval_ms = { from = 30, to = 30 }
+max_buffered_posts = 30
+stream_up_server_secs = { from = 20, to = 80 }
+
+[outbounds.transport.xhttp.xmux]
+max_concurrency = { from = 0, to = 0 }
+max_connections = { from = 0, to = 0 }
+c_max_reuse_times = { from = 0, to = 0 }
+h_max_request_times = { from = 0, to = 0 }
+h_max_reusable_secs = { from = 0, to = 0 }
+h_keep_alive_period = 0
+
+[[outbounds]]
 type = "vless"
 tag = "CF"
 server = "11.11.1.11:2083"
 password = "xxxxx"
 sni = "h.p.dev"
-fp = true
-transport_type = "ws"
-transport_path = "/"
-transport_headers.Host = "h.p.dev"
+
+[outbounds.transport]
+type = "ws"
+
+[outbounds.transport.ws]
+path = "/"
+headers = { Host = "h.p.dev" }
 
 [[outbounds]]
 type = "ssh"
@@ -82,7 +137,7 @@ server = "127.0.0.1:{PORT}"
 [[outbounds]]
 type = "urltest"
 tag = "auto"
-outbounds = ["A1", "A2", "A3", "CF"]
+outbounds = ["A1", "A2", "A3", "CF", "M1"]
 # outbounds = ["mac"]
 #interval = 600
 #url = "www.google.com"

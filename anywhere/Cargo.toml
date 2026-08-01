@@ -33,10 +33,11 @@ chrono = { version = "0.4", features = ["serde"] }
 tower-http = { version = "0.7", features = ["cors", "set-header", "fs"] }
 uuid = { version = "1", features = ["v4"] }
 serde_json = { workspace = true }
-hyper = { version = "1", features = ["client", "http1", "http2"] }
+hyper = { version = "1", features = ["client", "http1", "http2", "server"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "tokio"] }
 http = "1"
 http-body-util = "0.1"
+http-body = "1"
 url = { workspace = true }
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 sha1 = "0.11"

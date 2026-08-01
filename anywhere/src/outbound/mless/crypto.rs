@@ -209,6 +209,23 @@ impl CryptoLayer for Obfuscation {
         self.recv_counter = 0;
     }
 }
+/// Factory that creates `Obfuscation` (Ahead-XOR) instances.
+///
+/// Implements the `CryptoFactory` trait for the pluggable architecture.
+/// The `secret` parameter is the UUID string (same as `Obfuscation::new`).
+use crate::crypto::CryptoFactory;
+
+#[allow(dead_code)]
+pub struct AheadXorFactory;
+
+impl CryptoFactory for AheadXorFactory {
+    fn create(&self, secret: &str) -> Box<dyn CryptoLayer> {
+        Box::new(Obfuscation::new(secret))
+    }
+    fn name(&self) -> &'static str {
+        "ahead-xor"
+    }
+}
 
 // ---------------------------------------------------------------------------
 // CryptoLayer trait tests

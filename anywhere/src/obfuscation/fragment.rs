@@ -19,26 +19,23 @@ const TLS_CONTENT_TYPE_HANDSHAKE: u8 = 0x16;
 const TLS_HANDSHAKE_TYPE_CLIENT_HELLO: u8 = 0x01;
 const TLS_SNI_EXTENSION_TYPE: u16 = 0x0000;
 
-/// Configuration for TLS fragmentation.
+/// Configuration for TLS fragmentation with jitter.
 ///
-/// When all fields are `None` (the `Default`), fragmentation uses the
-/// legacy behavior: split ClientHello at SNI label boundaries with a
-/// fixed 100ms delay (or ACK-wait on Linux).
+/// Default: enhanced mode with random segment sizes and delays
+/// for stronger DPI evasion. Fragment the first 1-2 TLS packets
+/// into 3-8 segments with random lengths and delays.
 ///
-/// When fields are set, the enhanced mode activates:
-/// - `packets`: which packet numbers to fragment (0-indexed)
-/// - `max_split`: random maximum number of split segments
-/// - `lengths`: per-segment random length range
-/// - `delays`: per-segment random delay range
-#[derive(Debug, Clone, Default, serde::Deserialize)]
+/// When all fields are explicitly set to `None`, reverts to legacy
+/// behavior: split at SNI label boundaries with fixed 100ms delay.
+#[derive(Debug, Clone, serde::Deserialize)]
 pub struct FragmentConfig {
-    /// Packet number range to fragment (e.g. `0-1` = only first packet).
-    /// `None` means fragment all packets (legacy behavior: first only).
+    /// Packet number range to fragment (e.g. `0-1` = first two packets).
+    /// `None` means fragment only the first packet (legacy).
     #[serde(default)]
     pub packets: Option<Range>,
 
     /// Maximum number of segments to split into.
-    /// `None` means use SNI label count (legacy behavior).
+    /// `None` means use SNI label count (legacy).
     #[serde(default)]
     pub max_split: Option<Range>,
 
@@ -50,6 +47,27 @@ pub struct FragmentConfig {
     /// Per-segment delay range. `None` means legacy 100ms / ACK-wait.
     #[serde(default)]
     pub delays: Option<SegmentRange>,
+}
+
+impl Default for FragmentConfig {
+    fn default() -> Self {
+        Self {
+            // Fragment first 1-2 packets
+            packets: Some(Range::new(0, 1)),
+            // Split into 3-8 segments
+            max_split: Some(Range::new(3, 8)),
+            // Per-segment random length: seg0=10-50B, seg1=50-200B, seg2+=100-500B
+            lengths: Some(SegmentRange::from_arrays(
+                vec![10, 50, 100],
+                vec![50, 200, 500],
+            )),
+            // Per-segment random delay: seg0=0-10ms, seg1=0-50ms, seg2+=0-100ms
+            delays: Some(SegmentRange::from_arrays(
+                vec![0, 0, 0],
+                vec![10, 50, 100],
+            )),
+        }
+    }
 }
 
 impl FragmentConfig {
@@ -627,7 +645,7 @@ impl ObfuscationLayer for FragmentConfig {
     async fn pre_send(
         &mut self,
         data: &[u8],
-        _ctx: &ObfContext,
+        _ctx: &ObfContext<'_>,
     ) -> io::Result<Vec<u8>> {
         // FragmentConfig 作用于 TCP 层（TLS ClientHello 分片），
         // 不在数据层修改 payload，直接透传
@@ -637,7 +655,7 @@ impl ObfuscationLayer for FragmentConfig {
     async fn post_recv(
         &mut self,
         data: &[u8],
-        _ctx: &ObfContext,
+        _ctx: &ObfContext<'_>,
     ) -> io::Result<Vec<u8>> {
         Ok(data.to_vec())
     }
@@ -663,6 +681,7 @@ mod obfuscation_trait_tests {
             request_url: None,
             is_first: true,
             seq: None,
+            response_headers: None,
         };
         let data = b"test data";
         let out = frag.pre_send(data, &ctx).await.unwrap();

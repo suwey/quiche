@@ -240,19 +240,16 @@ impl VlessOutboundClient {
         let insecure = cfg.insecure;
         let tls_fp = cfg.fp;
 
-        let transport_type = cfg.transport_type.as_deref().unwrap_or("ws");
-        if transport_type != "ws" {
+        let transport = cfg.transport.as_ref().ok_or("vless: missing [transport] config")?;
+        if transport.type_ != "ws" {
             return Err(format!(
-                "vless: unsupported transport type '{transport_type}'"
+                "vless: unsupported transport type '{}'", transport.type_
             )
             .into());
         }
-        let transport_path = cfg
-            .transport_path
-            .clone()
-            .unwrap_or_else(|| "/".to_string());
-        let mut transport_headers =
-            cfg.transport_headers.clone().unwrap_or_default();
+        let ws = transport.ws.as_ref().ok_or("vless: missing [transport.ws] config")?;
+        let transport_path = ws.path.clone().unwrap_or_else(|| "/".to_string());
+        let mut transport_headers = ws.headers.clone().unwrap_or_default();
         transport_headers
             .entry("Host".to_string())
             .or_insert_with(|| tls_server.clone());

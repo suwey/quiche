@@ -117,6 +117,21 @@ fn default_sniff_true() -> Option<bool> {
 fn default_local_direct() -> bool {
     true
 }
+/// WebSocket transport configuration.
+#[derive(Debug, Clone, Deserialize)]
+pub struct WsConfig {
+    pub path: Option<String>,
+    pub headers: Option<HashMap<String, String>>,
+}
+
+/// Nested transport configuration.
+#[derive(Debug, Deserialize)]
+pub struct TransportConfig {
+    #[serde(rename = "type")]
+    pub type_: String,
+    pub ws: Option<WsConfig>,
+    pub xhttp: Option<crate::transport::xhttp::config::XhttpConfig>,
+}
 
 #[derive(Debug, Deserialize, Default)]
 pub struct OutboundConfig {
@@ -144,10 +159,10 @@ pub struct OutboundConfig {
 
     pub ech_config: Option<String>,
 
-    /// Enable TLS ClientHello fragmentation to evade DPI SNI matching.
-    /// Splits the first TLS write (ClientHello) across multiple TCP
-    /// segments with a delay between them.
-    #[serde(default)]
+    /// Enable TLS ClientHello fragmentation with jitter to evade DPI SNI matching.
+    /// Default: true. Fragments the first TLS write across multiple TCP
+    /// segments with random sizes and delays.
+    #[serde(default = "default_true")]
     pub tls_fragment: bool,
 
     // --- shared sub-config fields (urltest / vless) ---
@@ -170,16 +185,9 @@ pub struct OutboundConfig {
     /// Disable TLS certificate verification.
     #[serde(default)]
     pub insecure: bool,
-
-    /// Transport type — only "ws" supported.
-    pub transport_type: Option<String>,
-
-    /// WebSocket path (default: "/").
-    pub transport_path: Option<String>,
-
-    /// WebSocket custom headers, e.g. `transport_headers.Host = "..."`.
+    /// Nested transport config.
     #[serde(default)]
-    pub transport_headers: Option<HashMap<String, String>>,
+    pub transport: Option<TransportConfig>,
 
     // --- anytls session pool ---
     /// How often the pool cleanup task runs (seconds, default: 60).

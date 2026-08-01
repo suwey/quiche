@@ -345,7 +345,7 @@ fn trigger_reload(state: &AppContext) -> StatusCode {
 /// Uses `execve` via `std::os::unix::process::CommandExt::exec()`.
 /// On success, this function never returns (the process image is replaced).
 /// On failure, logs the error and exits with code 1.
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "android")))]
 pub(crate) fn do_execve(exe: &str, args: &[String]) {
     use std::os::unix::process::CommandExt;
     let err = std::process::Command::new(exe)

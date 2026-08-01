@@ -716,6 +716,12 @@ pub struct WsTransportSession {
 #[allow(dead_code)]
 impl WsTransportSession {
     pub(crate) fn new(ws: crate::outbound::vless::WsStream) -> Self {
+        // Set a short read timeout so WsDownlinkReader::read returns
+        // WouldBlock/TimedOut periodically instead of blocking forever.
+        // The io_loop's select! needs this to interleave outgoing writes
+        // with incoming reads. Without it, spawn_blocking(ws.recv())
+        // blocks indefinitely when the server has no data to send.
+        let _ = ws.set_read_timeout(std::time::Duration::from_millis(100));
         Self {
             inner: Arc::new(Mutex::new(ws)),
         }
@@ -825,5 +831,53 @@ impl TransportSession for WsTransportSession {
 
     fn kind(&self) -> &'static str {
         "websocket"
+    }
+}
+
+// ---------------------------------------------------------------------------
+// WsTransportFactory - TransportFactory implementation for WebSocket
+// ---------------------------------------------------------------------------
+
+use crate::transport::{TransportContext, TransportError, TransportFactory};
+
+/// Factory that creates `WsTransportSession` instances.
+///
+/// Uses `spawn_blocking` for the blocking TCP+TLS+WS handshake
+/// (BoringSSL + `build_ws`).
+#[allow(dead_code)]
+pub struct WsTransportFactory;
+
+#[async_trait]
+impl TransportFactory for WsTransportFactory {
+    async fn create(
+        &self,
+        ctx: &TransportContext,
+    ) -> std::result::Result<Box<dyn crate::transport::TransportSession>, TransportError> {
+        let ctx = ctx.clone();
+        let session = tokio::task::spawn_blocking(move || -> io::Result<_> {
+            let addr_str = format!("{}:{}", ctx.server, ctx.port);
+            let addr = crate::outbound::common::resolve_addr(&addr_str)
+                .map_err(|e| io::Error::new(io::ErrorKind::AddrNotAvailable, e))?;
+            let tcp = crate::outbound::common::connect_tcp_bypass_sync(addr)?;
+            let ws = crate::outbound::vless::build_ws(
+                tcp,
+                &ctx.tls_server,
+                ctx.insecure,
+                ctx.tls_fp,
+                ctx.fragment.as_ref(),
+                &ctx.path,
+                &ctx.headers,
+            )?;
+            Ok(WsTransportSession::new(ws))
+        })
+        .await
+        .map_err(|e| TransportError::Connect(e.to_string()))?
+        .map_err(|e| TransportError::Connect(e.to_string()))?;
+
+        Ok(Box::new(session))
+    }
+
+    fn supports_asymmetric(&self) -> bool {
+        false
     }
 }

@@ -1,14 +1,13 @@
 //! 连接管理层接口
 //!
 //! 职责：创建、池化、回收传输会话
-//! M0 阶段：仅定义 trait，现有 vless Pool 和 mless MlessMultiplexer 不适配此 trait
-
+//! M6: AsymmetricConnectionManager for stream-up/packet-up.
+pub mod asymmetric;
 use async_trait::async_trait;
 
 use crate::transport::TransportSession;
 
 /// 连接管理器接口
-#[allow(dead_code)]
 #[async_trait]
 pub trait ConnectionManager: Send + Sync {
     /// 获取一条可用的传输会话（上行）
@@ -27,7 +26,6 @@ pub trait ConnectionManager: Send + Sync {
     async fn shutdown(&self);
 }
 
-/// 连接管理错误（M0 定义但不使用）
 #[allow(dead_code)]
 #[derive(Debug)]
 pub enum ConnError {
@@ -47,3 +45,50 @@ impl std::fmt::Display for ConnError {
 }
 
 impl std::error::Error for ConnError {}
+
+
+// ---------------------------------------------------------------------------
+// SingleConnectionManager - one session per acquire (no pooling)
+// ---------------------------------------------------------------------------
+
+use crate::transport::{TransportContext, TransportFactory};
+
+/// Simple connection manager: creates a new session on each `acquire_*()`.
+///
+/// Used by mless over WS (backward compat) and any transport that doesn't
+/// need connection pooling. Each call to `acquire_uplink()` invokes the
+/// factory to create a fresh `TransportSession`.
+#[allow(dead_code)]
+pub struct SingleConnectionManager {
+    factory: Box<dyn TransportFactory>,
+    ctx: TransportContext,
+}
+
+#[allow(dead_code)]
+impl SingleConnectionManager {
+    pub fn new(factory: Box<dyn TransportFactory>, ctx: TransportContext) -> Self {
+        Self { factory, ctx }
+    }
+}
+
+#[async_trait]
+impl ConnectionManager for SingleConnectionManager {
+    async fn acquire_uplink(&self) -> Result<Box<dyn TransportSession>, ConnError> {
+        self.factory
+            .create(&self.ctx)
+            .await
+            .map_err(|e| ConnError::CreateFailed(e.to_string()))
+    }
+
+    async fn acquire_downlink(&self) -> Result<Box<dyn TransportSession>, ConnError> {
+        self.acquire_uplink().await
+    }
+
+    async fn release(&self, _session: Box<dyn TransportSession>) {}
+
+    fn is_healthy(&self) -> bool {
+        true
+    }
+
+    async fn shutdown(&self) {}
+}
