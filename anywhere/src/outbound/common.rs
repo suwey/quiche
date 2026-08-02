@@ -794,6 +794,51 @@ pub fn create_tls_stream(
     Ok(stream)
 }
 
+/// The async TLS stream type returned by [`create_tls_stream_async`].
+///
+/// Uses `tokio_boring::SslStream` which implements `AsyncRead + AsyncWrite`,
+/// enabling fully async WebSocket I/O without `spawn_blocking`.
+///
+/// Note: TLS fragment splitting is not yet supported on the async path.
+/// When fragment is configured, a warning is logged and fragment is ignored.
+pub type AsyncTlsStream = tokio_boring::SslStream<tokio::net::TcpStream>;
+
+/// Build an async TLS connection using `tokio_boring`.
+///
+/// This mirrors [`create_tls_stream`] but returns a `tokio_boring::SslStream`
+/// that implements `tokio::io::AsyncRead + AsyncWrite`, enabling fully async
+/// WebSocket I/O.
+///
+/// **TLS fragment is not yet supported** on the async path. If `fragment`
+/// is `Some`, a warning is logged and the fragment config is ignored.
+/// Fragment is a DPI evasion feature, not critical for functionality.
+// TODO: Implement AsyncRead/AsyncWrite for FragmentTcpStream<tokio::net::TcpStream>
+// to support TLS fragment on the async path.
+pub async fn create_tls_stream_async(
+    tcp: tokio::net::TcpStream,
+    sni: &str,
+    fp: bool,
+    insecure: bool,
+    _fragment: Option<&FragmentConfig>,
+) -> io::Result<AsyncTlsStream> {
+    use boring::ssl::SslConnector;
+    let mut builder = SslConnector::builder(SslMethod::tls())
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    if fp {
+        apply_fingerprint_to_ctx(&mut builder);
+    }
+    if insecure {
+ builder.set_verify(SslVerifyMode::NONE);
+    }
+    let connector = builder.build();
+    let config = connector
+        .configure()
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    tokio_boring::connect(config, sni, tcp)
+        .await
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+}
+
 /// Resolve a `server` string (IP:port or domain:port) to a `SocketAddr`.
 ///
 /// For domains, retries DNS resolution up to 5 times with 500ms gaps.

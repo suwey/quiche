@@ -25,7 +25,13 @@ use crate::protocol::vless::encode_request_bytes;
 use crate::relay::PacketRelay;
 use crate::relay::StreamRelay;
 use crate::transport::ws::WsConn;
+use crate::transport::ws::WsConnAsync;
+use crate::transport::ws::WsConnAsyncReader;
+use crate::transport::ws::WsConnAsyncWriter;
+use crate::transport::ws::WsFrame;
 use async_trait::async_trait;
+use tokio::io::ReadHalf;
+use tokio::io::WriteHalf;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TryRecvError;
 
@@ -450,6 +456,148 @@ pub(crate) fn build_ws(
     let ssl_stream = create_tls_stream(tcp, host, tls_fp, insecure, fragment)?;
     let ws = WsConn::upgrade(ssl_stream, path, host, &hdrs)?;
     Ok(WsStream::Tls(ws))
+}
+
+// ---------------------------------------------------------------------------
+// Async WS stream — for mless transport (fully async, no spawn_blocking)
+// ---------------------------------------------------------------------------
+
+/// Async WebSocket stream supporting both plain TCP and TLS.
+///
+/// Uses `WsConnAsync` which implements `AsyncRead + AsyncWrite` natively,
+/// eliminating the need for `spawn_blocking` and background reader threads.
+pub(crate) enum WsStreamAsync {
+    Plain(WsConnAsync<tokio::net::TcpStream>),
+    Tls(WsConnAsync<crate::outbound::common::AsyncTlsStream>),
+}
+
+/// Read half of `WsStreamAsync` after splitting.
+pub(crate) enum WsStreamAsyncReader {
+    Plain(WsConnAsyncReader<ReadHalf<tokio::net::TcpStream>>),
+    Tls(WsConnAsyncReader<ReadHalf<crate::outbound::common::AsyncTlsStream>>),
+}
+
+impl WsStreamAsyncReader {
+    pub(crate) async fn recv(&mut self) -> io::Result<WsFrame> {
+        match self {
+            WsStreamAsyncReader::Plain(r) => r.recv().await,
+            WsStreamAsyncReader::Tls(r) => r.recv().await,
+        }
+    }
+}
+
+/// Write half of `WsStreamAsync` after splitting.
+pub(crate) enum WsStreamAsyncWriter {
+    Plain(WsConnAsyncWriter<WriteHalf<tokio::net::TcpStream>>),
+    Tls(WsConnAsyncWriter<WriteHalf<crate::outbound::common::AsyncTlsStream>>),
+}
+
+impl WsStreamAsyncWriter {
+    pub(crate) async fn send(&mut self, data: &[u8]) -> io::Result<()> {
+        match self {
+            WsStreamAsyncWriter::Plain(w) => w.send(data).await,
+            WsStreamAsyncWriter::Tls(w) => w.send(data).await,
+        }
+    }
+
+    pub(crate) async fn close(&mut self) -> io::Result<()> {
+        match self {
+            WsStreamAsyncWriter::Plain(w) => w.close().await,
+            WsStreamAsyncWriter::Tls(w) => w.close().await,
+        }
+    }
+
+    pub(crate) async fn send_pong(&mut self, data: &[u8]) -> io::Result<()> {
+        match self {
+            WsStreamAsyncWriter::Plain(w) => w.send_pong(data).await,
+            WsStreamAsyncWriter::Tls(w) => w.send_pong(data).await,
+        }
+    }
+}
+
+#[allow(dead_code)]
+impl WsStreamAsync {
+    pub(crate) async fn send(&mut self, data: &[u8]) -> io::Result<()> {
+        match self {
+            WsStreamAsync::Plain(c) => c.send(data).await,
+            WsStreamAsync::Tls(c) => c.send(data).await,
+        }
+    }
+
+    pub(crate) async fn recv(&mut self) -> io::Result<Vec<u8>> {
+        match self {
+            WsStreamAsync::Plain(c) => c.recv().await,
+            WsStreamAsync::Tls(c) => c.recv().await,
+        }
+    }
+
+    pub(crate) async fn close(&mut self) -> io::Result<()> {
+        match self {
+            WsStreamAsync::Plain(c) => c.close().await,
+            WsStreamAsync::Tls(c) => c.close().await,
+        }
+    }
+
+    /// Split into a reader and writer half so they can run in separate
+    /// tokio tasks. This enables true concurrent read/write on the
+    /// underlying TLS/TCP stream.
+    pub(crate) fn into_split(self) -> (WsStreamAsyncReader, WsStreamAsyncWriter) {
+        match self {
+            WsStreamAsync::Plain(c) => {
+                let (r, w) = tokio::io::split(c.inner);
+                let reader = WsConnAsyncReader { inner: r, recv_buf: c.recv_buf };
+                let writer = WsConnAsyncWriter { inner: w };
+                (WsStreamAsyncReader::Plain(reader), WsStreamAsyncWriter::Plain(writer))
+            }
+            WsStreamAsync::Tls(c) => {
+                let (r, w) = tokio::io::split(c.inner);
+                let reader = WsConnAsyncReader { inner: r, recv_buf: c.recv_buf };
+                let writer = WsConnAsyncWriter { inner: w };
+                (WsStreamAsyncReader::Tls(reader), WsStreamAsyncWriter::Tls(writer))
+            }
+        }
+    }
+}
+
+/// Build an async WebSocket connection over TCP (optional TLS).
+///
+/// This mirrors [`build_ws`] but uses `tokio_boring` for async TLS and
+/// `WsConnAsync` for async WebSocket framing. The entire handshake is
+/// fully async — no `spawn_blocking`.
+///
+/// **TLS fragment** is not yet supported on the async path. If `fragment`
+/// is `Some`, a warning is logged and fragment is ignored.
+pub(crate) async fn build_ws_async(
+    tcp: tokio::net::TcpStream,
+    tls_server: &str,
+    insecure: bool,
+    tls_fp: bool,
+    fragment: Option<&FragmentConfig>,
+    path: &str,
+    headers: &HashMap<String, String>,
+) -> io::Result<WsStreamAsync> {
+    let host = tls_server;
+    let hdrs: Vec<(&str, &str)> = headers
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    if tls_server.is_empty() {
+        // Plain WS — no TLS
+        let ws = WsConnAsync::upgrade(tcp, path, host, &hdrs).await?;
+        return Ok(WsStreamAsync::Plain(ws));
+    }
+    // TODO: TLS fragment not yet supported with async TLS
+    if fragment.is_some() {
+        log::warn!(
+            "TLS fragment is not yet supported with async WebSocket; ignoring fragment config"
+        );
+    }
+    let ssl_stream = crate::outbound::common::create_tls_stream_async(
+        tcp, host, tls_fp, insecure, fragment,
+    )
+    .await?;
+    let ws = WsConnAsync::upgrade(ssl_stream, path, host, &hdrs).await?;
+    Ok(WsStreamAsync::Tls(ws))
 }
 
 // ---------------------------------------------------------------------------

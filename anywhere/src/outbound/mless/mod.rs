@@ -312,8 +312,9 @@ impl StreamRelay for MlessStreamRelay {
     async fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         if self.read_pos >= self.read_buf.len() {
             // Two timeouts:
-            // - First byte (`ever_received=false`): 10s. ClientHello is in
-            //   flight; if no response in 10s the upstream is unreachable.
+            // - First byte (`ever_received=false`): 30s. CF Worker cold
+            //   start / concurrency limits can delay first response by
+            //   10-40s. 30s balances patience vs. leaking stale streams.
             // - Subsequent reads (`ever_received=true`): 300s. This is an
             //   idle period in an established TLS stream (HTTP keep-alive,
             //   HTTP/2 PING gap, WebSocket idle, etc.). Hermes side has a
@@ -323,7 +324,7 @@ impl StreamRelay for MlessStreamRelay {
             let read_timeout = if self.ever_received {
                 std::time::Duration::from_secs(300)
             } else {
-                std::time::Duration::from_secs(10)
+                std::time::Duration::from_secs(30)
             };
             match tokio::time::timeout(read_timeout, self.rx.recv()).await {
                 Ok(Some(data)) => {
@@ -373,7 +374,7 @@ impl StreamRelay for MlessStreamRelay {
                     log::debug!(
                         "mless: stream#{} timeout ({}s), closing",
                         self.stream_id,
-                        if self.ever_received { 300 } else { 10 },
+                        if self.ever_received { 300 } else { 30 },
                     );
                     if let Some(mux) = self.multiplexer.upgrade() {
                         mux.close_stream(self.stream_id).await;

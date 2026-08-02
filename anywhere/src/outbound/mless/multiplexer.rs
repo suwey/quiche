@@ -289,9 +289,19 @@ impl MlessMultiplexer {
         );
 
         let mut inner = self.inner.lock();
-        inner.active_streams.insert(stream_id);
-        if let Some(tx) = inner.streams.get(&stream_id) {
+        // Only insert into active_streams if the stream channel still exists.
+        // If the stream was already closed (CLOSE sent/received), the channel
+        // is gone and we should not re-activate it.
+        if let Some(tx) = inner.streams.get(&stream_id).cloned() {
+            inner.active_streams.insert(stream_id);
             let _ = tx.send(payload);
+        } else {
+            // Stream already closed — silently discard late data from server.
+            log::debug!(
+                "mless: DATA stream#{} {}B discarded (stream closed)",
+                stream_id,
+                payload.len(),
+            );
         }
     }
 
@@ -351,6 +361,11 @@ async fn io_loop(
     let _session = &mut session;
 
     let mut buf = vec![0u8; 16 * 1024];
+    // Accumulation buffer for cross-read frame boundaries.
+    // When a WS message is larger than `buf` or a mless frame spans
+    // two WS messages, we need to buffer the incomplete tail and
+    // prepend it to the next read.
+    let mut accum: Vec<u8> = Vec::new();
 
     log::debug!("mless: io_loop ready, entering select loop");
 
@@ -400,18 +415,24 @@ async fn io_loop(
                         return;
                     }
                     Ok(n) => {
-                        let data = &buf[..n];
+                        // Prepend any leftover from previous read.
+                        if !accum.is_empty() {
+                            accum.extend_from_slice(&buf[..n]);
+                        }
+                        let data: &[u8] = if accum.is_empty() {
+                            &buf[..n]
+                        } else {
+                            &accum[..]
+                        };
+
                         let mut offset = 0;
                         while offset < data.len() {
                             let (stream_id, flags, payload, consumed) =
                                 match decode_frame(&data[offset..]) {
                                     Some(v) => v,
                                     None => {
-                                        log::warn!(
-                                            "mless: invalid frame at offset {} in data len {}",
-                                            offset,
-                                            data.len(),
-                                        );
+                                        // Incomplete frame — save the
+                                        // remaining bytes for next read.
                                         break;
                                     }
                                 };
@@ -435,6 +456,20 @@ async fn io_loop(
                             };
                             m.on_frame(stream_id, flags, decrypted);
                             offset += consumed;
+                        }
+
+                        // Save unconsumed tail for next iteration.
+                        if offset < data.len() {
+                            if data.as_ptr() == accum.as_ptr() {
+                                // data points to accum — drain consumed part.
+                                accum.drain(..offset);
+                            } else {
+                                // data points to buf — copy tail to accum.
+                                accum = data[offset..].to_vec();
+                            }
+                        } else {
+                            // All consumed — clear accum.
+                            accum.clear();
                         }
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock
