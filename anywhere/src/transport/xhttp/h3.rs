@@ -102,9 +102,8 @@ impl H3Session {
         if !self.config.no_grpc_header {
             headers.push(quiche::h3::Header::new(b"content-type", b"application/grpc"));
         }
-        if !self.config.no_sse_header {
-            headers.push(quiche::h3::Header::new(b"x-accel-buffering", b"no"));
-        }
+        // Note: no_sse_header controls the server-side SSE response header
+        // (Content-Type: text/event-stream), not a client request header.
         headers
     }
 }

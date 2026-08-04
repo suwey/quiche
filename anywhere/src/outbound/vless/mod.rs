@@ -586,12 +586,7 @@ pub(crate) async fn build_ws_async(
         let ws = WsConnAsync::upgrade(tcp, path, host, &hdrs).await?;
         return Ok(WsStreamAsync::Plain(ws));
     }
-    // TODO: TLS fragment not yet supported with async TLS
-    if fragment.is_some() {
-        log::warn!(
-            "TLS fragment is not yet supported with async WebSocket; ignoring fragment config"
-        );
-    }
+    // TLS fragment is now supported via AsyncFragmentStream in create_tls_stream_async.
     let ssl_stream = crate::outbound::common::create_tls_stream_async(
         tcp, host, tls_fp, insecure, fragment,
     )

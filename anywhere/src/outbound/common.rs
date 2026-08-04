@@ -796,45 +796,40 @@ pub fn create_tls_stream(
 
 /// The async TLS stream type returned by [`create_tls_stream_async`].
 ///
-/// Uses `tokio_boring::SslStream` which implements `AsyncRead + AsyncWrite`,
-/// enabling fully async WebSocket I/O without `spawn_blocking`.
-///
-/// Note: TLS fragment splitting is not yet supported on the async path.
-/// When fragment is configured, a warning is logged and fragment is ignored.
-pub type AsyncTlsStream = tokio_boring::SslStream<tokio::net::TcpStream>;
+/// Uses `tokio_boring::SslStream` wrapped around `AsyncFragmentStream`
+/// for TLS fragment support, implementing `AsyncRead + AsyncWrite`.
+pub type AsyncTlsStream = tokio_boring::SslStream<
+    crate::obfuscation::fragment::AsyncFragmentStream<tokio::net::TcpStream>,
+>;
 
 /// Build an async TLS connection using `tokio_boring`.
 ///
 /// This mirrors [`create_tls_stream`] but returns a `tokio_boring::SslStream`
 /// that implements `tokio::io::AsyncRead + AsyncWrite`, enabling fully async
-/// WebSocket I/O.
-///
-/// **TLS fragment is not yet supported** on the async path. If `fragment`
-/// is `Some`, a warning is logged and the fragment config is ignored.
-/// Fragment is a DPI evasion feature, not critical for functionality.
-// TODO: Implement AsyncRead/AsyncWrite for FragmentTcpStream<tokio::net::TcpStream>
-// to support TLS fragment on the async path.
+/// WebSocket I/O. TLS fragment splitting is supported via `AsyncFragmentStream`.
 pub async fn create_tls_stream_async(
     tcp: tokio::net::TcpStream,
     sni: &str,
     fp: bool,
     insecure: bool,
-    _fragment: Option<&FragmentConfig>,
+    fragment: Option<&FragmentConfig>,
 ) -> io::Result<AsyncTlsStream> {
     use boring::ssl::SslConnector;
+    use crate::obfuscation::fragment::AsyncFragmentStream;
     let mut builder = SslConnector::builder(SslMethod::tls())
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
     if fp {
         apply_fingerprint_to_ctx(&mut builder);
     }
     if insecure {
- builder.set_verify(SslVerifyMode::NONE);
+        builder.set_verify(SslVerifyMode::NONE);
     }
     let connector = builder.build();
     let config = connector
         .configure()
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-    tokio_boring::connect(config, sni, tcp)
+    let frag_stream = AsyncFragmentStream::new(tcp, fragment);
+    tokio_boring::connect(config, sni, frag_stream)
         .await
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
 }

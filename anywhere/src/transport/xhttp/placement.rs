@@ -34,6 +34,9 @@ impl PlacementConfig {
         seq: Option<u64>,
     ) -> (String, Vec<(String, String)>) {
         let mut path = base_path.trim_end_matches('/').to_string();
+        if path.is_empty() {
+            path = "/".to_string();
+        }
         let mut query_parts: Vec<String> = Vec::new();
         let mut headers: Vec<(String, String)> = Vec::new();
         let mut cookie_parts: Vec<String> = Vec::new();

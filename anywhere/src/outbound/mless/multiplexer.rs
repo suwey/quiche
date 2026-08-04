@@ -371,6 +371,7 @@ async fn io_loop(
 
     loop {
         tokio::select! {
+            biased;
             // Outgoing: plaintext from channel -> encrypt -> frame -> transport
             msg = ws_rx.recv() => {
                 let Some(m) = mux.upgrade() else { return; };

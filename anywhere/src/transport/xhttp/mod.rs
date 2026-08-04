@@ -22,6 +22,8 @@ pub mod xmux;
 pub mod h3;
 use std::io;
 use std::sync::Arc;
+use std::future::Future;
+use std::pin::Pin;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -32,7 +34,7 @@ use tokio::sync::mpsc;
 use crate::transport::{DownlinkReader, TransportSession, UplinkWriter};
 
 use config::{resolve_http_version, resolve_mode, XhttpConfig, XhttpMode};
-use h2::{make_stream_body, H2SendRequest, ReqBody};
+use h2::{make_stream_body, H2SendRequest, HttpSendRequest, ReqBody};
 use padding::XPaddingMiddleware;
 use upload_queue::UploadQueue;
 use placement::PlacementConfig;
@@ -51,7 +53,7 @@ pub struct XhttpSession {
     mode: XhttpMode,
 
     /// H2 send-request handle (cloned per stream; `None` after `close()`).
-    send_req: Option<H2SendRequest>,
+    send_req: Option<HttpSendRequest>,
 
     /// Response future stored between `uplink()` and `downlink()`.
     response_rx: Option<tokio::sync::oneshot::Receiver<Result<hyper::Response<hyper::body::Incoming>, hyper::Error>>>,
@@ -66,7 +68,7 @@ pub struct XhttpSession {
 impl XhttpSession {
     /// Create a session from a pre-built H2 `SendRequest` (for testing
     /// or when the connection is managed externally).
-    pub fn from_send_request(config: Arc<XhttpConfig>, send_req: H2SendRequest) -> Self {
+    pub fn from_send_request(config: Arc<XhttpConfig>, send_req: HttpSendRequest) -> Self {
         let padding = config.padding.clone().map(XPaddingMiddleware::new);
         let placement = PlacementConfig {
             session_id_placement: config.session_id_placement,
@@ -118,13 +120,18 @@ impl XhttpSession {
         for (k, v) in &extra_headers {
             builder = builder.header(k, v);
         }
-        // Decoy headers (disabled by no_grpc_header / no_sse_header)
+        // Decoy headers (disabled by no_grpc_header)
         if !self.config.no_grpc_header {
             builder = builder.header("Content-Type", "application/grpc");
         }
-        if !self.config.no_sse_header {
-            builder = builder.header("X-Accel-Buffering", "no");
-        }
+        // HTTP/1.1 requires Transfer-Encoding: chunked for streaming
+        // request bodies. hyper's H1 client does not auto-add it for
+        // custom Body types, causing the server to wait for body EOF.
+        // H2 will strip this header (per RFC 7540 §8.1.2.2).
+        builder = builder.header("Transfer-Encoding", "chunked");
+        // Note: no_sse_header controls the server-side SSE response header
+        // (Content-Type: text/event-stream), not a client request header.
+        // X-Accel-Buffering is a server response header, not a request header.
 
         if let Some(pad) = &self.padding {
             let mut pad_headers = Vec::new();
@@ -177,9 +184,13 @@ impl TransportSession for XhttpSession {
             XhttpMode::PacketUp => {
                 // Packet-up: return a PacketUplinkWriter that chunks data
                 // into separate POSTs with seq
-                let send_req_clone = self.send_req.as_ref()
-                    .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "session closed"))?
-                    .clone();
+                let send_req_clone = match self.send_req.as_ref() {
+                    Some(HttpSendRequest::H2(sr)) => sr.clone(),
+                    _ => return Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "packet-up requires HTTP/2",
+                    )),
+                };
 
                 Ok(Box::new(PacketUplinkWriter {
                     send_req: send_req_clone,
@@ -205,25 +216,19 @@ impl TransportSession for XhttpSession {
     async fn downlink(&mut self) -> io::Result<Box<dyn DownlinkReader>> {
         match self.mode {
             XhttpMode::StreamOne => {
-                // Stream-one: use the response from uplink()
+                // Stream-one: return a lazy reader that awaits the response
+                // on first read(). This avoids blocking downlink() while the
+                // request body is still being sent - critical for HTTP/1.1
+                // where the server won't respond until it receives body data.
                 let response_rx = self.response_rx.take().ok_or_else(|| {
                     io::Error::new(io::ErrorKind::InvalidInput, "uplink() must be called first")
                 })?;
-
-                let response = response_rx
-                    .await
-                    .map_err(|_| io::Error::new(io::ErrorKind::ConnectionReset, "response task dropped"))?
-                    .map_err(|e| io::Error::new(io::ErrorKind::ConnectionReset, e))?;
-
-                if let Some(pad) = &self.padding {
-                    if !pad.validate_response(response.headers()) {
-                        log::warn!("xhttp: response XPadding validation failed");
-                    }
-                }
-
                 Ok(Box::new(StreamDownlinkReader {
-                    body: response.into_body(),
+                    response_rx: Some(response_rx),
+                    response_fut: None,
+                    body: None,
                     read_buf: Vec::new(),
+                    padding: self.padding.clone(),
                 }))
             }
             XhttpMode::StreamUp | XhttpMode::PacketUp => {
@@ -247,8 +252,11 @@ impl TransportSession for XhttpSession {
                 }
 
                 Ok(Box::new(StreamDownlinkReader {
-                    body: response.into_body(),
+                    response_rx: None,
+                    response_fut: None,
+                    body: Some(response.into_body()),
                     read_buf: Vec::new(),
+                    padding: None,
                 }))
             }
             XhttpMode::Auto => {
@@ -303,10 +311,13 @@ impl UplinkWriter for StreamUplinkWriter {
 
 /// Reads downlink data from the HTTP response body.
 pub struct StreamDownlinkReader {
-    body: hyper::body::Incoming,
+    response_rx: Option<tokio::sync::oneshot::Receiver<Result<hyper::Response<hyper::body::Incoming>, hyper::Error>>>,
+    /// Cached response future for cancel-safe lazy init.
+    response_fut: Option<Pin<Box<dyn Future<Output = io::Result<hyper::body::Incoming>> + Send>>>,
+    body: Option<hyper::body::Incoming>,
     read_buf: Vec<u8>,
+    padding: Option<XPaddingMiddleware>,
 }
-
 #[async_trait]
 impl DownlinkReader for StreamDownlinkReader {
     async fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
@@ -318,9 +329,37 @@ impl DownlinkReader for StreamDownlinkReader {
             return Ok(n);
         }
 
+        // Lazy init: await response on first read (cancel-safe via cached future)
+        if self.body.is_none() && self.response_fut.is_none() {
+            let response_rx = self.response_rx.take()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::ConnectionReset, "no response available"))?;
+            let padding = self.padding.clone();
+            self.response_fut = Some(Box::pin(async move {
+                let response = response_rx
+                    .await
+                    .map_err(|_| io::Error::new(io::ErrorKind::ConnectionReset, "response task dropped"))?
+                    .map_err(|e| io::Error::new(io::ErrorKind::ConnectionReset, e))?;
+                log::debug!("xhttp: response status={}", response.status());
+                if let Some(pad) = &padding {
+                    if !pad.validate_response(response.headers()) {
+                        log::warn!("xhttp: response XPadding validation failed");
+                    }
+                }
+                Ok(response.into_body())
+            }));
+        }
+
+        if let Some(fut) = self.response_fut.as_mut() {
+            let body = fut.as_mut().await?;
+            self.body = Some(body);
+            self.response_fut = None;
+        }
+
         // Read the next data frame from the response body
+        let body = self.body.as_mut()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::ConnectionReset, "no body"))?;
         loop {
-            match self.body.frame().await {
+            match body.frame().await {
                 None => return Ok(0), // EOF
                 Some(Ok(frame)) => {
                     if let Some(data) = frame.data_ref() {
@@ -387,9 +426,8 @@ impl PacketUplinkWriter {
         if !self.config.no_grpc_header {
             builder = builder.header("Content-Type", "application/grpc");
         }
-        if !self.config.no_sse_header {
-            builder = builder.header("X-Accel-Buffering", "no");
-        }
+        // Note: no_sse_header controls the server-side SSE response header
+        // (Content-Type: text/event-stream), not a client request header.
         if let Some(pad) = &self.padding {
             let mut pad_headers = Vec::new();
             pad.apply_to_request(&path, &mut pad_headers);
@@ -499,7 +537,7 @@ mod tests {
     }
 
     /// Connect a plain H2 client (no TLS) for testing.
-    async fn connect_plain_h2(addr: std::net::SocketAddr) -> H2SendRequest {
+    async fn connect_plain_h2(addr: std::net::SocketAddr) -> HttpSendRequest {
         let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
         let io = TokioIo::new(tcp);
         let exec = TokioExecutor::new();

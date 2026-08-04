@@ -16,7 +16,9 @@ use crate::obfuscation::range::Range;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum XhttpMode {
-    /// Automatically select the best mode (stream-one for M3).
+    /// Automatically select the best mode.
+    /// Resolves to `PacketUp` for non-REALITY (matching Xray-core),
+    /// or `StreamOne` when used with REALITY.
     #[default]
     Auto,
     /// Single POST: body=uplink, response body=downlink (symmetric).
@@ -200,7 +202,7 @@ pub struct XhttpConfig {
     #[serde(default = "default_path")]
     pub path: String,
 
-    /// Transport mode (default: auto = stream-one).
+    /// Transport mode (default: auto = packet-up, matching Xray-core).
     #[serde(default)]
     pub mode: XhttpMode,
 
@@ -220,7 +222,9 @@ pub struct XhttpConfig {
     #[serde(default)]
     pub no_grpc_header: bool,
 
-    /// Suppress SSE headers (default: false).
+    /// Whether the server is expected to suppress SSE response header
+    /// (Content-Type: text/event-stream). Client-side hint only; does not
+    /// affect request headers sent by anywhere. (default: false)
     #[serde(default)]
     pub no_sse_header: bool,
 
@@ -301,10 +305,16 @@ impl Default for XhttpConfig {
         }
     }
 }
-/// Resolve the effective mode: `Auto` becomes `StreamOne`.
+/// Resolve the effective mode.
+///
+/// `Auto` resolves to `PacketUp` to match Xray-core behavior, where
+/// `mode: auto` (or empty) resolves to `packet-up` for non-REALITY
+/// connections. When using REALITY, Xray resolves to `stream-one`,
+/// but that is determined by the caller based on transport settings,
+/// not here.
 pub fn resolve_mode(cfg: &XhttpConfig) -> XhttpMode {
     match cfg.mode {
-        XhttpMode::Auto => XhttpMode::StreamOne,
+        XhttpMode::Auto => XhttpMode::PacketUp,
         m => m,
     }
 }
@@ -342,8 +352,9 @@ mod tests {
 
     #[test]
     fn resolve_auto_mode() {
+        // Auto resolves to PacketUp to match Xray-core non-REALITY behavior
         let cfg = XhttpConfig { mode: XhttpMode::Auto, ..Default::default() };
-        assert_eq!(resolve_mode(&cfg), XhttpMode::StreamOne);
+        assert_eq!(resolve_mode(&cfg), XhttpMode::PacketUp);
 
         let cfg = XhttpConfig { mode: XhttpMode::StreamUp, ..Default::default() };
         assert_eq!(resolve_mode(&cfg), XhttpMode::StreamUp);

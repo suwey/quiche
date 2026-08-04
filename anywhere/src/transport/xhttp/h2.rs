@@ -15,6 +15,7 @@ use bytes::Bytes;
 use super::config::HttpVersionPref;
 use http_body::{Body, Frame};
 use hyper::client::conn::http2;
+use hyper::client::conn::http1;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use tokio::sync::mpsc;
 use tokio_rustls::rustls;
@@ -42,7 +43,6 @@ impl Body for ChannelBody {
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Bytes>, io::Error>>> {
-        // ChannelBody is Unpin (mpsc::Receiver is Unpin)
         let this = self.get_mut();
         this.rx.poll_recv(cx)
     }
@@ -51,7 +51,23 @@ impl Body for ChannelBody {
 /// The streaming request body type used by all XHTTP requests.
 pub type ReqBody = ChannelBody;
 
-/// H2 send-request handle - cloned per-stream from a shared connection.
+/// Unified send-request handle for HTTP/1.1 and HTTP/2.
+pub enum HttpSendRequest {
+    H1(http1::SendRequest<ReqBody>),
+    H2(http2::SendRequest<ReqBody>),
+}
+
+impl HttpSendRequest {
+    pub fn send_request(
+        &mut self, req: http::Request<ReqBody>,
+    ) -> Pin<Box<dyn Future<Output = Result<hyper::Response<hyper::body::Incoming>, hyper::Error>> + Send>> {
+        match self {
+            HttpSendRequest::H1(s) => Box::pin(s.send_request(req)),
+            HttpSendRequest::H2(s) => Box::pin(s.send_request(req)),
+        }
+    }
+}
+/// H2-only send-request handle (for packet-up which needs Clone).
 pub type H2SendRequest = http2::SendRequest<ReqBody>;
 
 // ---------------------------------------------------------------------------
@@ -139,7 +155,7 @@ pub async fn connect(
     host: &str,
     insecure: bool,
     http_version: HttpVersionPref,
-) -> io::Result<H2SendRequest> {
+) -> io::Result<HttpSendRequest> {
     // 1. TCP connect (bypasses TUN via SO_MARK / VpnService.protect)
     let tcp = crate::outbound::common::connect_tcp_bypass(addr).await?;
     let _ = tcp.set_nodelay(true);
@@ -182,10 +198,17 @@ pub async fn connect(
     }
 
     if !expect_h2 {
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "HTTP/1.1 not yet implemented (use http_version = \"auto\" or \"http2\")",
-        ));
+        let io = TokioIo::new(tls);
+        let (send_req, conn) = http1::handshake(io)
+            .await
+            .map_err(|e| io::Error::new(io::ErrorKind::ConnectionRefused, e))?;
+        let host_owned = host.to_string();
+        tokio::spawn(async move {
+            if let Err(e) = conn.await {
+                log::debug!("xhttp: H1 connection to {host_owned} closed: {e}");
+            }
+        });
+        return Ok(HttpSendRequest::H1(send_req));
     }
 
     // 3. H2 handshake
@@ -203,7 +226,7 @@ pub async fn connect(
         }
     });
 
-    Ok(send_req)
+    Ok(HttpSendRequest::H2(send_req))
 }
 
 /// Create a streaming request body backed by a tokio mpsc channel.

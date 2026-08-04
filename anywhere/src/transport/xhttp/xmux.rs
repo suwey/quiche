@@ -23,7 +23,7 @@ use crate::connection::{ConnError, ConnectionManager};
 use crate::transport::TransportSession;
 
 use super::config::XhttpConfig;
-use super::h2::H2SendRequest;
+use super::h2::HttpSendRequest;
 use super::XhttpSession;
 
 /// H2 connection pool manager for XHTTP transport.
@@ -36,7 +36,7 @@ pub struct XmuxConnectionManager {
     addr: std::net::SocketAddr,
     /// Canonical SendRequest kept alive to prevent h2 idle GoAway.
     /// Cloned per-session; `None` when not yet connected or after shutdown.
-    pub(crate) canonical: Mutex<Option<H2SendRequest>>,
+    pub(crate) canonical: Mutex<Option<HttpSendRequest>>,
     /// Set to `true` by `shutdown()` to mark the manager as permanently closed.
     shutdown: Mutex<bool>,
 }
@@ -67,13 +67,20 @@ impl XmuxConnectionManager {
     }
 
     /// Get a `SendRequest` from the pool, or create a new connection.
-    async fn get_or_connect(&self) -> Result<H2SendRequest, ConnError> {
-        // Fast path: clone the canonical handle
+    async fn get_or_connect(&self) -> Result<HttpSendRequest, ConnError> {
+        // Fast path: clone the canonical handle (H2 only - H1 is not Clone)
         {
             let guard = self.canonical.lock();
             if let Some(sr) = &*guard {
-                if !sr.is_closed() {
-                    return Ok(sr.clone());
+                match sr {
+                    HttpSendRequest::H2(h2_sr) => {
+                        if !h2_sr.is_closed() {
+                            return Ok(HttpSendRequest::H2(h2_sr.clone()));
+                        }
+                    }
+                    HttpSendRequest::H1(_) => {
+                        // H1 SendRequest is not Clone; always create new
+                    }
                 }
             }
         }
@@ -83,9 +90,12 @@ impl XmuxConnectionManager {
             .await
             .map_err(|e| ConnError::CreateFailed(e.to_string()))?;
 
-        // Store as canonical (replaces any dead connection)
-        let mut guard = self.canonical.lock();
-        *guard = Some(send_req.clone());
+        // Store H2 as canonical (H1 can't be cloned for reuse)
+        if let HttpSendRequest::H2(h2_sr) = &send_req {
+            let mut guard = self.canonical.lock();
+            *guard = Some(HttpSendRequest::H2(h2_sr.clone()));
+        }
+
         Ok(send_req)
     }
 }
@@ -115,7 +125,10 @@ impl ConnectionManager for XmuxConnectionManager {
         }
         let guard = self.canonical.lock();
         match &*guard {
-            Some(sr) => !sr.is_closed(),
+            Some(sr) => match sr {
+                HttpSendRequest::H2(h2_sr) => !h2_sr.is_closed(),
+                HttpSendRequest::H1(_) => false,
+            },
             None => true, // Not yet connected - assume healthy
         }
     }

@@ -100,6 +100,17 @@ impl MlessOutboundClient {
                 if xhttp_config.host.is_empty() { xhttp_config.host = tls_server.clone(); }
                 if xhttp_config.port == 0 { xhttp_config.port = addr.port(); }
                 xhttp_config.insecure = cfg.insecure;
+                // mless requires a bidirectional streaming transport (uplink POST
+                // body + downlink response body). Force stream-one regardless of
+                // the user's mode setting, since packet-up/stream-up would break
+                // the mless frame io_loop.
+                xhttp_config.mode = crate::transport::xhttp::config::XhttpMode::StreamOne;
+                // Hermes router intercepts UUID-like paths as logout
+                // (router.ts: uuidRegex.test(访问路径) -> 302 redirect).
+                // session_id is a UUID, so placing it in the path triggers
+                // a 302. Force query placement to keep the path clean.
+                xhttp_config.session_id_placement =
+                    crate::transport::xhttp::config::SessionPlacement::Query;
                 let xhttp_config = Arc::new(xhttp_config);
                 if xhttp_config.http_version == HttpVersionPref::Http3 {
                     use crate::transport::xhttp::h3::H3ConnectionManager;
