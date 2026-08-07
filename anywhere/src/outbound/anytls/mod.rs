@@ -2,7 +2,6 @@
 // TLS-based multiplexed proxy protocol with traffic padding.
 
 use std::collections::HashMap;
-use std::io::Read;
 use std::io::Write;
 use std::net::Shutdown;
 use std::sync::Arc;
@@ -296,12 +295,17 @@ impl SessionPoolConfig {
 struct SessionPoolEntry {
     handle: SessionHandle,
     idle_since: Option<std::time::Instant>,
+    /// Monotonic session sequence number (per pool). The protocol prefers
+    /// reusing the newest (highest-Seq) idle session.
+    seq: u64,
 }
 
 struct SessionPool {
     entries: StdMutex<Vec<SessionPoolEntry>>,
     config: SessionPoolConfig,
     cleanup_abort: StdMutex<Option<tokio::task::AbortHandle>>,
+    /// Source of monotonic session sequence numbers.
+    next_seq: StdMutex<u64>,
 }
 
 impl SessionPool {
@@ -310,11 +314,28 @@ impl SessionPool {
             entries: StdMutex::new(Vec::new()),
             config,
             cleanup_abort: StdMutex::new(None),
+            next_seq: StdMutex::new(0),
         })
     }
 
+    /// Allocate the next monotonic session Seq for this pool.
+    fn alloc_seq(&self) -> u64 {
+        let mut g = self.next_seq.lock().unwrap();
+        let s = *g;
+        *g += 1;
+        s
+    }
+
     /// Get a live session from the pool, or create one via `factory`.
-    /// Dead sessions are purged lazily.
+    /// Max concurrent streams multiplexed onto one session before we open a
+    /// fresh one. Bounds head-of-line blocking without defeating reuse.
+    const MAX_STREAMS_PER_SESSION: u32 = 16;
+
+    /// Get a live session from the pool, or create one via `factory`.
+    /// Dead sessions are purged lazily. Per the protocol, we reuse the
+    /// newest (highest Seq) live session for multiplexing — whether it is
+    /// currently idle or already carrying streams. Only once a session hits
+    /// `MAX_STREAMS_PER_SESSION` do we open a new one.
     fn acquire(
         &self, factory: impl FnOnce() -> std::io::Result<SessionHandle>,
     ) -> std::io::Result<SessionHandle> {
@@ -323,21 +344,34 @@ impl SessionPool {
         // Remove dead sessions.
         entries.retain(|e| !e.handle.is_closed());
 
-        // Return the first live session (mark as in-use).
-        if let Some(entry) = entries.first_mut() {
-            entry.idle_since = None;
+        // Prefer the highest-Seq live session that still has headroom.
+        let mut best: Option<usize> = None;
+        for (i, entry) in entries.iter().enumerate() {
+            if entry.handle.inner.active_streams.load(SeqCst) >=
+                Self::MAX_STREAMS_PER_SESSION
+            {
+                continue;
+            }
+            match best {
+                Some(bi) if entry.seq <= entries[bi].seq => {},
+                _ => best = Some(i),
+            }
+        }
+        if let Some(i) = best {
+            entries[i].idle_since = None;
             return Ok(SessionHandle {
-                inner: entry.handle.inner.clone(),
+                inner: entries[i].handle.inner.clone(),
             });
         }
 
-        // Pool empty — create a new session.
+        // No live session with headroom — create a new session.
         let handle = factory()?;
         entries.push(SessionPoolEntry {
             handle: SessionHandle {
                 inner: handle.inner.clone(),
             },
             idle_since: None,
+            seq: self.alloc_seq(),
         });
         Ok(handle)
     }
@@ -395,6 +429,7 @@ impl SessionPool {
                             inner: handle.inner.clone(),
                         },
                         idle_since: Some(std::time::Instant::now()),
+                        seq: self.alloc_seq(),
                     });
                     log::debug!(
                         "anytls pool: replenished (now {} sessions)",
@@ -583,12 +618,19 @@ fn run_io_loop(
     mut control_rx: mpsc::UnboundedReceiver<ControlFrame>,
     mut outbound_rx: mpsc::UnboundedReceiver<OutboundMsg>,
     padding_cache: Arc<StdMutex<PaddingCache>>,
+    // Per protocol, packet #1 must carry cmdSettings AND the first
+    // stream's SYN+PSH in a single TLS write. We defer the settings frame
+    // into the loop and combine it with the first OpenStream.
+    mut initial_settings: Option<Vec<u8>>,
 ) {
     stream
         .get_mut()
         .get_mut()
         .set_read_timeout(Some(Duration::from_secs(3)))
         .ok();
+    // Packet counter == number of client TLS writes. The auth write is
+    // packet #0 (sent raw, no padding). The first write inside the loop
+    // (settings + first SYN+PSH) is packet #1.
     let mut pkt_counter = 1u32;
     log::debug!("io thread started");
     loop {
@@ -625,6 +667,11 @@ fn run_io_loop(
                         if let Ok(psh) = encode_frame(CMD_PSH, sid, &target) {
                             let mut combined =
                                 Vec::with_capacity(syn.len() + psh.len());
+                            // Protocol: packet #1 must carry cmdSettings AND
+                            // the first stream's SYN+PSH in one TLS write.
+                            if let Some(settings) = initial_settings.take() {
+                                combined.extend_from_slice(&settings);
+                            }
                             combined.extend_from_slice(&syn);
                             combined.extend_from_slice(&psh);
                             let pkt = pkt_counter;
@@ -677,7 +724,9 @@ fn run_io_loop(
                     cmd_name(cmd),
                     data.len()
                 );
-                pkt_counter += 1;
+                // NOTE: do NOT advance pkt_counter here. The padding packet
+                // index is defined as the client's TLS write count, and reads
+                // are the server's packets.
                 handle_blocking_frame(
                     cmd,
                     sid,
@@ -690,6 +739,14 @@ fn run_io_loop(
                 if e.kind() == std::io::ErrorKind::WouldBlock ||
                     e.kind() == std::io::ErrorKind::TimedOut =>
             {
+                // Do NOT send a heartbeat before the mandatory settings+
+                // first-SYN packet (#1) has gone out, or it would steal that
+                // index and shift every subsequent padding packet — which
+                // the server counts by client write number, causing a
+                // frame-size desync (garbage frames, stalls).
+                if initial_settings.is_some() {
+                    continue;
+                }
                 if let Ok(frame) = encode_frame(CMD_HEART_REQUEST, 0, &[]) {
                     let pkt = pkt_counter;
                     pkt_counter += 1;
@@ -759,6 +816,7 @@ impl AnyTlsOutboundClient {
             tcp_pool.entries.lock().unwrap().push(SessionPoolEntry {
                 handle,
                 idle_since: Some(std::time::Instant::now()),
+                seq: tcp_pool.alloc_seq(),
             });
         }
 
@@ -907,71 +965,32 @@ impl AnyTlsOutboundClient {
             }
             stream.flush().ok();
 
-            // Settings (sent once per session)
+            // Build the settings frame (sent once per session). Per protocol,
+            // packet #1 must carry cmdSettings AND the first stream's SYN+PSH
+            // in a single TLS write, so we hand it to the IO loop to merge
+            // with the first OpenStream instead of writing it separately.
             let settings_md5 = padding_cache.lock().unwrap().md5().to_string();
             let settings = format!(
                 "v=2\nclient=anywhere/0.1.0\npadding-md5={}",
                 settings_md5
             );
-            let mut settings_buf = Vec::new();
+            let mut initial_settings: Option<Vec<u8>> = None;
             if let Ok(frame) = encode_frame(CMD_SETTINGS, 0, settings.as_bytes())
             {
-                settings_buf.extend_from_slice(&frame);
+                initial_settings = Some(frame);
             }
-            if let Err(e) =
-                write_padded(&mut stream, settings_buf, &inner_clone.padding, 0)
-            {
-                log::error!("anytls settings: {e}");
-                inner_clone.closed.store(true, SeqCst);
-                return;
-            }
-            log::debug!("anytls settings sent");
+            log::debug!("anytls settings built");
 
-            // Read settings response
-            let mut resp = [0u8; 4096];
-            match stream.read(&mut resp) {
-                Ok(n) => {
-                    log::debug!("anytls settings response: {} bytes", n);
-                    let mut off = 0;
-                    while off + 7 <= n {
-                        let cmd = resp[off];
-                        let sid_val = u32::from_be_bytes([
-                            resp[off + 1],
-                            resp[off + 2],
-                            resp[off + 3],
-                            resp[off + 4],
-                        ]);
-                        let len =
-                            u16::from_be_bytes([resp[off + 5], resp[off + 6]])
-                                as usize;
-                        if off + 7 + len > n {
-                            break;
-                        }
-                        let d = resp[off + 7..off + 7 + len].to_vec();
-                        handle_blocking_frame(
-                            cmd,
-                            sid_val,
-                            d,
-                            &inner_clone,
-                            Some(&padding_cache),
-                        );
-                        off += 7 + len;
-                    }
-                },
-                Err(e) => {
-                    log::error!("anytls settings read: {e}");
-                    inner_clone.closed.store(true, SeqCst);
-                    return;
-                },
-            }
-
-            // Enter IO loop
+            // Enter IO loop. The settings frame is sent alongside the first
+            // OpenStream (packet #1). The server's reply (SERVER_SETTINGS /
+            // UPDATE_PADDING_SCHEME) is handled by the loop's read path.
             run_io_loop(
                 stream,
                 &inner_clone,
                 control_rx,
                 outbound_rx,
                 padding_cache,
+                initial_settings,
             );
         });
 
