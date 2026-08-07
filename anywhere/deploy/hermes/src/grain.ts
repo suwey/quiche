@@ -18,7 +18,7 @@ export interface GrainSender {
 export function 创建下行Grain发送器(webSocket: SocketLikeSend, headerData: Uint8Array | null = null): GrainSender {
 	const packetCap = 下行Grain包字节;
 	const tailBytes = 下行Grain尾部阈值;
-	const lowWaterBytes = Math.max(4096, tailBytes << 3);
+	const lowWaterBytes = Math.max(4096, tailBytes * 12);
 	let header = headerData;
 	let pendingBuffer = new Uint8Array(packetCap);
 	let pendingBytes = 0;
@@ -77,7 +77,7 @@ export function 创建下行Grain发送器(webSocket: SocketLikeSend, headerData
 					flush().catch(() => closeSocketQuietly(webSocket));
 					return;
 				}
-				if (waitRounds < 2 && (generation !== scheduledGeneration || pendingBytes < lowWaterBytes)) {
+				if (waitRounds < 4 && (generation !== scheduledGeneration || pendingBytes < lowWaterBytes)) {
 					waitRounds++;
 					scheduledGeneration = generation;
 					scheduleFlush();

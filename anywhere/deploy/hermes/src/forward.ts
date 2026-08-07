@@ -329,24 +329,30 @@ export async function forwardataTCP(
 					候选索引列表.push((state.缓存反代数组索引 + k) % 所有反代数组.length);
 				}
 			}
-			// PROXYIP 路径用 1 路连接 + 轮询：每个流分到不同节点，避免单 IP 被频控。
-			// 多路并发会让最快节点永远胜出，导致所有流量集中到同一个 IP。
-			for (let i = 0; i < 候选索引列表.length; i++) {
-				const 反代数组索引 = 候选索引列表[i];
-				const [反代地址, 反代端口] = 所有反代数组[反代数组索引];
-				const 候选: Candidate = { hostname: 反代地址, port: 反代端口, attempt: 0, index: 反代数组索引 };
+			// 按 反代并发拨号数 分批并发拨号：每批取最快节点，轮询推进。
+			// 保留黑名单过滤（拉黑的节点跳过）；默认 1 路即退化为原单路轮询。
+			const 实际并发数 = Math.max(1, Math.floor(Number(state.反代并发拨号数) || 1));
+			for (let i = 0; i < 候选索引列表.length; i += 实际并发数) {
+				const 候选列表: Candidate[] = [];
+				for (let j = 0; j < 实际并发数 && i + j < 候选索引列表.length; j++) {
+					const 反代数组索引 = 候选索引列表[i + j];
+					const [反代地址, 反代端口] = 所有反代数组[反代数组索引];
+					候选列表.push({ hostname: 反代地址, port: 反代端口, attempt: 0, index: 反代数组索引 });
+				}
 				let socket: TCPSocket | null = null;
 				try {
-					log(`[反代连接] 尝试: ${候选.hostname}:${候选.port}`);
-					socket = await 打开TCP连接(候选.hostname, 候选.port);
+					log(`[反代连接] 并发尝试 ${候选列表.length} 路: ${候选列表.map(候选 => `${候选.hostname}:${候选.port}`).join(', ')}`);
+					const 连接结果 = await 并发打开候选连接(候选列表);
+					socket = 连接结果.socket;
+					const 胜出候选 = 连接结果.candidate;
 					await 写入首包(socket, data);
-					log(`[反代连接] 成功连接到: ${候选.hostname}:${候选.port} (索引: ${候选.index})`);
+					log(`[反代连接] 成功连接到: ${胜出候选.hostname}:${胜出候选.port} (索引: ${胜出候选.index})`);
 					// 索引前进到 winner+1，下次从下一个 PROXYIP 开始（轮询）。
-					state.缓存反代数组索引 = (反代数组索引 + 1) % 所有反代数组.length;
-					return { socket, proxyKey: `${候选.hostname}:${候选.port}` };
+					state.缓存反代数组索引 = ((胜出候选.index ?? 0) + 1) % 所有反代数组.length;
+					return { socket, proxyKey: `${胜出候选.hostname}:${胜出候选.port}` };
 				} catch (err) {
 					try { socket?.close?.(); } catch { /* ignore */ }
-					log(`[反代连接] ${候选.hostname}:${候选.port} 连接失败: ${(err as { message?: string })?.message ?? err}`);
+					log(`[反代连接] 本批连接失败: ${(err as { message?: string })?.message ?? err}`);
 				}
 			}
 		}
@@ -449,9 +455,7 @@ export async function forwardataTCP(
 	}
 	remoteConnWrapper.retryConnect = async () => connecttoPry(!已通过代理发送首包);
 
-	const 命中拒绝直连域名 = state.拒绝直连域名列表.some(p =>
-		new RegExp(`^${p.replace(/\./g, '\\.').replace(/\*/g, '.*')}$`, 'i').test(host),
-	);
+	const 有PROXYIP = !!反代IP;
 
 	if (启用SOCKS5反代 && (启用SOCKS5全局反代 || SOCKS5白名单.some(p => new RegExp(`^${p.replace(/\*/g, '.*')}$`, 'i').test(host)))) {
 		log(`[TCP转发] 启用 SOCKS5/HTTP/HTTPS/TURN/SSTP 全局代理`);
@@ -461,22 +465,16 @@ export async function forwardataTCP(
 			log(`[TCP转发] SOCKS5/HTTP/HTTPS/TURN/SSTP 代理连接失败: ${(err as { message?: string })?.message ?? err}`);
 			throw err;
 		}
-	} else if (命中拒绝直连域名) {
-		log(`[TCP转发] ${host} 命中拒绝直连域名列表，直接走 PROXYIP`);
-		try {
-			await connecttoPry();
-		} catch (err) {
-			log(`[TCP转发] PROXYIP 失败: ${(err as { message?: string })?.message ?? err}`);
-			throw err;
-		}
 	} else {
+		// 与上游 openclaw 一致：先直连，直连失败/中途断开才回退 PROXYIP。
+		// 不再对 googlevideo/youtube 强制走 PROXYIP（CF Worker 直连现在可行，且更快）。
 		try {
 			log(`[TCP转发] 尝试直连到: ${host}:${portNum}`);
 			const initialSocket = await connectDirect(host, portNum, rawData, true);
 			remoteConnWrapper.socket = initialSocket;
 			await connectStreams(initialSocket, ws, respHeader, async () => {
 				if (remoteConnWrapper.socket !== initialSocket) return;
-				await connecttoPry();
+				if (有PROXYIP) await connecttoPry();
 			});
 		} catch (err) {
 			log(`[TCP转发] 直连 ${host}:${portNum} 失败: ${(err as { message?: string })?.message ?? err}`);
@@ -484,7 +482,7 @@ export async function forwardataTCP(
 				closeSocketQuietly(ws as unknown as { readyState?: number; close?: () => void });
 				throw err;
 			}
-			await connecttoPry();
+			if (有PROXYIP) await connecttoPry();
 		}
 	}
 }

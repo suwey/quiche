@@ -20,6 +20,7 @@ export interface Env {
 	GO2SOCKS5?: string;
 	DEBUG?: string;
 	PRELOAD_RACE_DIAL?: string;
+	PROXY_CONCURRENT_DIAL?: string;
 	BEST_SUB?: string;
 	OFF_LOG?: string;
 }

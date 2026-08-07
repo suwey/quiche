@@ -176,11 +176,6 @@ pub struct OutboundConfig {
     /// URL to test latency against (e.g. "www.google.com").
     pub url: Option<String>,
 
-    /// Enable mux.cool multiplexing over a single WS connection.
-    /// When enabled, replaces connection pool with a single shared session.
-    #[serde(default)]
-    pub mux: bool,
-
     // --- vless flat fields ---
     /// Disable TLS certificate verification.
     #[serde(default)]
@@ -199,6 +194,14 @@ pub struct OutboundConfig {
 
     /// Minimum number of sessions to keep alive in the pool (default: 2).
     pub min_idle_session: Option<usize>,
+
+    /// Connection pool tuning (applies to vless/mless/xhttp outbounds).
+    /// Configured as a top-level `[outbounds.xmux]` section.
+    /// For vless: `pool_size` controls the number of pre-built WS connections.
+    /// For mless: `pool_size` controls the number of parallel WS multiplexers.
+    /// For xhttp: uses `max_concurrency`, `max_connections`, etc.
+    #[serde(default)]
+    pub xmux: Option<crate::transport::xhttp::config::XmuxConfig>,
 }
 
 fn default_rule_type() -> String {

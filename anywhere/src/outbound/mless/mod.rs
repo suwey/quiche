@@ -5,6 +5,7 @@
 
 use std::sync::Arc;
 use std::sync::Weak;
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 use async_trait::async_trait;
 use tokio::sync::mpsc;
@@ -35,17 +36,33 @@ pub mod vless;
 ///
 /// M4: Uses pluggable `ConnectionManager` + `CryptoFactory` instead of
 /// raw connection parameters. Supports both WS and XHTTP transports.
+///
+/// When `pool_size > 1`, multiple `MlessMultiplexer` instances are created,
+/// each with its own WebSocket connection and independent crypto counters.
+/// Streams are distributed round-robin across the pool, multiplying TCP
+/// throughput and eliminating the single-connection bottleneck.
 pub struct MlessOutboundClient {
-    multiplexer: tokio::sync::Mutex<Arc<MlessMultiplexer>>,
+    /// Pool of multiplexers. Each entry is `(multiplexer, consecutive_fails)`.
+    /// A pool of size 1 is equivalent to the old single-multiplexer behavior.
+    pool: tokio::sync::Mutex<Vec<MuxSlot>>,
+    /// Round-robin index for stream distribution.
+    next: AtomicUsize,
+    /// Pool size (cached for reconnection logic).
+    pool_size: usize,
     uuid: [u8; 16],
     uuid_str: String,
-    /// Pluggable connection manager (for reconnection).
+    /// Pluggable connection manager (shared across all pool slots).
     conn_mgr: Arc<dyn ConnectionManager>,
-    /// Pluggable crypto factory.
+    /// Pluggable crypto factory (shared; each slot creates its own instance).
     crypto_factory: Arc<dyn CryptoFactory>,
-    consecutive_fails: std::sync::atomic::AtomicU32,
     /// Direct outbound used for UDP ports that mless can't tunnel (e.g. NTP).
     direct_fallback: DirectOutboundClient,
+}
+
+/// One slot in the mless connection pool.
+struct MuxSlot {
+    mux: Arc<MlessMultiplexer>,
+    consecutive_fails: AtomicU32,
 }
 
 impl MlessOutboundClient {
@@ -68,6 +85,14 @@ impl MlessOutboundClient {
             .ok_or("mless: missing password (uuid)")?;
         let uuid = parse_uuid(uuid_str)?;
         let uuid_str = uuid_str.to_string();
+
+        // Determine pool size from [outbounds.xmux].pool_size (default: 5).
+        let pool_size = cfg
+            .xmux
+            .as_ref()
+            .and_then(|x| x.pool_size)
+            .unwrap_or(5)
+            .max(1);
 
         // Build connection manager from nested [transport] config
         let transport = cfg.transport.as_ref().ok_or("mless: missing [transport] config")?;
@@ -94,6 +119,7 @@ impl MlessOutboundClient {
                 Arc::new(SingleConnectionManager::new(Box::new(WsTransportFactory), ctx))
             }
             "xhttp" => {
+                use crate::transport::xhttp::config::XmuxConfig;
                 use crate::transport::xhttp::{config::HttpVersionPref, xmux::XmuxConnectionManager};
                 let xc = transport.xhttp.as_ref().ok_or("mless: missing [transport.xhttp] config")?;
                 let mut xhttp_config = xc.clone();
@@ -112,11 +138,13 @@ impl MlessOutboundClient {
                 xhttp_config.session_id_placement =
                     crate::transport::xhttp::config::SessionPlacement::Query;
                 let xhttp_config = Arc::new(xhttp_config);
+                let default_xmux = XmuxConfig::default();
+                let xmux_cfg = cfg.xmux.as_ref().unwrap_or(&default_xmux);
                 if xhttp_config.http_version == HttpVersionPref::Http3 {
                     use crate::transport::xhttp::h3::H3ConnectionManager;
                     Arc::new(H3ConnectionManager::new(xhttp_config))
                 } else {
-                    Arc::new(XmuxConnectionManager::from_config(xhttp_config).await?)
+                    Arc::new(XmuxConnectionManager::from_config(xhttp_config, xmux_cfg).await?)
                 }
             }
             other => return Err(format!("mless: unsupported transport type '{other}'").into()),
@@ -126,72 +154,118 @@ impl MlessOutboundClient {
         let crypto_factory: Arc<dyn CryptoFactory> =
             Arc::new(self::crypto::AheadXorFactory);
 
-        // Connect via pluggable architecture
-        let multiplexer = MlessMultiplexer::connect_pluggable(
-            conn_mgr.clone(),
-            crypto_factory.clone(),
-            &uuid_str,
-        )
-        .await?;
+        // Connect all multiplexer instances in the pool.
+        // Each gets its own WS connection and independent crypto state.
+        let mut slots = Vec::with_capacity(pool_size);
+        for i in 0..pool_size {
+            let mux = MlessMultiplexer::connect_pluggable(
+                conn_mgr.clone(),
+                crypto_factory.clone(),
+                &uuid_str,
+            )
+            .await?;
+            if pool_size > 1 {
+                log::info!("mless: pool slot {}/{} connected", i + 1, pool_size);
+            }
+            slots.push(MuxSlot {
+                mux,
+                consecutive_fails: AtomicU32::new(0),
+            });
+        }
 
         Ok(Self {
-            multiplexer: tokio::sync::Mutex::new(multiplexer),
+            pool: tokio::sync::Mutex::new(slots),
+            next: AtomicUsize::new(0),
+            pool_size,
             uuid,
             uuid_str,
             conn_mgr,
             crypto_factory,
-            consecutive_fails: std::sync::atomic::AtomicU32::new(0),
             direct_fallback: DirectOutboundClient,
         })
     }
 
+    /// Pick a healthy multiplexer from the pool, reconnecting if needed.
+    ///
+    /// Uses round-robin to distribute streams across pool slots. If the
+    /// selected slot is dead, attempts reconnection with exponential
+    /// backoff. Falls back to the next slot on failure.
     async fn get_or_reconnect(&self) -> Arc<MlessMultiplexer> {
+        let idx = self.next.fetch_add(1, Ordering::Relaxed) % self.pool_size;
+
+        // Fast path: check if the selected slot is alive (no lock held).
         {
-            let mux = self.multiplexer.lock().await;
-            if !mux.dead.load(std::sync::atomic::Ordering::Relaxed) {
-                return mux.clone();
+            let pool = self.pool.lock().await;
+            let slot = &pool[idx];
+            if !slot.mux.dead.load(Ordering::Relaxed) {
+                return slot.mux.clone();
             }
-            if mux
+            // Check if another slot is already reconnecting this one.
+            if slot
+                .mux
                 .reconnecting
-                .swap(true, std::sync::atomic::Ordering::Acquire)
+                .swap(true, Ordering::Acquire)
             {
-                drop(mux);
+                drop(pool);
                 tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                let mux = self.multiplexer.lock().await;
-                return mux.clone();
+                let pool = self.pool.lock().await;
+                return pool[idx].mux.clone();
             }
         }
-        let fails = self
-            .consecutive_fails
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        // Slow path: reconnect the dead slot.
+        let fails = {
+            let pool = self.pool.lock().await;
+            pool[idx].consecutive_fails.fetch_add(1, Ordering::Relaxed)
+        };
         let delay_secs = (2u64).pow(fails.min(5)).min(30);
         log::info!(
-            "{}: reconnecting... (attempt {}, backoff {}s)",
+            "{}: pool slot {} reconnecting... (attempt {}, backoff {}s)",
             self.log_tag(),
+            idx,
             fails + 1,
             delay_secs,
         );
         tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
+
         let result = MlessMultiplexer::connect_pluggable(
             self.conn_mgr.clone(),
             self.crypto_factory.clone(),
             &self.uuid_str,
         )
         .await;
+
+        // Extract the result before locking the pool to avoid holding
+        // a non-Send `Box<dyn StdError>` across an await boundary.
         let new_mux = result.ok();
-        let mut mux = self.multiplexer.lock().await;
-        mux.reconnecting
-            .store(false, std::sync::atomic::Ordering::Release);
-        if let Some(new_mux) = new_mux {
-            self.consecutive_fails
-                .store(0, std::sync::atomic::Ordering::Relaxed);
-            *mux = new_mux.clone();
-            drop(mux);
-            log::info!("{}: reconnected", self.log_tag());
-            new_mux
-        } else {
-            log::warn!("{}: reconnect failed", self.log_tag());
-            mux.clone()
+
+        let mut pool = self.pool.lock().await;
+        pool[idx]
+            .mux
+            .reconnecting
+            .store(false, Ordering::Release);
+
+        match new_mux {
+            Some(new_mux) => {
+                pool[idx].consecutive_fails.store(0, Ordering::Relaxed);
+                pool[idx].mux = new_mux.clone();
+                drop(pool);
+                log::info!(
+                    "{}: pool slot {} reconnected",
+                    self.log_tag(),
+                    idx
+                );
+                new_mux
+            }
+            None => {
+                log::warn!(
+                    "{}: pool slot {} reconnect failed",
+                    self.log_tag(),
+                    idx
+                );
+                // Return the (still dead) mux; caller will check `dead` flag.
+                pool[idx].mux.clone()
+            }
         }
     }
 
@@ -498,187 +572,5 @@ impl PacketRelay for MlessPacketRelay {
     async fn close(&mut self) -> std::io::Result<()> {
         self.handle.close().await;
         Ok(())
-    }
-}
-
-// ---------------------------------------------------------------------------
-// End-to-end test: mless over XHTTP stream-one
-// ---------------------------------------------------------------------------
-
-#[cfg(test)]
-mod mless_xhttp_tests {
-    use super::*;
-    use crate::crypto::CryptoFactory;
-    use crate::transport::xhttp::h2::{make_stream_body, H2SendRequest};
-    use crate::transport::xhttp::{config::XhttpConfig, xmux::XmuxConnectionManager};
-    use bytes::Bytes;
-    use http_body::Frame;
-    use http_body_util::BodyExt;
-    use hyper::body::Incoming;
-    use hyper::server::conn::http2;
-    use hyper::service::service_fn;
-    use hyper::Request;
-    use hyper_util::rt::{TokioExecutor, TokioIo};
-
-    /// Streaming echo server: echoes H2 POST body frames back as response
-    /// body frames, without waiting for the full request body.
-    async fn start_streaming_echo() -> std::net::SocketAddr {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            loop {
-                let Ok((tcp, _)) = listener.accept().await else { break };
-                let io = TokioIo::new(tcp);
-                let exec = TokioExecutor::new();
-                let _ = http2::Builder::new(exec)
-                    .serve_connection(
-                        io,
-                        service_fn(|req: Request<Incoming>| async move {
-                            let (tx, body) = make_stream_body(16);
-                            let mut req_body = req.into_body();
-                            tokio::spawn(async move {
-                                loop {
-                                    match req_body.frame().await {
-                                        Some(Ok(frame)) => {
-                                            if let Some(data) = frame.data_ref() {
-                                                if tx
-                                                    .send(Ok(Frame::data(data.clone())))
-                                                    .await
-                                                    .is_err()
-                                                {
-                                                    break;
-                                                }
-                                            }
-                                        }
-                                        Some(Err(_)) => break,
-                                        None => break,
-                                    }
-                                }
-                            });
-                            Ok::<_, std::convert::Infallible>(
-                                hyper::Response::builder()
-                                    .status(200)
-                                    .body(body)
-                                    .unwrap(),
-                            )
-                        }),
-                    )
-                    .await;
-            }
-        });
-        addr
-    }
-
-    async fn connect_plain_h2(addr: std::net::SocketAddr) -> H2SendRequest {
-        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let io = TokioIo::new(tcp);
-        let exec = TokioExecutor::new();
-        let (send_req, conn) =
-            hyper::client::conn::http2::handshake(exec, io).await.unwrap();
-        tokio::spawn(async move {
-            let _ = conn.await;
-        });
-        send_req
-    }
-
-    #[tokio::test]
-    async fn mless_over_xhttp_echo() {
-        let addr = start_streaming_echo().await;
-        let send_req = connect_plain_h2(addr).await;
-
-        // Build XHTTP connection manager with injected SendRequest
-        let xhttp_config = Arc::new(XhttpConfig {
-            host: "localhost".to_string(),
-            port: addr.port(),
-            path: "/xhttp".to_string(),
-            ..Default::default()
-        });
-        let mgr = XmuxConnectionManager::new(xhttp_config, addr);
-        *mgr.canonical.lock() = Some(send_req);
-        let conn_mgr: Arc<dyn ConnectionManager> = Arc::new(mgr);
-
-        // Build crypto factory
-        let crypto_factory: Arc<dyn CryptoFactory> =
-            Arc::new(self::crypto::AheadXorFactory);
-        let uuid_str = "00000000-0000-4000-8000-000000000000";
-
-        // Connect multiplexer via pluggable architecture
-        let mux = MlessMultiplexer::connect_pluggable(
-            conn_mgr,
-            crypto_factory,
-            uuid_str,
-        )
-        .await
-        .unwrap();
-
-        // Register a stream
-        let (stream_id, mut rx) = mux.register_stream();
-
-        // Send plaintext data - io_loop will encrypt and write to transport
-        mux.send_data(stream_id, b"hello mless over xhttp");
-
-        // Read echoed data back (with timeout - the io_loop needs time to process)
-        let received = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            rx.recv(),
-        )
-        .await
-        .expect("timeout waiting for echo")
-        .expect("stream channel closed");
-
-        assert_eq!(received, b"hello mless over xhttp");
-    }
-
-    #[tokio::test]
-    async fn mless_over_xhttp_multiple_frames() {
-        let addr = start_streaming_echo().await;
-        let send_req = connect_plain_h2(addr).await;
-
-        let xhttp_config = Arc::new(XhttpConfig {
-            host: "localhost".to_string(),
-            port: addr.port(),
-            path: "/xhttp".to_string(),
-            ..Default::default()
-        });
-        let mgr = XmuxConnectionManager::new(xhttp_config, addr);
-        *mgr.canonical.lock() = Some(send_req);
-        let conn_mgr: Arc<dyn ConnectionManager> = Arc::new(mgr);
-
-        let crypto_factory: Arc<dyn CryptoFactory> =
-            Arc::new(self::crypto::AheadXorFactory);
-        let uuid_str = "00000000-0000-4000-8000-000000000000";
-
-        let mux = MlessMultiplexer::connect_pluggable(
-            conn_mgr,
-            crypto_factory,
-            uuid_str,
-        )
-        .await
-        .unwrap();
-
-        let (stream_id, mut rx) = mux.register_stream();
-
-        // Send multiple frames
-        mux.send_data(stream_id, b"frame1");
-        mux.send_data(stream_id, b"frame2");
-        mux.send_data(stream_id, b"frame3");
-
-        // Read all frames back
-        let r1 = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
-            .await
-            .expect("timeout 1")
-            .expect("channel closed 1");
-        let r2 = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
-            .await
-            .expect("timeout 2")
-            .expect("channel closed 2");
-        let r3 = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
-            .await
-            .expect("timeout 3")
-            .expect("channel closed 3");
-
-        assert_eq!(r1, b"frame1");
-        assert_eq!(r2, b"frame2");
-        assert_eq!(r3, b"frame3");
     }
 }

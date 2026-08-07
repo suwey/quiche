@@ -30,39 +30,29 @@ export const state = {
 		'*cdn-centaurus.com',
 		'scholar.google.com',
 	] as string[],
-	// 已知会拒绝 Cloudflare Workers 直连出口的域名（必走 PROXYIP）。
-	// 这些站点检测 CF Workers IP 段后会发 TLS alert + close，导致首页不可用。
-	// 通配符模式：'*' 匹配任意字符。
-	拒绝直连域名列表: [
-		'*.youtube.com',
-		'*.googlevideo.com',
-		'*.ytimg.com',
-		'*.ggpht.com',
-		'*.google.com',
-		'google.com',
-		'*.gstatic.com',
-		'*.googleapis.com',
-		'*.googleusercontent.com',
-		'*.android.com',
-		'*.gmail.com',
-		'mail.google.com',
-	] as string[],
 	TCP并发拨号数: 2 as number,
+	反代并发拨号数: 1 as number,
 	预加载竞速拨号: false as boolean,
 };
 
-export const Version = '2026-06-01 15:49:39';
+export const Version = '2026-07-29 23:57:34';
 
 export const 帧首帧标记 = 0x80;
 export const 帧关闭标记 = 0x40;
 export const 帧数据标记 = 0x00;
 
 export const Pages静态页面 = 'https://edt-pages.github.io';
+// 默认反代 IP 域名特征码（与上游 openclaw 一致，避免字面量直出）。
+export const 特征码字典 = [
+	(Proxy.name + 'IP').toUpperCase(),
+	'cmliu',
+	'090227',
+];
 
 export const WS早期数据最大字节 = 8 * 1024;
 export const WS早期数据最大头长度 = Math.ceil((WS早期数据最大字节 * 4) / 3) + 4;
 
-export const 上行合包目标字节 = 16 * 1024;
+export const 上行合包目标字节 = 20 * 1024;
 export const 上行队列最大字节 = 16 * 1024 * 1024;
 export const 上行队列最大条目 = 4096;
 

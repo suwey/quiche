@@ -26,7 +26,7 @@ Set socks5://127.0.0.1:1080 and test.
 
 5. Implemented useful clash api for [MetaCudeXD](https://github.com/MetaCubeX/metacubexd/releases/): most info APIs, global mode change (auto disable tun forward when mode direct, enable tun when mode rule/global), `Restart Core` by start command setted by -s option (not set will execve a new process, if set to systemctl will execute command: systemctl restart [exename]), `Reload Config` is same as restart, `Upload Config` / `Edit Config` / `Pull Config` will overwrite config file and restart. 
 
-6. Urltest outbound as auto selector, domain and geo rules, tun inbound (linux only).
+6. Urltest outbound as auto selector, domain and geo rules, tun inbound (linux/windows/macos/android).
 7. Fake ip, DNS hijack auto enabled by tun inbound, DOH support.
 8. Auto monitor wan ifaces and bypass lan ifaces.
 9. Vless outbound, tls + ws mode for [edgetunnel](https://github.com/cmliu/edgetunnel), hide sensitive characters and back up as `deploy/openclaw`, can deploy to cloudflare pages (workers domain has been blocked).
@@ -50,16 +50,25 @@ type = "mless"
 tag = "CF"
 # copy and open url https://custom.domain.not.blocked/sub?token=xxxxxxxxxxxxx after login
 # pick one from urls like vless://xxxx-xxx-xx-xx@s.s.s.s:1334?......
-# if blocked by some websites, change to another one
+# if blocked, change to another one
 server = "s.s.s.s:1334"
 password = "xxxx-xxx-xx-xx"
 sni = "custom.domain.not.blocked"
 fp = true
-transport_type = "ws"
-transport_path = "/"
-transport_headers.Host = "custom.domain.not.blocked"
+
+[outbounds.transport]
+type = "ws"
+
+[outbounds.transport.ws]
+path = "/"
+headers = { Host = "custom.domain.not.blocked" }
+
+# default 5 connections is enough for 4k 60fps video
+# since cloudflare's network keep changing, may need adjust this
+[outbounds.xmux]
+pool_size = 5
 ```
-Recommend to deploy `openclaw` and `hermes` both, cloudflare's free plan will be very enough to use. Many thanks to @cmliu for [edgetunnel](https://github.com/cmliu/edgetunnel), see it for more info.
+Recommend to deploy `openclaw` and `hermes` both, one for `vless/ss/trojan` one for `mless` then cloudflare's free plan will be very enough to use. Many thanks to @cmliu for [edgetunnel](https://github.com/cmliu/edgetunnel), see it for more info.
 
 ## Deploy to arm64 router running koolshare with jffs enabled
 Tun inbound only support linux now and need ip & iptables commands (as root), other platform will just ignore it, config is very simple and most are setted, linux desktop can use too, see [config.toml](./anywhere/deploy/koolshare/config.toml), build for arm64 router:
@@ -71,7 +80,7 @@ cargo zigbuild -p anywhere --target aarch64-unknown-linux-musl --release
 ```
 mkdir -p /jffs/anywhere/ui
 ```
-2. Download [MetaCudeXD](https://github.com/MetaCubeX/metacubexd/releases/) and extract, or my [edit version](./anywhere-android/app/src/main/assets/ui/), anywhere release and files in deploy, change your settings in config.toml.
+2. Download [MetaCudeXD](https://github.com/MetaCubeX/metacubexd/releases/) and extract (or my version), anywhere release and files in deploy, change your settings in config.toml.
 ```
 scp -O -r compressed-dist/* 192.168.1.1:/jffs/anywhere/ui/
 scp -O anywhere 192.168.1.1:/jffs/anywhere/
@@ -99,7 +108,10 @@ Confirm works fine before reboot, if can't work, ctrl+c or ./anywhere.sh stop, c
 Install apk, click start button, click `Open Web UI` (or open in computer on same local network), then go to config page: upload or edit [anywhere.toml](./anywhere-android/app/src/main/assets/config/anywhere.toml), it will restart.
 
 
-`bash scripts/build.sh --apk` to build apk, see prerequisites in [build.sh](./scripts/build.sh).
+`bash scripts/build.sh --apk` to build apk, see prerequisites in [build_on_mac.sh](./scripts/build_on_mac.sh).
+
+## Windows
+Download [wintun](https://www.wintun.net), copy your platform's `wintun.dll` to same dir with `anywhere.exe` and [start.bat](./anywhere/deploy/windows/start.bat), right click `start.bat` and run as admin to use tun mode.
 
 
 ## Some service provider not support or limit speed of third party client

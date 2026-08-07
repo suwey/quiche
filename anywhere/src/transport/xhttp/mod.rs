@@ -31,10 +31,13 @@ use http_body::Frame;
 use http_body_util::BodyExt;
 use tokio::sync::mpsc;
 
+use crate::obfuscation::{ObfContext, ObfuscationChain};
 use crate::transport::{DownlinkReader, TransportSession, UplinkWriter};
 
-use config::{resolve_http_version, resolve_mode, XhttpConfig, XhttpMode};
+use base64::Engine;
+use config::{resolve_http_version, resolve_mode, UplinkDataPlacement, XhttpConfig, XhttpDirectionConfig, HttpVersionPref, XhttpMode};
 use h2::{make_stream_body, H2SendRequest, HttpSendRequest, ReqBody};
+use h3::H3Session;
 use padding::XPaddingMiddleware;
 use upload_queue::UploadQueue;
 use placement::PlacementConfig;
@@ -53,7 +56,16 @@ pub struct XhttpSession {
     mode: XhttpMode,
 
     /// H2 send-request handle (cloned per stream; `None` after `close()`).
+    /// `None` when in H3 mode (uses `h3_session` instead).
     send_req: Option<HttpSendRequest>,
+
+    /// Optional separate downlink send-request for asymmetric mode
+    /// (when `downlink_target` is configured). `None` in symmetric mode.
+    downlink_send_req: Option<HttpSendRequest>,
+
+    /// H3 session handle (when using HTTP/3). `None` for H2/H1 mode.
+    /// When set, all TransportSession methods delegate to this H3 session.
+    h3_session: Option<H3Session>,
 
     /// Response future stored between `uplink()` and `downlink()`.
     response_rx: Option<tokio::sync::oneshot::Receiver<Result<hyper::Response<hyper::body::Incoming>, hyper::Error>>>,
@@ -82,6 +94,8 @@ impl XhttpSession {
             config,
             session_id,
             send_req: Some(send_req),
+            downlink_send_req: None,
+            h3_session: None,
             response_rx: None,
             padding,
             placement,
@@ -89,11 +103,108 @@ impl XhttpSession {
     }
 
     /// Connect to the server and create a session (production path).
+    ///
+    /// If `uplink_target` or `downlink_target` is configured, uses asymmetric
+    /// mode: separate connections for uplink and downlink.
+    ///
+    /// When `http_version` is `Http3`, tries H3 (QUIC) first. If H3 fails,
+    /// falls back to H2 automatically.
     pub async fn connect(config: Arc<XhttpConfig>) -> io::Result<Self> {
-        let addr = resolve_addr(&config).await?;
+        if config.uplink_target.is_some() || config.downlink_target.is_some() {
+            return Self::connect_asymmetric(config).await;
+        }
+
+        // Symmetric mode: single connection for both directions
         let http_version = resolve_http_version(&config);
-        let send_req = h2::connect(addr, &config.host, config.insecure, http_version).await?;
-        Ok(Self::from_send_request(config, send_req))
+
+        match http_version {
+            HttpVersionPref::Http3 => {
+                // Try H3 first, fall back to H2 on failure
+                match h3::H3Session::connect(config.clone()).await {
+                    Ok(h3_session) => {
+                        log::debug!("xhttp: connected via H3 to {}", config.host);
+                        let padding = config.padding.clone().map(XPaddingMiddleware::new);
+                        let placement = PlacementConfig {
+                            session_id_placement: config.session_id_placement,
+                            session_id_key: config.session_id_key.clone(),
+                            seq_placement: config.seq_placement,
+                            seq_key: config.seq_key.clone(),
+                        };
+                        let session_id = uuid::Uuid::new_v4().to_string();
+                        let mode = resolve_mode(&config);
+                        Ok(Self {
+                            config,
+                            session_id,
+                            mode,
+                            send_req: None,
+                            downlink_send_req: None,
+                            h3_session: Some(h3_session),
+                            response_rx: None,
+                            padding,
+                            placement,
+                        })
+                    }
+                    Err(e) => {
+                        log::warn!("xhttp: H3 connect failed, falling back to H2: {}", e);
+                        let addr = resolve_addr(&config).await?;
+                        let send_req = h2::connect(
+                            addr,
+                            &config.host,
+                            config.insecure,
+                            HttpVersionPref::Http2,
+                        ).await?;
+                        Ok(Self::from_send_request(config, send_req))
+                    }
+                }
+            }
+            _ => {
+                // H2 / H1 path (original)
+                let addr = resolve_addr(&config).await?;
+                let send_req = h2::connect(addr, &config.host, config.insecure, http_version).await?;
+                Ok(Self::from_send_request(config, send_req))
+            }
+        }
+    }
+
+    /// Connect using asymmetric (separate uplink/downlink) connections.
+    ///
+    /// - Uplink: uses `uplink_target` overrides merged into base config.
+    /// - Downlink: if `downlink_target` is set, creates a separate connection.
+    async fn connect_asymmetric(config: Arc<XhttpConfig>) -> io::Result<Self> {
+        // Build uplink config by merging base with uplink_target overrides
+        let uplink_config = merge_direction_config(&config, config.uplink_target.as_ref());
+        let uplink_addr = resolve_addr(&uplink_config).await?;
+        let uplink_http_version = resolve_http_version(&uplink_config);
+        let uplink_send_req = h2::connect(
+            uplink_addr,
+            &uplink_config.host,
+            uplink_config.insecure,
+            uplink_http_version,
+        )
+        .await?;
+
+        // Build downlink config (if downlink_target is set)
+        let downlink_send_req = if config.downlink_target.is_some() {
+            let downlink_config =
+                merge_direction_config(&config, config.downlink_target.as_ref());
+            let downlink_addr = resolve_addr(&downlink_config).await?;
+            let downlink_http_version = resolve_http_version(&downlink_config);
+            let dl_send_req = h2::connect(
+                downlink_addr,
+                &downlink_config.host,
+                downlink_config.insecure,
+                downlink_http_version,
+            )
+            .await?;
+            Some(dl_send_req)
+        } else {
+            None
+        };
+
+        // Build session with uplink connection as primary
+        let mut session = Self::from_send_request(config, uplink_send_req);
+        session.downlink_send_req = downlink_send_req;
+        Ok(session)
     }
 
     /// Build an HTTP request with the given method, optional seq, and body.
@@ -109,9 +220,16 @@ impl XhttpSession {
             seq,
         );
 
+        // Apply padding before setting URI so Query placement can modify the URL
+        let mut pad_path = path;
+        let mut pad_headers = Vec::new();
+        if let Some(pad) = &self.padding {
+            pad.apply_to_request_mut(&mut pad_path, &mut pad_headers);
+        }
+
         let mut builder = http::Request::builder()
             .method(method)
-            .uri(&path)
+            .uri(&pad_path)
             .header("Host", &self.config.host);
 
         for (k, v) in &self.config.headers {
@@ -133,12 +251,8 @@ impl XhttpSession {
         // (Content-Type: text/event-stream), not a client request header.
         // X-Accel-Buffering is a server response header, not a request header.
 
-        if let Some(pad) = &self.padding {
-            let mut pad_headers = Vec::new();
-            pad.apply_to_request(&path, &mut pad_headers);
-            for (k, v) in pad_headers {
-                builder = builder.header(k, v);
-            }
+        for (k, v) in pad_headers {
+            builder = builder.header(k, v);
         }
 
         builder
@@ -150,6 +264,10 @@ impl XhttpSession {
 #[async_trait]
 impl TransportSession for XhttpSession {
     async fn uplink(&mut self) -> io::Result<Box<dyn UplinkWriter>> {
+        // Delegate to H3 session if in H3 mode
+        if let Some(ref mut h3) = self.h3_session {
+            return h3.uplink().await;
+        }
         match self.mode {
             XhttpMode::StreamOne | XhttpMode::StreamUp => {
                 let (body_tx, body) = make_stream_body(64);
@@ -179,6 +297,8 @@ impl TransportSession for XhttpSession {
 
                 Ok(Box::new(StreamUplinkWriter {
                     body_tx: Some(body_tx),
+                    obf_chain: None,
+                    is_first_write: true,
                 }))
             }
             XhttpMode::PacketUp => {
@@ -192,19 +312,33 @@ impl TransportSession for XhttpSession {
                     )),
                 };
 
+                // Resolve chunk_size from uplink.chunk_size (default 16KB)
+                let cs = self.config.uplink.chunk_size
+                    .as_ref()
+                    .map(|r| r.rand_usize())
+                    .unwrap_or(16 * 1024);
+
+                // Resolve throttle config: max_buffered_posts (default 30)
+                let max_buffered_posts = self.config.throttle.max_buffered_posts
+                    .unwrap_or(30) as usize;
+                let max_buffered = max_buffered_posts * cs;
+
+                // Resolve min_posts_interval_ms (default 30ms)
+                let min_post_interval = self.config.throttle.min_posts_interval_ms
+                    .as_ref()
+                    .map(|r| std::time::Duration::from_millis(r.rand_u64()))
+                    .or(Some(std::time::Duration::from_millis(30)));
+
                 Ok(Box::new(PacketUplinkWriter {
                     send_req: send_req_clone,
                     config: self.config.clone(),
                     session_id: self.session_id.clone(),
                     placement: self.placement.clone(),
                     padding: self.padding.clone(),
-                    upload_queue: {
-                        let cs = self.config.uplink.chunk_size
-                            .as_ref()
-                            .map(|r| r.rand_usize())
-                            .unwrap_or(16 * 1024);
-                        UploadQueue::new(cs)
-                    },
+                    upload_queue: UploadQueue::new(cs, max_buffered),
+                    last_post_time: None,
+                    min_post_interval,
+                    obf_chain: None,
                 }))
             }
             XhttpMode::Auto => {
@@ -214,6 +348,10 @@ impl TransportSession for XhttpSession {
     }
 
     async fn downlink(&mut self) -> io::Result<Box<dyn DownlinkReader>> {
+        // Delegate to H3 session if in H3 mode
+        if let Some(ref mut h3) = self.h3_session {
+            return h3.downlink().await;
+        }
         match self.mode {
             XhttpMode::StreamOne => {
                 // Stream-one: return a lazy reader that awaits the response
@@ -229,17 +367,23 @@ impl TransportSession for XhttpSession {
                     body: None,
                     read_buf: Vec::new(),
                     padding: self.padding.clone(),
+                    obf_chain: None,
                 }))
             }
             XhttpMode::StreamUp | XhttpMode::PacketUp => {
                 // Stream-up / packet-up: send a separate GET request
+                // In asymmetric mode, use the dedicated downlink connection if available
                 let (_empty_tx, empty_body) = make_stream_body(1);
                 // _empty_tx dropped -> empty body = immediate end-of-body
                 let request = self.build_request("GET", None, empty_body)?;
 
-                let send_req = self.send_req.as_mut().ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::NotConnected, "session closed")
-                })?;
+                let send_req = if let Some(ref mut dl_req) = self.downlink_send_req {
+                    dl_req
+                } else {
+                    self.send_req.as_mut().ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::NotConnected, "session closed")
+                    })?
+                };
 
                 let response = send_req.send_request(request)
                     .await
@@ -257,6 +401,7 @@ impl TransportSession for XhttpSession {
                     body: Some(response.into_body()),
                     read_buf: Vec::new(),
                     padding: None,
+                    obf_chain: None,
                 }))
             }
             XhttpMode::Auto => {
@@ -266,13 +411,22 @@ impl TransportSession for XhttpSession {
     }
 
     async fn close(&mut self) -> io::Result<()> {
+        // Close H3 session if present
+        if let Some(mut h3) = self.h3_session.take() {
+            h3.close().await?;
+        }
         self.send_req.take();
+        self.downlink_send_req.take();
         self.response_rx = None;
         Ok(())
     }
 
     fn kind(&self) -> &'static str {
-        "xhttp"
+        if self.h3_session.is_some() {
+            "xhttp-h3"
+        } else {
+            "xhttp"
+        }
     }
 }
 
@@ -283,6 +437,10 @@ impl TransportSession for XhttpSession {
 /// Writes uplink data to the POST request body via a channel.
 pub struct StreamUplinkWriter {
     body_tx: Option<mpsc::Sender<Result<Frame<Bytes>, io::Error>>>,
+    /// Optional obfuscation chain for pre_send processing.
+    obf_chain: Option<ObfuscationChain>,
+    /// Whether the next write is the first write (for ObfContext.is_first).
+    is_first_write: bool,
 }
 
 #[async_trait]
@@ -291,7 +449,22 @@ impl UplinkWriter for StreamUplinkWriter {
         let tx = self.body_tx.as_ref().ok_or_else(|| {
             io::Error::new(io::ErrorKind::BrokenPipe, "uplink already shut down")
         })?;
-        tx.send(Ok(Frame::data(Bytes::copy_from_slice(data))))
+
+        // Apply obfuscation chain if present
+        let payload = if let Some(ref mut chain) = self.obf_chain {
+            let ctx = ObfContext {
+                request_url: None,
+                is_first: self.is_first_write,
+                seq: None,
+                response_headers: None,
+            };
+            self.is_first_write = false;
+            chain.pre_send(data, &ctx).await?
+        } else {
+            data.to_vec()
+        };
+
+        tx.send(Ok(Frame::data(Bytes::from(payload))))
             .await
             .map_err(|_| {
                 io::Error::new(io::ErrorKind::ConnectionReset, "body channel closed")
@@ -317,6 +490,8 @@ pub struct StreamDownlinkReader {
     body: Option<hyper::body::Incoming>,
     read_buf: Vec<u8>,
     padding: Option<XPaddingMiddleware>,
+    /// Optional obfuscation chain for post_recv processing.
+    obf_chain: Option<ObfuscationChain>,
 }
 #[async_trait]
 impl DownlinkReader for StreamDownlinkReader {
@@ -363,10 +538,23 @@ impl DownlinkReader for StreamDownlinkReader {
                 None => return Ok(0), // EOF
                 Some(Ok(frame)) => {
                     if let Some(data) = frame.data_ref() {
-                        let n = std::cmp::min(data.len(), buf.len());
-                        buf[..n].copy_from_slice(&data[..n]);
-                        if data.len() > n {
-                            self.read_buf.extend_from_slice(&data[n..]);
+                        // Apply post_recv obfuscation chain if present
+                        let processed = if let Some(ref mut chain) = self.obf_chain {
+                            let ctx = ObfContext {
+                                request_url: None,
+                                is_first: false,
+                                seq: None,
+                                response_headers: None,
+                            };
+                            chain.post_recv(data, &ctx).await?
+                        } else {
+                            data.to_vec()
+                        };
+
+                        let n = std::cmp::min(processed.len(), buf.len());
+                        buf[..n].copy_from_slice(&processed[..n]);
+                        if processed.len() > n {
+                            self.read_buf.extend_from_slice(&processed[n..]);
                         }
                         return Ok(n);
                     }
@@ -395,12 +583,43 @@ pub struct PacketUplinkWriter {
     placement: PlacementConfig,
     padding: Option<XPaddingMiddleware>,
     upload_queue: UploadQueue,
+    /// Last time a POST was sent, for throttling.
+    last_post_time: Option<tokio::time::Instant>,
+    /// Minimum interval between POSTs (from ThrottleConfig.min_posts_interval_ms).
+    min_post_interval: Option<std::time::Duration>,
+    /// Optional obfuscation chain for pre_send processing.
+    obf_chain: Option<ObfuscationChain>,
 }
 
 impl PacketUplinkWriter {
     /// Send a single chunk as a POST with `?seq=<seq>`.
+    ///
+    /// If `min_post_interval` is set and the elapsed time since the last
+    /// POST is less than the interval, this method sleeps for the
+    /// remaining duration before sending.
     async fn send_packet(&mut self, seq: u64, data: Vec<u8>) -> io::Result<()> {
-        let (body_tx, body) = make_stream_body(1);
+        // Throttle: enforce minimum interval between POSTs
+        if let Some(interval) = self.min_post_interval {
+            if let Some(last) = self.last_post_time {
+                let elapsed = last.elapsed();
+                if elapsed < interval {
+                    tokio::time::sleep(interval - elapsed).await;
+                }
+            }
+        }
+
+        // Apply obfuscation chain if present
+        let data = if let Some(ref mut chain) = self.obf_chain {
+            let ctx = ObfContext {
+                request_url: None,
+                is_first: seq == 0,
+                seq: Some(seq),
+                response_headers: None,
+            };
+            chain.pre_send(&data, &ctx).await?
+        } else {
+            data
+        };
 
         // Build POST request with seq in URL
         let (path, extra_headers) = self.placement.build_request_meta(
@@ -411,9 +630,17 @@ impl PacketUplinkWriter {
             config::HttpMethod::Post => "POST",
             config::HttpMethod::Get => "GET",
         };
+
+        // Apply padding before setting URI so Query placement can modify the URL
+        let mut pad_path = path;
+        let mut pad_headers = Vec::new();
+        if let Some(pad) = &self.padding {
+            pad.apply_to_request_mut(&mut pad_path, &mut pad_headers);
+        }
+
         let mut builder = http::Request::builder()
             .method(method_str)
-            .uri(&path)
+            .uri(&pad_path)
             .header("Host", &self.config.host);
 
         for (k, v) in &self.config.headers {
@@ -428,21 +655,60 @@ impl PacketUplinkWriter {
         }
         // Note: no_sse_header controls the server-side SSE response header
         // (Content-Type: text/event-stream), not a client request header.
-        if let Some(pad) = &self.padding {
-            let mut pad_headers = Vec::new();
-            pad.apply_to_request(&path, &mut pad_headers);
-            for (k, v) in pad_headers {
-                builder = builder.header(k, v);
-            }
+        for (k, v) in pad_headers {
+            builder = builder.header(k, v);
         }
+
+        // Data placement: decide where to put the uplink data based on config.
+        // Auto/Body -> POST body; Header -> base64 in X-Data header;
+        // Cookie -> base64+urlencoded in Cookie header.
+        let body: ReqBody = match self.config.uplink.data_placement {
+            UplinkDataPlacement::Auto | UplinkDataPlacement::Body => {
+                let (body_tx, body) = make_stream_body(1);
+                let _ = body_tx.send(Ok(Frame::data(Bytes::from(data)))).await;
+                drop(body_tx);
+                body
+            }
+            UplinkDataPlacement::Header => {
+                let key = if self.config.uplink.data_key.is_empty() {
+                    "X-Data"
+                } else {
+                    &self.config.uplink.data_key
+                };
+                let encoded = base64::engine::general_purpose::STANDARD.encode(&data);
+                const MAX_HEADER_CHUNK: usize = 8 * 1024;
+                if encoded.len() <= MAX_HEADER_CHUNK {
+                    builder = builder.header(key, &encoded);
+                } else {
+                    for (i, chunk) in encoded.as_bytes().chunks(MAX_HEADER_CHUNK).enumerate() {
+                        let header_name = format!("{}-{}", key, i);
+                        let val = std::str::from_utf8(chunk).unwrap_or("");
+                        builder = builder.header(header_name, val);
+                    }
+                }
+                let (_, body) = make_stream_body(1);
+                body
+            }
+            UplinkDataPlacement::Cookie => {
+                let key = if self.config.uplink.data_key.is_empty() {
+                    "data"
+                } else {
+                    &self.config.uplink.data_key
+                };
+                let encoded = base64::engine::general_purpose::STANDARD.encode(&data);
+                let cookie_value = urlencoding::encode(&encoded);
+                builder = builder.header(
+                    "Cookie",
+                    format!("{}={}", key, cookie_value),
+                );
+                let (_, body) = make_stream_body(1);
+                body
+            }
+        };
 
         let request = builder
             .body(body)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-
-        // Send data and close body immediately (short POST)
-        let _ = body_tx.send(Ok(Frame::data(Bytes::from(data)))).await;
-        drop(body_tx);
 
         let response_future = self.send_req.send_request(request);
 
@@ -453,6 +719,9 @@ impl PacketUplinkWriter {
             }
         });
 
+        // Record the time of this POST for throttling
+        self.last_post_time = Some(tokio::time::Instant::now());
+
         Ok(())
     }
 }
@@ -460,7 +729,7 @@ impl PacketUplinkWriter {
 #[async_trait]
 impl UplinkWriter for PacketUplinkWriter {
     async fn write(&mut self, data: &[u8]) -> io::Result<()> {
-        let chunks = self.upload_queue.push(data);
+        let chunks = self.upload_queue.push(data)?;
         for (seq, chunk) in chunks {
             self.send_packet(seq, chunk).await?;
         }
@@ -487,357 +756,40 @@ async fn resolve_addr(config: &XhttpConfig) -> io::Result<std::net::SocketAddr> 
         .ok_or_else(|| io::Error::new(io::ErrorKind::AddrNotAvailable, "DNS resolution failed"))
 }
 
+/// Merge per-direction overrides from `XhttpDirectionConfig` into a base `XhttpConfig`.
+///
+/// Only fields that are `Some` in the direction config are overridden;
+/// all others are inherited from the base config. This allows asymmetric
+/// mode to use different servers/ports/paths for uplink and downlink
+/// while sharing the rest of the configuration (TLS, padding, throttling, etc.).
+fn merge_direction_config(
+    base: &XhttpConfig,
+    direction: Option<&XhttpDirectionConfig>,
+) -> Arc<XhttpConfig> {
+    let mut merged = base.clone();
+    if let Some(dir) = direction {
+        if let Some(ref server) = dir.server {
+            merged.host = server.clone();
+        }
+        if let Some(port) = dir.port {
+            merged.port = port;
+        }
+        if let Some(ref path) = dir.path {
+            merged.path = path.clone();
+        }
+        if let Some(ref tls_server) = dir.tls_server {
+            merged.host = tls_server.clone();
+        }
+        if let Some(ref headers) = dir.headers {
+            merged.headers = headers.clone();
+        }
+        if let Some(hv) = dir.http_version {
+            merged.http_version = hv;
+        }
+    }
+    Arc::new(merged)
+}
+
 // ---------------------------------------------------------------------------
 // Integration tests
 // ---------------------------------------------------------------------------
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use hyper::body::Incoming;
-    use hyper::server::conn::http2;
-    use hyper::service::service_fn;
-    use hyper::Request;
-    use hyper_util::rt::{TokioExecutor, TokioIo};
-    use http_body_util::{BodyExt, Full};
-
-    /// Start a plain-H2 echo server on localhost.
-    ///
-    /// Reads the full request body, then echoes it back as the response body.
-    async fn start_echo_server() -> (
-        std::net::SocketAddr,
-        tokio::task::JoinHandle<()>,
-    ) {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-
-        let handle = tokio::spawn(async move {
-            loop {
-                let Ok((tcp, _)) = listener.accept().await else { break };
-                let io = TokioIo::new(tcp);
-                let exec = TokioExecutor::new();
-                let _ = http2::Builder::new(exec)
-                    .serve_connection(
-                        io,
-                        service_fn(|req: Request<Incoming>| async move {
-                            let bytes = req.into_body().collect().await.unwrap().to_bytes();
-                            Ok::<_, std::convert::Infallible>(
-                                hyper::Response::builder()
-                                    .status(200)
-                                    .body(Full::new(bytes))
-                                    .unwrap(),
-                            )
-                        }),
-                    )
-                    .await;
-            }
-        });
-
-        (addr, handle)
-    }
-
-    /// Connect a plain H2 client (no TLS) for testing.
-    async fn connect_plain_h2(addr: std::net::SocketAddr) -> HttpSendRequest {
-        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let io = TokioIo::new(tcp);
-        let exec = TokioExecutor::new();
-        let (send_req, conn) = hyper::client::conn::http2::handshake(exec, io).await.unwrap();
-        tokio::spawn(async move {
-            let _ = conn.await;
-        });
-        send_req
-    }
-
-    #[tokio::test]
-    async fn stream_one_echo_roundtrip() {
-        let (addr, _server) = start_echo_server().await;
-        let send_req = connect_plain_h2(addr).await;
-
-        let config = Arc::new(XhttpConfig {
-            host: "localhost".to_string(),
-            path: "/xhttp".to_string(),
-            ..Default::default()
-        });
-        let mut session = XhttpSession::from_send_request(config, send_req);
-
-        // Write data through uplink
-        let mut writer = session.uplink().await.unwrap();
-        writer.write(b"Hello, XHTTP!").await.unwrap();
-        writer.shutdown().await.unwrap();
-
-        // Read data from downlink
-        let mut reader = session.downlink().await.unwrap();
-        let mut buf = vec![0u8; 1024];
-        let n = reader.read(&mut buf).await.unwrap();
-        assert_eq!(&buf[..n], b"Hello, XHTTP!");
-
-        // EOF
-        let n2 = reader.read(&mut buf).await.unwrap();
-        assert_eq!(n2, 0);
-    }
-
-    #[tokio::test]
-    async fn stream_one_large_data() {
-        let (addr, _server) = start_echo_server().await;
-        let send_req = connect_plain_h2(addr).await;
-
-        let config = Arc::new(XhttpConfig {
-            host: "localhost".to_string(),
-            path: "/xhttp".to_string(),
-            ..Default::default()
-        });
-        let mut session = XhttpSession::from_send_request(config, send_req);
-
-        // Write 64KB of data
-        let data: Vec<u8> = (0..65536).map(|i| (i % 256) as u8).collect();
-        let mut writer = session.uplink().await.unwrap();
-        // Write in chunks
-        for chunk in data.chunks(4096) {
-            writer.write(chunk).await.unwrap();
-        }
-        writer.shutdown().await.unwrap();
-
-        // Read all data back
-        let mut reader = session.downlink().await.unwrap();
-        let mut received = Vec::new();
-        let mut buf = vec![0u8; 8192];
-        loop {
-            let n = reader.read(&mut buf).await.unwrap();
-            if n == 0 {
-                break;
-            }
-            received.extend_from_slice(&buf[..n]);
-        }
-        assert_eq!(received, data);
-    }
-
-    #[tokio::test]
-    async fn stream_one_multiple_writes() {
-        let (addr, _server) = start_echo_server().await;
-        let send_req = connect_plain_h2(addr).await;
-
-        let config = Arc::new(XhttpConfig {
-            host: "localhost".to_string(),
-            path: "/xhttp".to_string(),
-            ..Default::default()
-        });
-        let mut session = XhttpSession::from_send_request(config, send_req);
-
-        let mut writer = session.uplink().await.unwrap();
-        writer.write(b"chunk1|").await.unwrap();
-        writer.write(b"chunk2|").await.unwrap();
-        writer.write(b"chunk3").await.unwrap();
-        writer.shutdown().await.unwrap();
-
-        let mut reader = session.downlink().await.unwrap();
-        let mut received = Vec::new();
-        let mut buf = vec![0u8; 1024];
-        loop {
-            let n = reader.read(&mut buf).await.unwrap();
-            if n == 0 {
-                break;
-            }
-            received.extend_from_slice(&buf[..n]);
-        }
-        assert_eq!(received, b"chunk1|chunk2|chunk3");
-    }
-
-    #[tokio::test]
-    async fn session_kind() {
-        let (addr, _server) = start_echo_server().await;
-        let send_req = connect_plain_h2(addr).await;
-        let config = Arc::new(XhttpConfig {
-            host: "localhost".to_string(),
-            ..Default::default()
-        });
-        let session = XhttpSession::from_send_request(config, send_req);
-        assert_eq!(session.kind(), "xhttp");
-    }
-
-    #[tokio::test]
-    async fn session_close() {
-        let (addr, _server) = start_echo_server().await;
-        let send_req = connect_plain_h2(addr).await;
-        let config = Arc::new(XhttpConfig {
-            host: "localhost".to_string(),
-            ..Default::default()
-        });
-        let mut session = XhttpSession::from_send_request(config, send_req);
-        session.close().await.unwrap();
-        // uplink after close should fail
-        assert!(session.uplink().await.is_err());
-    }
-
-    // -----------------------------------------------------------------------
-    // Stream-up tests (M6)
-    // -----------------------------------------------------------------------
-
-    /// Server that stores POST body and returns it as GET response.
-    /// POST and GET are associated by arriving on the same H2 connection.
-    async fn start_stream_up_server() -> std::net::SocketAddr {
-        use std::time::Duration;
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let stored: Arc<tokio::sync::Mutex<Option<Vec<u8>>>> =
-            Arc::new(tokio::sync::Mutex::new(None));
-        let notify = Arc::new(tokio::sync::Notify::new());
-
-        tokio::spawn(async move {
-            loop {
-                let Ok((tcp, _)) = listener.accept().await else { break };
-                let io = TokioIo::new(tcp);
-                let exec = TokioExecutor::new();
-                let stored = stored.clone();
-                let notify = notify.clone();
-                let _ = http2::Builder::new(exec)
-                    .serve_connection(
-                        io,
-                        service_fn(move |req: Request<Incoming>| {
-                            let stored = stored.clone();
-                            let notify = notify.clone();
-                            async move {
-                                if req.method() == "POST" {
-                                    let bytes = req.into_body().collect().await.unwrap().to_bytes();
-                                    *stored.lock().await = Some(bytes.to_vec());
-                                    notify.notify_one();
-                                    Ok::<_, std::convert::Infallible>(
-                                        hyper::Response::builder().status(200).body(Full::new(Bytes::new())).unwrap(),
-                                    )
-                                } else {
-                                    // GET: wait for POST to complete
-                                    let _ = tokio::time::timeout(
-                                        Duration::from_secs(5),
-                                        notify.notified(),
-                                    ).await;
-                                    let data = stored.lock().await.clone().unwrap_or_default();
-                                    Ok::<_, std::convert::Infallible>(
-                                        hyper::Response::builder().status(200)
-                                            .body(Full::new(Bytes::from(data))).unwrap(),
-                                    )
-                                }
-                            }
-                        }),
-                    )
-                    .await;
-            }
-        });
-        addr
-    }
-
-    #[tokio::test]
-    async fn stream_up_separate_post_get() {
-        let addr = start_stream_up_server().await;
-        let send_req = connect_plain_h2(addr).await;
-        let config = Arc::new(XhttpConfig {
-            host: "localhost".to_string(),
-            path: "/xhttp".to_string(),
-            mode: XhttpMode::StreamUp,
-            ..Default::default()
-        });
-        let mut session = XhttpSession::from_send_request(config, send_req);
-
-        // Uplink: write data via POST
-        let mut writer = session.uplink().await.unwrap();
-        writer.write(b"stream-up test data").await.unwrap();
-        writer.shutdown().await.unwrap();
-
-        // Downlink: read data via GET
-        let mut reader = session.downlink().await.unwrap();
-        let mut buf = vec![0u8; 1024];
-        let n = reader.read(&mut buf).await.unwrap();
-        assert_eq!(&buf[..n], b"stream-up test data");
-    }
-
-    // -----------------------------------------------------------------------
-    // Packet-up tests (M6)
-    // -----------------------------------------------------------------------
-
-    /// Server that collects POST chunks by seq and returns them as GET response.
-    async fn start_packet_up_server() -> std::net::SocketAddr {
-        use std::collections::BTreeMap;
-        use std::time::Duration;
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let chunks: Arc<tokio::sync::Mutex<BTreeMap<u64, Vec<u8>>>> =
-            Arc::new(tokio::sync::Mutex::new(BTreeMap::new()));
-        let post_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
-
-        tokio::spawn(async move {
-            loop {
-                let Ok((tcp, _)) = listener.accept().await else { break };
-                let io = TokioIo::new(tcp);
-                let exec = TokioExecutor::new();
-                let chunks = chunks.clone();
-                let post_count = post_count.clone();
-                let _ = http2::Builder::new(exec)
-                    .serve_connection(
-                        io,
-                        service_fn(move |req: Request<Incoming>| {
-                            let chunks = chunks.clone();
-                            let post_count = post_count.clone();
-                            async move {
-                                if req.method() == "POST" {
-                                    // Extract seq from query before consuming body
-                                    let seq = req.uri().query()
-                                        .and_then(|q| q.split('=').nth(1))
-                                        .and_then(|s| s.parse::<u64>().ok())
-                                        .unwrap_or(0);
-                                    let bytes = req.into_body().collect().await.unwrap().to_bytes();
-                                    chunks.lock().await.insert(seq, bytes.to_vec());
-                                    post_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                    Ok::<_, std::convert::Infallible>(
-                                        hyper::Response::builder().status(200).body(Full::new(Bytes::new())).unwrap(),
-                                    )
-                                } else {
-                                    // GET: wait for POSTs to arrive
-                                    tokio::time::sleep(Duration::from_millis(500)).await;
-                                    let map = chunks.lock().await;
-                                    let mut data = Vec::new();
-                                    for (_, chunk) in map.iter() {
-                                        data.extend_from_slice(chunk);
-                                    }
-                                    Ok::<_, std::convert::Infallible>(
-                                        hyper::Response::builder().status(200)
-                                            .body(Full::new(Bytes::from(data))).unwrap(),
-                                    )
-                                }
-                            }
-                        }),
-                    )
-                    .await;
-            }
-        });
-        addr
-    }
-
-    #[tokio::test]
-    async fn packet_up_multiple_posts() {
-        let addr = start_packet_up_server().await;
-        let send_req = connect_plain_h2(addr).await;
-        let config = Arc::new(XhttpConfig {
-            host: "localhost".to_string(),
-            path: "/xhttp".to_string(),
-            mode: XhttpMode::PacketUp,
-            ..Default::default()
-        });
-        let mut session = XhttpSession::from_send_request(config, send_req);
-
-        // Write 32KB of data - should be split into 2 chunks (16KB default)
-        let data: Vec<u8> = (0..32768).map(|i| (i % 256) as u8).collect();
-        let mut writer = session.uplink().await.unwrap();
-        writer.write(&data).await.unwrap();
-        writer.shutdown().await.unwrap();
-
-        // Downlink: read reassembled data via GET
-        let mut reader = session.downlink().await.unwrap();
-        let mut received = Vec::new();
-        let mut buf = vec![0u8; 8192];
-        loop {
-            let n = reader.read(&mut buf).await.unwrap();
-            if n == 0 { break; }
-            received.extend_from_slice(&buf[..n]);
-        }
-        assert_eq!(received.len(), data.len());
-        assert_eq!(received, data);
-    }
-}

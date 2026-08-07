@@ -1,30 +1,22 @@
 use std::collections::HashMap;
-use std::io::ErrorKind;
-use std::io::{
-    self,
-};
+use std::io::{self};
 use std::net::SocketAddr;
-use std::net::TcpStream;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use crate::config::OutboundConfig;
-
-pub mod mux;
 use crate::inbound::Address;
 use crate::inbound::Destination;
 use crate::outbound::OutboundClient;
-use crate::outbound::common::connect_tcp_bypass_sync;
-use crate::outbound::common::create_tls_stream;
-use crate::tlsfragment::FragmentConfig;
+use crate::outbound::common::connect_tcp_bypass;
 use crate::outbound::common::resolve_sni;
 use crate::protocol::vless::VlessCommand;
 use crate::protocol::vless::encode_request_bytes;
 use crate::relay::PacketRelay;
 use crate::relay::StreamRelay;
-use crate::transport::ws::WsConn;
+use crate::tlsfragment::FragmentConfig;
 use crate::transport::ws::WsConnAsync;
 use crate::transport::ws::WsConnAsyncReader;
 use crate::transport::ws::WsConnAsyncWriter;
@@ -34,46 +26,6 @@ use tokio::io::ReadHalf;
 use tokio::io::WriteHalf;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TryRecvError;
-
-// ---------------------------------------------------------------------------
-// Unified WS stream — supports TLS and plain TCP
-pub(crate) enum WsStream {
-    Plain(WsConn<TcpStream>),
-    Tls(WsConn<crate::outbound::common::TlsStream>),
-}
-
-impl WsStream {
-    pub(crate) fn set_read_timeout(&self, dur: Duration) -> io::Result<()> {
-        match self {
-            WsStream::Plain(ws) => ws.get_ref().set_read_timeout(Some(dur)),
-            WsStream::Tls(ws) =>
-                ws.get_ref().get_ref().get_ref().set_read_timeout(Some(dur)),
-        }
-    }
-}
-
-impl WsStream {
-    pub(crate) fn send(&mut self, data: &[u8]) -> io::Result<()> {
-        match self {
-            WsStream::Plain(c) => c.send(data),
-            WsStream::Tls(c) => c.send(data),
-        }
-    }
-
-    pub(crate) fn recv(&mut self) -> io::Result<Vec<u8>> {
-        match self {
-            WsStream::Plain(c) => c.recv(),
-            WsStream::Tls(c) => c.recv(),
-        }
-    }
-
-    pub(crate) fn close(&mut self) -> io::Result<()> {
-        match self {
-            WsStream::Plain(c) => c.close(),
-            WsStream::Tls(c) => c.close(),
-        }
-    }
-}
 
 // ---------------------------------------------------------------------------
 // UUID parsing
@@ -94,23 +46,21 @@ pub(crate) fn parse_uuid(
     Ok(out)
 }
 // ---------------------------------------------------------------------------
-// Constants — tune pool size and multiplexing mode
+// Constants — tune pool size
+// ---------------------------------------------------------------------------
+// Pool water mark — read from config at construction time.
+// Default matches the old hardcoded value for backward compatibility.
 // ---------------------------------------------------------------------------
 
-/// Set to `true` once the server side supports stream multiplexing over
-/// a single WS connection (requires edgetunnel changes).
-#[allow(dead_code)]
-const MUX_ENABLED: bool = false;
-
-/// Number of pre-built WS connections the pool tries to keep ready.
-const POOL_WATER_MARK: usize = 15;
+/// Default number of pre-built WS connections the pool tries to keep ready.
+const DEFAULT_POOL_WATER_MARK: usize = 30;
 
 // ---------------------------------------------------------------------------
 // VLESS Pool — a set of WS connections ready for immediate VLESS handshake
 // ---------------------------------------------------------------------------
 
 struct VlessPool {
-    ready: tokio::sync::Mutex<std::collections::VecDeque<WsStream>>,
+    ready: tokio::sync::Mutex<std::collections::VecDeque<WsStreamAsync>>,
     building: AtomicUsize,
     addr: SocketAddr,
     tls_server: String,
@@ -119,6 +69,8 @@ struct VlessPool {
     fragment: Option<FragmentConfig>,
     transport_path: String,
     transport_headers: HashMap<String, String>,
+    /// Target pool size (water mark).
+    water_mark: usize,
 }
 
 impl VlessPool {
@@ -126,6 +78,7 @@ impl VlessPool {
         addr: SocketAddr, tls_server: String, insecure: bool, tls_fp: bool,
         fragment: Option<FragmentConfig>,
         transport_path: String, transport_headers: HashMap<String, String>,
+        water_mark: usize,
     ) -> Arc<Self> {
         Arc::new(Self {
             ready: tokio::sync::Mutex::new(std::collections::VecDeque::new()),
@@ -137,18 +90,19 @@ impl VlessPool {
             fragment,
             transport_path,
             transport_headers,
+            water_mark,
         })
     }
 
     /// Take a ready WS connection. Returns `None` if the pool is empty.
-    async fn acquire(&self) -> Option<WsStream> {
+    async fn acquire(&self) -> Option<WsStreamAsync> {
         self.ready.lock().await.pop_front()
     }
 
-    /// Build a fresh WS connection (TCP + optional TLS + WS upgrade).
-    fn build_one(&self) -> io::Result<WsStream> {
-        let tcp = connect_tcp_bypass_sync(self.addr)?;
-        build_ws(
+    /// Build a fresh WS connection (TCP + optional TLS + WS upgrade), fully async.
+    async fn build_one(&self) -> io::Result<WsStreamAsync> {
+        let tcp = connect_tcp_bypass(self.addr).await?;
+        build_ws_async(
             tcp,
             &self.tls_server,
             self.insecure,
@@ -157,14 +111,15 @@ impl VlessPool {
             &self.transport_path,
             &self.transport_headers,
         )
+        .await
     }
 
     /// Push a pre-built WS connection back into the pool.
-    fn replenish(&self) {
-        match self.build_one() {
+    async fn replenish(&self) {
+        match self.build_one().await {
             Ok(ws) => {
-                let mut ready = self.ready.blocking_lock();
-                if ready.len() < POOL_WATER_MARK {
+                let mut ready = self.ready.lock().await;
+                if ready.len() < self.water_mark {
                     ready.push_back(ws);
                 }
             },
@@ -176,7 +131,7 @@ impl VlessPool {
 
     fn spawn_build(self: &Arc<Self>) {
         let current = self.building.load(Ordering::Relaxed);
-        if current >= POOL_WATER_MARK {
+        if current >= self.water_mark {
             return;
         }
         if self
@@ -193,8 +148,8 @@ impl VlessPool {
         }
 
         let this = self.clone();
-        tokio::task::spawn_blocking(move || {
-            this.replenish();
+        tokio::spawn(async move {
+            this.replenish().await;
             this.building.fetch_sub(1, Ordering::Relaxed);
         });
     }
@@ -207,7 +162,7 @@ impl VlessPool {
                 tokio::time::sleep(std::time::Duration::from_millis(250)).await;
                 let ready = this.ready.lock().await.len();
                 let building = this.building.load(Ordering::Relaxed);
-                for _ in (ready + building)..POOL_WATER_MARK {
+                for _ in (ready + building)..this.water_mark {
                     this.spawn_build();
                 }
             }
@@ -220,8 +175,6 @@ impl VlessPool {
 pub struct VlessOutboundClient {
     pool: Arc<VlessPool>,
     uuid: [u8; 16],
-    /// Mux session — replaces pool when `mux = true`.
-    mux_session: Option<Arc<crate::outbound::vless::mux::MuxSession>>,
 }
 
 impl VlessOutboundClient {
@@ -259,28 +212,19 @@ impl VlessOutboundClient {
         transport_headers
             .entry("Host".to_string())
             .or_insert_with(|| tls_server.clone());
-        let mux = cfg.mux;
         let fragment = if cfg.tls_fragment {
             Some(FragmentConfig::default())
         } else {
             None
         };
-        let mux_session = if mux {
-            let session = crate::outbound::vless::mux::MuxSession::spawn(
-                addr,
-                uuid,
-                &tls_server,
-                insecure,
-                tls_fp,
-                fragment.as_ref(),
-                &transport_path,
-                &transport_headers,
-            )
-            .map_err(|e| format!("vless mux: {e}"))?;
-            Some(session)
-        } else {
-            None
-        };
+
+        // Pool size from [outbounds.xmux].pool_size (default: 30).
+        let water_mark = cfg
+            .xmux
+            .as_ref()
+            .and_then(|x| x.pool_size)
+            .unwrap_or(DEFAULT_POOL_WATER_MARK)
+            .max(1);
 
         let pool = VlessPool::new(
             addr,
@@ -290,15 +234,13 @@ impl VlessOutboundClient {
             fragment,
             transport_path.clone(),
             transport_headers.clone(),
+            water_mark,
         );
-        if !mux {
-            pool.spawn_replenish();
-        }
+        pool.spawn_replenish();
 
         Ok(Self {
             pool,
             uuid,
-            mux_session,
         })
     }
 }
@@ -308,19 +250,11 @@ impl OutboundClient for VlessOutboundClient {
     async fn dial(
         &self, dest: &Destination,
     ) -> Result<Box<dyn StreamRelay>, Box<dyn std::error::Error>> {
-        if let Some(ref session) = self.mux_session {
-            return session
-                .dial_stream(&self.uuid, VlessCommand::Tcp, dest)
-                .await;
-        }
-
         let ws = if let Some(ws) = self.pool.acquire().await {
-            let p = self.pool.clone();
-            p.spawn_build();
+            self.pool.spawn_build();
             ws
         } else {
-            let p = self.pool.clone();
-            tokio::task::spawn_blocking(move || p.build_one()).await??
+            self.pool.build_one().await?
         };
         let state =
             Arc::new(tokio::sync::Mutex::new(DeferredTcpState::Pending {
@@ -347,17 +281,11 @@ impl OutboundClient for VlessOutboundClient {
             return Err(crate::outbound::common::ERR_UDP_NOT_SUPPORTED.into());
         }
 
-        if self.mux_session.is_some() {
-            // Mux doesn't support UDP — fall through to pool/fresh path.
-        }
-
         let ws = if let Some(ws) = self.pool.acquire().await {
-            let p = self.pool.clone();
-            p.spawn_build();
+            self.pool.spawn_build();
             ws
         } else {
-            let p = self.pool.clone();
-            tokio::task::spawn_blocking(move || p.build_one()).await??
+            self.pool.build_one().await?
         };
         let state =
             Arc::new(tokio::sync::Mutex::new(DeferredUdpState::Pending {
@@ -401,61 +329,116 @@ fn split_vless_response(resp: Vec<u8>) -> io::Result<Vec<u8>> {
     Ok(data)
 }
 
-fn relay_loop(
-    mut ws: WsStream, data_tx: mpsc::UnboundedSender<Vec<u8>>,
-    mut outbound_rx: mpsc::UnboundedReceiver<Vec<u8>>,
-) -> io::Result<()> {
-    ws.set_read_timeout(Duration::from_millis(100))?;
-    loop {
-        match outbound_rx.try_recv() {
-            Ok(data) =>
-                if let Err(e) = ws.send(&data) {
-                    log::error!("vless relay send error: {e}");
-                    break;
-                },
-            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {},
-            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-                ws.close().ok();
-                break;
-            },
-        }
-        match ws.recv() {
-            Ok(payload) =>
-                if data_tx.send(payload).is_err() {
-                    break;
-                },
-            Err(ref e)
-                if e.kind() == ErrorKind::TimedOut ||
-                    e.kind() == ErrorKind::WouldBlock =>
-            {
-                continue;
-            },
-            Err(e) => {
-                log::debug!("vless relay recv error: {e}");
-                break;
-            },
-        }
-    }
-    Ok(())
-}
+/// Spawn an async relay for an established VLESS connection.
+///
+/// Performs the VLESS handshake (header + bundled first payload), then splits
+/// the WS into reader/writer halves and runs async read/write loops — fully
+/// async, no `spawn_blocking`, so a stuck connection can't wedge the tokio
+/// blocking pool (and thus Ctrl+C shutdown).
+fn spawn_vless_relay(
+    ws: WsStreamAsync,
+    uuid: [u8; 16],
+    dest: Destination,
+    command: VlessCommand,
+    first_payload: Vec<u8>,
+    data_tx: mpsc::UnboundedSender<Vec<u8>>,
+    outbound_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+) {
+    tokio::spawn(async move {
+        let mut ws = ws;
 
-pub(crate) fn build_ws(
-    tcp: TcpStream, tls_server: &str, insecure: bool, tls_fp: bool,
-    fragment: Option<&FragmentConfig>,
-    path: &str, headers: &HashMap<String, String>,
-) -> io::Result<WsStream> {
-    let host = tls_server;
-    let hdrs: Vec<(&str, &str)> = headers
-        .iter()
-        .map(|(k, v)| (k.as_str(), v.as_str()))
-        .collect();
-    if tls_server.is_empty() {
-        let ws = WsConn::upgrade(tcp, path, host, &hdrs)?;
-        return Ok(WsStream::Plain(ws));
-    }
-    let ssl_stream = create_tls_stream(tcp, host, tls_fp, insecure, fragment)?;
-    let ws = WsConn::upgrade(ssl_stream, path, host, &hdrs)?;
-    Ok(WsStream::Tls(ws))
+        // 1. VLESS handshake: send header + first payload, read response.
+        let mut req = encode_request_bytes(&uuid, None, command, &dest);
+        req.extend_from_slice(&first_payload);
+        if let Err(e) = ws.send(&req).await {
+            log::error!("vless relay handshake send: {e}");
+            return;
+        }
+        let resp = match ws.recv().await {
+            Ok(r) => r,
+            Err(e) => {
+                log::error!("vless relay handshake recv: {e}");
+                return;
+            }
+        };
+        let initial = match split_vless_response(resp) {
+            Ok(d) => d,
+            Err(e) => {
+                log::error!("vless relay handshake decode: {e}");
+                return;
+            }
+        };
+        if !initial.is_empty() {
+            let _ = data_tx.send(initial);
+        }
+        log::debug!("vless relay handshake complete ({dest})");
+
+        // 2. Split into independent reader/writer tasks (concurrent I/O).
+        let (reader, writer) = ws.into_split();
+        let (pong_tx, pong_rx) = mpsc::channel::<Vec<u8>>(8);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let read_task = {
+            let data_tx = data_tx.clone();
+            let pong_tx = pong_tx.clone();
+            tokio::spawn(async move {
+                let mut reader = reader;
+                loop {
+                    match reader.recv().await {
+                        Ok(WsFrame::Binary(d)) => {
+                            if data_tx.send(d).is_err() {
+                                break;
+                            }
+                        }
+                        Ok(WsFrame::Ping(p)) => {
+                            let _ = pong_tx.send(p).await;
+                        }
+                        Err(e) => {
+                            log::debug!("vless relay recv error: {e}");
+                            break;
+                        }
+                    }
+                }
+                let _ = shutdown_tx.send(());
+            })
+        };
+
+        let write_task = tokio::spawn(async move {
+            let mut writer = writer;
+            let mut pong_rx = pong_rx;
+            let mut outbound_rx = outbound_rx;
+            let mut shutdown_rx = shutdown_rx;
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = &mut shutdown_rx => break,
+                    pong = pong_rx.recv() => {
+                        match pong {
+                            Some(p) => {
+                                if writer.send_pong(&p).await.is_err() {
+                                    break;
+                                }
+                            }
+                            None => break,
+                        }
+                    }
+                    data = outbound_rx.recv() => {
+                        match data {
+                            Some(d) => {
+                                if writer.send(&d).await.is_err() {
+                                    break;
+                                }
+                            }
+                            None => break,
+                        }
+                    }
+                }
+            }
+            let _ = writer.close().await;
+        });
+
+        let _ = tokio::join!(read_task, write_task);
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -561,12 +544,8 @@ impl WsStreamAsync {
 
 /// Build an async WebSocket connection over TCP (optional TLS).
 ///
-/// This mirrors [`build_ws`] but uses `tokio_boring` for async TLS and
-/// `WsConnAsync` for async WebSocket framing. The entire handshake is
-/// fully async — no `spawn_blocking`.
-///
-/// **TLS fragment** is not yet supported on the async path. If `fragment`
-/// is `Some`, a warning is logged and fragment is ignored.
+/// Uses `tokio_boring` for async TLS and `WsConnAsync` for async WebSocket
+/// framing. The entire handshake is fully async — no `spawn_blocking`.
 pub(crate) async fn build_ws_async(
     tcp: tokio::net::TcpStream,
     tls_server: &str,
@@ -634,7 +613,7 @@ impl StreamRelay for VlessStreamRelay {
 
 enum DeferredTcpState {
     Pending {
-        ws: Option<WsStream>,
+        ws: Option<WsStreamAsync>,
         uuid: [u8; 16],
         dest: Destination,
     },
@@ -689,42 +668,15 @@ impl StreamRelay for VlessDeferredStreamRelay {
     async fn write(&mut self, buf: &[u8]) -> io::Result<()> {
         let mut guard = self.state.lock().await;
         if let DeferredTcpState::Pending { ws, uuid, dest } = &mut *guard {
-            let mut ws = ws.take().expect("ws already taken");
+            let ws = ws.take().expect("ws already taken");
             let uuid = *uuid;
             let dest = dest.clone();
             let first = buf.to_vec();
             let (data_tx, data_rx) = mpsc::unbounded_channel();
             let (outbound_tx, outbound_rx) = mpsc::unbounded_channel();
-            tokio::task::spawn_blocking(move || {
-                let mut req =
-                    encode_request_bytes(&uuid, None, VlessCommand::Tcp, &dest);
-                req.extend_from_slice(&first);
-                if let Err(e) = ws.send(&req) {
-                    log::error!("vless tcp handshake send: {e}");
-                    return;
-                }
-                let resp = match ws.recv() {
-                    Ok(r) => r,
-                    Err(e) => {
-                        log::error!("vless tcp handshake recv: {e}");
-                        return;
-                    },
-                };
-                let initial = match split_vless_response(resp) {
-                    Ok(data) => data,
-                    Err(e) => {
-                        log::error!("vless tcp handshake decode: {e}");
-                        return;
-                    },
-                };
-                if !initial.is_empty() {
-                    let _ = data_tx.send(initial);
-                }
-                log::debug!("vless tcp handshake complete ({})", dest);
-                if let Err(e) = relay_loop(ws, data_tx, outbound_rx) {
-                    log::error!("vless tcp relay: {e}");
-                }
-            });
+            spawn_vless_relay(
+                ws, uuid, dest, VlessCommand::Tcp, first, data_tx, outbound_rx,
+            );
             *guard = DeferredTcpState::Active {
                 data_rx,
                 outbound_tx,
@@ -795,7 +747,7 @@ impl PacketRelay for VlessPacketRelay {
 
 enum DeferredUdpState {
     Pending {
-        ws: Option<WsStream>,
+        ws: Option<WsStreamAsync>,
         uuid: [u8; 16],
         dest: Destination,
     },
@@ -846,43 +798,15 @@ impl PacketRelay for VlessDeferredPacketRelay {
         let mut guard = self.state.lock().await;
         // On first write: do VLESS handshake with payload bundled.
         if let DeferredUdpState::Pending { ws, uuid, dest } = &mut *guard {
-            let mut ws = ws.take().expect("ws already taken");
+            let ws = ws.take().expect("ws already taken");
             let uuid = *uuid;
             let dest = dest.clone();
             let first = buf.to_vec();
             let (data_tx, data_rx) = mpsc::unbounded_channel();
             let (outbound_tx, outbound_rx) = mpsc::unbounded_channel();
-            tokio::task::spawn_blocking(move || {
-                // VLESS header + first UDP payload in one WS frame.
-                let mut req =
-                    encode_request_bytes(&uuid, None, VlessCommand::Udp, &dest);
-                req.extend_from_slice(&first);
-                if let Err(e) = ws.send(&req) {
-                    log::error!("vless udp handshake send: {e}");
-                    return;
-                }
-                let resp = match ws.recv() {
-                    Ok(r) => r,
-                    Err(e) => {
-                        log::error!("vless udp handshake recv: {e}");
-                        return;
-                    },
-                };
-                let initial = match split_vless_response(resp) {
-                    Ok(data) => data,
-                    Err(e) => {
-                        log::error!("vless udp handshake decode: {e}");
-                        return;
-                    },
-                };
-                if !initial.is_empty() {
-                    let _ = data_tx.send(initial);
-                }
-                log::debug!("vless udp handshake complete ({})", dest);
-                if let Err(e) = relay_loop(ws, data_tx, outbound_rx) {
-                    log::error!("vless udp relay: {e}");
-                }
-            });
+            spawn_vless_relay(
+                ws, uuid, dest, VlessCommand::Udp, first, data_tx, outbound_rx,
+            );
             *guard = DeferredUdpState::Active {
                 data_rx,
                 outbound_tx,

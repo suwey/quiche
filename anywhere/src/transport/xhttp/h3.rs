@@ -115,16 +115,19 @@ impl TransportSession for H3Session {
             &self.config.path, &self.session_id, None,
         );
 
-        let mut headers = self.build_h3_headers("POST", &path);
+        // Apply padding before building headers so Query placement can modify the URL
+        let mut pad_path = path;
+        let mut pad_headers = Vec::new();
+        if let Some(ref pad) = self.padding {
+            pad.apply_to_request_mut(&mut pad_path, &mut pad_headers);
+        }
+
+        let mut headers = self.build_h3_headers("POST", &pad_path);
         for (k, v) in &extra_headers {
             headers.push(quiche::h3::Header::new(k.as_bytes(), v.as_bytes()));
         }
-        if let Some(ref pad) = self.padding {
-            let mut pad_headers = Vec::new();
-            pad.apply_to_request(&path, &mut pad_headers);
-            for (k, v) in pad_headers {
-                headers.push(quiche::h3::Header::new(k.as_bytes(), v.as_bytes()));
-            }
+        for (k, v) in pad_headers {
+            headers.push(quiche::h3::Header::new(k.as_bytes(), v.as_bytes()));
         }
 
         let (body_tx, body_rx) = tokio::sync::oneshot::channel::<OutboundFrameSender>();

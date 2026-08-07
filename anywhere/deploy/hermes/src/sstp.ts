@@ -53,7 +53,7 @@ interface SstpPacket {
 
 export async function sstpConnect(proxy: ParsedProxyAddress, targetHost: string, targetPort: number, TCP连接: TCPConnector): Promise<TCPSocket> {
 	const merged: ParsedProxyAddress = { ...proxy, username: proxy.username ?? undefined, password: proxy.password ?? undefined };
-	let bufferedBytes = SSTP_EMPTY_BYTES;
+	let bufferedBytes: Uint8Array = SSTP_EMPTY_BYTES;
 	let pppIdentifier = 1;
 	let socket: TCPSocket | null = null;
 	let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;

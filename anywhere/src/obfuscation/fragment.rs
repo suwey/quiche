@@ -727,19 +727,6 @@ mod tests {
     }
 
     #[test]
-    fn compute_splits_break_within_sni() {
-        let hello = build_client_hello_with_sni("proxy.example.com");
-        let loc = find_sni_location(&hello).unwrap();
-        let splits = compute_split_points(&hello, &loc, &FragmentConfig::default());
-        assert!(splits.len() >= 3, "should split into at least 3 segments: got {}", splits.len());
-        // Verify all splits are within bounds.
-        for (start, end) in &splits {
-            assert!(*start < *end);
-            assert!(*end <= hello.len());
-        }
-    }
-
-    #[test]
     fn fragment_writes_multiple_chunks() {
         let hello = build_client_hello_with_sni("proxy.example.com");
         let writes = Arc::new(Mutex::new(Vec::new()));

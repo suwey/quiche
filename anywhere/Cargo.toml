@@ -20,6 +20,7 @@ serde = { workspace = true, features = ["derive"] }
 toml = "1.1.2"
 async-trait = "0.1"
 base64 = "0.22"
+urlencoding = "2.1"
 boring = { workspace = true, features = ["pq-experimental"] }
 boring-sys = "4.3.0"
 tokio-boring = "4.22.0"

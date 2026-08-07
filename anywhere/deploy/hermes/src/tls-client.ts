@@ -107,7 +107,7 @@ async function digestBytes(hash: string, data: Uint8Array): Promise<Uint8Array> 
 }
 async function tls12Prf(secret: Uint8Array, label: string, seed: Uint8Array, length: number, hash = 'SHA-256'): Promise<Uint8Array> {
 	const labelSeed = concatBytes(textEncoder.encode(label), seed);
-	let output = new Uint8Array(0);
+	let output: Uint8Array = new Uint8Array(0);
 	let currentA = labelSeed;
 	while (output.length < length) {
 		currentA = await hmac(hash, secret, currentA);
@@ -125,8 +125,8 @@ async function hkdfExpandLabel(hash: string, secret: Uint8Array, label: string, 
 	const info = tlsBytes(uint16be(length), fullLabel.length, fullLabel, context.length, context);
 	const hashLen = hashByteLength(hash);
 	const roundCount = Math.ceil(length / hashLen);
-	let output = new Uint8Array(0);
-	let previousBlock = new Uint8Array(0);
+	let output: Uint8Array = new Uint8Array(0);
+	let previousBlock: Uint8Array = new Uint8Array(0);
 	for (let round = 1; round <= roundCount; round++) {
 		previousBlock = await hmac(hash, secret, concatBytes(previousBlock, info, new Uint8Array([round])));
 		output = concatBytes(output, previousBlock);
@@ -322,7 +322,7 @@ interface TlsRecord {
 }
 
 class TlsRecordParser {
-	private buffer = new Uint8Array(0);
+	private buffer: Uint8Array = new Uint8Array(0);
 	feed(chunk: Uint8Array | ArrayBuffer | ArrayBufferView): void {
 		const bytes = 数据转Uint8Array(chunk);
 		this.buffer = this.buffer.length ? concatBytes(this.buffer, bytes) : bytes;
@@ -347,7 +347,7 @@ interface HandshakeMessage {
 }
 
 class TlsHandshakeParser {
-	private buffer = new Uint8Array(0);
+	private buffer: Uint8Array = new Uint8Array(0);
 	feed(chunk: Uint8Array): void {
 		const bytes = 数据转Uint8Array(chunk);
 		this.buffer = this.buffer.length ? concatBytes(this.buffer, bytes) : bytes;

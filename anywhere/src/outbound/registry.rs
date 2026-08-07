@@ -252,10 +252,10 @@ mod tests {
             interval: None,
             url: None,
             insecure: false,
-            mux: false,
             idle_session_check_interval: None,
             idle_session_timeout: None,
             min_idle_session: None,
+            xmux: None,
             transport: None,
             tls_fragment: false,
         }

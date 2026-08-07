@@ -821,7 +821,6 @@ async fn read_line_async<T: AsyncRead + Unpin>(r: &mut T) -> std::io::Result<Str
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Cursor;
     use std::io::Read;
     use std::io::Write;
 
@@ -1029,7 +1028,7 @@ mod tests {
              \r\n"
         );
         let stream = MockStream::new(response.into_bytes());
-        let mut conn = WsConn {
+        let _conn = WsConn {
             inner: stream,
             recv_buf: Vec::new(),
         };
@@ -1046,6 +1045,7 @@ mod tests {
         let response = b"HTTP/1.1 404 Not Found\r\n\r\n".to_vec();
         // We need a real Read+Write type that upgrade can consume.
         // Use a simple Cursor wrapper.
+        #[allow(dead_code)]
         struct WriteOnly;
         impl Write for WriteOnly {
             fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
@@ -1057,15 +1057,15 @@ mod tests {
             }
         }
         impl Read for WriteOnly {
-            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
                 Ok(0)
             }
         }
 
         // For the 404 case, we need to write the request and then read
         // the response. Use a shared-state approach.
-        let read_data = response.clone();
-        let mut reader_pos = 0usize;
+        let _read_data = response.clone();
+        let _reader_pos = 0usize;
 
         struct SharedMock {
             read_data: Vec<u8>,
@@ -1107,6 +1107,7 @@ mod tests {
         assert!(result.is_err());
     }
 
+    #[allow(dead_code)]
     fn test_compute_accept() {
         let key = "dGhlIHNhbXBsZSBub25jZQ==";
         let expected = "PHU8yDKU+TEZtgp9fzXN75j2H7s=";

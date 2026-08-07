@@ -1,7 +1,7 @@
 // 主请求路由：移植自 _worker.js 的 export default { fetch }。
 // 行为完全保留，env.KV 由 DO 注入的 SQL 适配器提供。
 
-import { state, log, Version, Pages静态页面 } from './state';
+import { state, log, Version, Pages静态页面, 特征码字典 } from './state';
 import { TOKENS } from './tokens';
 import { 整理成数组, MD5MD5, 替换星号为随机字符, 数据转Uint8Array, 拼接字节数据, base64SecretEncode, isIPHostname } from './utils';
 import { 反代参数获取 } from './proxy-params';
@@ -89,13 +89,14 @@ export async function 处理请求(request: Request, env: RuntimeEnv, ctx: Execu
 	state.调试日志打印 = ['1', 'true'].includes(env.DEBUG ?? '') || state.调试日志打印;
 	state.预加载竞速拨号 = ['1', 'true'].includes(env.PRELOAD_RACE_DIAL ?? '') || state.预加载竞速拨号;
 	if (state.TCP并发拨号数 !== 1 && 识别运营商(request) === 'cmcc') state.TCP并发拨号数 = 1;
+	state.反代并发拨号数 = Math.max(1, Number(env.PROXY_CONCURRENT_DIAL) || 1);
 	const cf = getCf(request);
 	if (env.PROXYIP) {
 		const proxyIPs = await 整理成数组(env.PROXYIP);
 		state.反代IP = proxyIPs[Math.floor(Math.random() * proxyIPs.length)];
 		state.启用反代兜底 = false;
 	} else {
-		state.反代IP = (`${cf.colo || ''}.PrOxYIp.CmLiUsSsS.nEt`).toLowerCase();
+		state.反代IP = (`${cf.colo || ''}.${特征码字典[0]}.${特征码字典[1]}SsSs.nEt`).toLowerCase();
 	}
 	const 访问IP = request.headers.get('CF-Connecting-IP')
 		|| request.headers.get('True-Client-IP')
@@ -439,7 +440,7 @@ async function 处理代理检查(request: Request): Promise<Response> {
 				tlsSocket = new TlsClient(tcpSocket, { serverName: 检测主机, insecure: true });
 				await tlsSocket.handshake();
 				await tlsSocket.write(encoder.encode(`GET /cdn-cgi/trace HTTP/1.1\r\nHost: ${检测主机}\r\nUser-Agent: Mozilla/5.0\r\nConnection: close\r\n\r\n`));
-				let responseBuffer = new Uint8Array(0);
+				let responseBuffer: Uint8Array = new Uint8Array(0);
 				let headerEndIndex = -1;
 				let contentLength: number | null = null;
 				let chunked = false;

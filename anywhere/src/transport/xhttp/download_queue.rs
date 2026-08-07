@@ -5,6 +5,7 @@
 //!
 //! For packet-up (future: multiple GET responses): packets may arrive
 //! out of order, queue buffers and returns data in seq order.
+// TODO: M5 server-side — download queue is not yet used by the server.
 
 use std::collections::BTreeMap;
 

@@ -140,7 +140,7 @@ export async function httpsConnect(targetHost: string, targetPort: number, initi
 		const request = `CONNECT ${targetHost}:${targetPort} HTTP/1.1\r\nHost: ${targetHost}:${targetPort}\r\n${auth}User-Agent: Mozilla/5.0\r\nConnection: keep-alive\r\n\r\n`;
 		await tlsSocket.write(encoder.encode(request));
 
-		let responseBuffer = new Uint8Array(0);
+		let responseBuffer: Uint8Array = new Uint8Array(0);
 		let headerEndIndex = -1;
 		let bytesRead = 0;
 		while (headerEndIndex === -1 && bytesRead < 8192) {

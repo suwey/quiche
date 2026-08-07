@@ -1,12 +1,8 @@
 name = "openclaw"
 main = "_worker.js"
-compatibility_date = "2025-04-01"
+compatibility_date = "2025-11-04"
+keep_vars = true
 
 # [[kv_namespaces]]
 # binding = "KV"
 # id = ""
-# preview_id = ""
-
-[observability]
-enabled = true
-head_sampling_rate = 1

@@ -371,7 +371,11 @@ async fn io_loop(
 
     loop {
         tokio::select! {
-            biased;
+            // Fair select (no `biased`): the downlink (incoming video) must be
+            // polled even while the uplink (outgoing TCP ACKs) is busy, or a
+            // continuous ACK stream starves the downlink and caps throughput.
+            // (A `biased` select here prioritizes ws_rx and only reads the
+            // downlink when ws_rx is momentarily empty.)
             // Outgoing: plaintext from channel -> encrypt -> frame -> transport
             msg = ws_rx.recv() => {
                 let Some(m) = mux.upgrade() else { return; };

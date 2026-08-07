@@ -12,10 +12,13 @@ tag = "CF"
 server = "REDACTED"
 password = "5-9u0j-k-j"
 sni = "h.c.c"
-fp = true
-transport_type = "ws"
-transport_path = "/"
-transport_headers.Host = "h.c.c"
+
+[outbounds.transport]
+type = "ws"
+
+[outbounds.transport.ws]
+path = "/"
+headers = { Host = "h.c.c" }
 
 [[outbounds]]
 type = "urltest"

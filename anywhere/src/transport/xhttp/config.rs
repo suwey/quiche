@@ -158,6 +158,10 @@ pub struct ThrottleConfig {
 
 /// Xmux connection pool tuning.
 /// All defaults are 0 = unlimited (matching Xray defaults).
+///
+/// `pool_size` is used by WS-based outbounds (vless/mless) to control
+/// the number of pre-built WebSocket connections. It is ignored by
+/// XHTTP (which uses `max_connections` + `max_concurrency` instead).
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 pub struct XmuxConfig {
     /// Max concurrent streams per H2 connection (0 = unlimited).
@@ -178,6 +182,12 @@ pub struct XmuxConfig {
     /// Keep-alive period in seconds (0 = default).
     #[serde(default)]
     pub h_keep_alive_period: u64,
+    /// Number of parallel WS connections for vless/mless outbounds.
+    /// vless: number of pre-built WS connections to keep ready (default: 15).
+    /// mless: number of multiplexer instances, each with its own WS + crypto (default: 1).
+    /// Ignored by XHTTP transport.
+    #[serde(default)]
+    pub pool_size: Option<usize>,
 }
 
 // ---------------------------------------------------------------------------
@@ -266,12 +276,6 @@ pub struct XhttpConfig {
     /// Throttling for stream-up / packet-up.
     #[serde(default)]
     pub throttle: ThrottleConfig,
-
-    // --- Xmux ---
-
-    /// Connection pool tuning.
-    #[serde(default)]
-    pub xmux: XmuxConfig,
 }
 
 fn default_port() -> u16 { 443 }
@@ -301,7 +305,6 @@ impl Default for XhttpConfig {
             padding: None,
             uplink: UplinkDataConfig::default(),
             throttle: ThrottleConfig::default(),
-            xmux: XmuxConfig::default(),
         }
     }
 }
@@ -319,11 +322,12 @@ pub fn resolve_mode(cfg: &XhttpConfig) -> XhttpMode {
     }
 }
 
-/// Resolve the effective HTTP version: `Auto` becomes `Http2` for M3.
+/// Resolve the effective HTTP version: `Auto` becomes `Http2`.
+/// `Http3` is returned as-is (H3 is supported via h3.rs).
 pub fn resolve_http_version(cfg: &XhttpConfig) -> HttpVersionPref {
     match cfg.http_version {
         HttpVersionPref::Auto => HttpVersionPref::Http2,
-        HttpVersionPref::Http3 => HttpVersionPref::Http2, // H3 deferred to M6
+        HttpVersionPref::Http3 => HttpVersionPref::Http3,
         v => v,
     }
 }
@@ -366,7 +370,7 @@ mod tests {
         assert_eq!(resolve_http_version(&cfg), HttpVersionPref::Http2);
 
         let cfg = XhttpConfig { http_version: HttpVersionPref::Http3, ..Default::default() };
-        assert_eq!(resolve_http_version(&cfg), HttpVersionPref::Http2);
+        assert_eq!(resolve_http_version(&cfg), HttpVersionPref::Http3);
 
         let cfg = XhttpConfig { http_version: HttpVersionPref::Http1, ..Default::default() };
         assert_eq!(resolve_http_version(&cfg), HttpVersionPref::Http1);

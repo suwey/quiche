@@ -2,7 +2,7 @@
 // 一站式 deploy：先 scrub，部署无论成功失败都还原源码。
 // 用法：node scripts/deploy.mjs  （或 npm run deploy）
 //
-// 还原策略：优先 `git checkout -- src/`，失败则反向跑 scrub。
+// 还原策略：纯替换反向 scrub，不依赖 git，避免还原整个工作区影响其他改动。
 
 import { execSync } from 'node:child_process';
 import { readFile, writeFile, readdir } from 'node:fs/promises';
@@ -60,17 +60,11 @@ try {
 	console.error(`\n!! Deploy failed: ${err && err.message ? err.message : err}`);
 	process.exitCode = 1;
 } finally {
-	let restored = false;
+	// 只撤销 scrub-literals 写入的 TOKENS 引用，纯文本替换，不动其他行。
 	try {
-		run('git checkout -- src/');
-		restored = true;
-	} catch { /* not a git repo or no commits */ }
-	if (!restored) {
-		try {
-			await reverseScrub();
-		} catch (err) {
-			console.error(`!! Failed to restore source: ${err && err.message ? err.message : err}`);
-			if (process.exitCode === undefined) process.exitCode = 1;
-		}
+		await reverseScrub();
+	} catch (err) {
+		console.error(`!! Failed to restore source: ${err && err.message ? err.message : err}`);
+		if (process.exitCode === undefined) process.exitCode = 1;
 	}
 }

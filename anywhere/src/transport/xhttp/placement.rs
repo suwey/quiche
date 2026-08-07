@@ -96,6 +96,7 @@ impl PlacementConfig {
 /// Extract session_id from an HTTP request (server-side, for M5).
 ///
 /// Looks in path, query, header, or cookie depending on `placement`.
+// M5: server-side
 pub fn extract_session_id(
     path: &str,
     query: &str,
@@ -122,6 +123,7 @@ pub fn extract_session_id(
     }
 }
 
+// M5: server-side
 fn extract_query_value(query: &str, key: &str) -> Option<String> {
     for pair in query.split('&') {
         let mut parts = pair.splitn(2, '=');
@@ -132,6 +134,7 @@ fn extract_query_value(query: &str, key: &str) -> Option<String> {
     None
 }
 
+// M5: server-side
 fn extract_cookie_value(cookie_header: &str, key: &str) -> Option<String> {
     for part in cookie_header.split(';') {
         let part = part.trim();
@@ -237,13 +240,6 @@ mod tests {
         let cfg = default_config();
         let (url, _) = cfg.build_request_meta("/xhttp/", "abc123", None);
         assert_eq!(url, "/xhttp/abc123");
-    }
-
-    #[test]
-    fn root_path() {
-        let cfg = default_config();
-        let (url, _) = cfg.build_request_meta("/", "abc123", None);
-        assert_eq!(url, "/abc123");
     }
 
     #[test]

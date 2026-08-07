@@ -42,9 +42,22 @@ impl XPaddingMiddleware {
     /// ## Custom mode (`obfs_mode = true`)
     ///
     /// Padding placement is configured via `placement`, `key`, and `header`.
-    pub fn apply_to_request(
+    /// Apply padding to an HTTP request being built.
+    ///
+    /// Modifies `url` (for query placement) and `headers` (for header/cookie/
+    /// referer placement) in place.
+    ///
+    /// ## Default mode (`obfs_mode = false`)
+    ///
+    /// Padding is placed in the `Referer` header as a URL query parameter
+    /// with key `x_padding`. This matches Xray's default behavior.
+    ///
+    /// ## Custom mode (`obfs_mode = true`)
+    ///
+    /// Padding placement is configured via `placement`, `key`, and `header`.
+    pub fn apply_to_request_mut(
         &self,
-        url: &str,
+        url: &mut String,
         headers: &mut Vec<(String, String)>,
     ) {
         let padding = self.generate_padding();
@@ -73,21 +86,9 @@ impl XPaddingMiddleware {
                     ));
                 }
                 XPaddingPlacement::Query => {
-                    // Append to URL query - caller handles URL construction
-                    // We signal this by adding a pseudo-header that the
-                    // request builder will interpret.
-                    //
-                    // In practice, the request builder appends query params
-                    // before calling this method, so we handle query placement
-                    // by adding to the URL via a special header.
-                    //
-                    // Actually, for query placement, the URL should be modified
-                    // directly. Since we receive `url` as &str, we can't modify
-                    // it here. The caller should handle query placement by
-                    // calling `generate_padding()` and appending to the URL.
-                    //
-                    // For now, fall back to header placement for query mode.
-                    headers.push((self.config.header.clone(), padding));
+                    // ✅ Append padding directly to URL query string
+                    let sep = if url.contains('?') { '&' } else { '?' };
+                    url.push_str(&format!("{}{}={}", sep, self.config.key, padding));
                 }
                 XPaddingPlacement::QueryInHeader => {
                     let header_value = format!("{}?{}={}", url, self.config.key, padding);
@@ -95,6 +96,19 @@ impl XPaddingMiddleware {
                 }
             }
         }
+    }
+
+    /// Legacy wrapper: applies padding using an immutable `&str` URL.
+    ///
+    /// Query placement is not effective in this mode (falls back to header).
+    /// Prefer [`apply_to_request_mut`] when the URL can be mutated.
+    pub fn apply_to_request(
+        &self,
+        url: &str,
+        headers: &mut Vec<(String, String)>,
+    ) {
+        let mut url_owned = url.to_string();
+        self.apply_to_request_mut(&mut url_owned, headers);
     }
 
     /// Validate the X-Padding response header.
@@ -115,6 +129,7 @@ impl XPaddingMiddleware {
     }
 
     /// Generate a response padding header for server-side use (M5).
+    // M5: server-side
     ///
     /// Returns `(header_name, value)` or `None` if padding is disabled.
     pub fn generate_response_padding(&self) -> Option<(String, String)> {

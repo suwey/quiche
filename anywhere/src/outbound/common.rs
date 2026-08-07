@@ -545,7 +545,11 @@ pub async fn bind_udp_bypass(
     }
 }
 
-/// Synchronous connect — for use inside `spawn_blocking`.
+// Synchronous connect — for use inside `spawn_blocking`.
+// Bound the blocking connect so a stuck dial (e.g. unreachable proxy server)
+// can't wedge the tokio blocking pool — and therefore Ctrl+C shutdown — for
+// the OS-level connect timeout (which can be many seconds to minutes).
+const SYNC_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 /// On Linux, applies SO_MARK before connect so the socket bypasses TUN routing.
 /// The address MUST be a resolved `SocketAddr` (IP:port), not a domain.
 pub fn connect_tcp_bypass_sync(
@@ -572,7 +576,7 @@ pub fn connect_tcp_bypass_sync(
             .with_time(std::time::Duration::from_secs(60))
             .with_interval(std::time::Duration::from_secs(15))
             .with_retries(3))?;
-        socket.connect(&addr.into())?;
+        socket.connect_timeout(&addr.into(), SYNC_CONNECT_TIMEOUT)?;
         Ok(socket.into())
     }
     #[cfg(target_os = "android")]
@@ -601,7 +605,7 @@ pub fn connect_tcp_bypass_sync(
             .with_time(std::time::Duration::from_secs(60))
             .with_interval(std::time::Duration::from_secs(15))
             .with_retries(3))?;
-        socket.connect(&addr.into())?;
+        socket.connect_timeout(&addr.into(), SYNC_CONNECT_TIMEOUT)?;
         Ok(socket.into())
     }
     #[cfg(target_os = "macos")]
@@ -641,7 +645,7 @@ pub fn connect_tcp_bypass_sync(
             }
         }
 
-        socket.connect(&addr.into())?;
+        socket.connect_timeout(&addr.into(), SYNC_CONNECT_TIMEOUT)?;
         Ok(socket.into())
 
     }
@@ -668,12 +672,12 @@ pub fn connect_tcp_bypass_sync(
 
         set_unicast_if_raw(socket.as_raw_socket() as libc::SOCKET, addr.is_ipv4());
 
-        socket.connect(&addr.into())?;
+        socket.connect_timeout(&addr.into(), SYNC_CONNECT_TIMEOUT)?;
         Ok(socket.into())
     }
     #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "windows")))]
     {
-        let stream = std::net::TcpStream::connect(addr)?;
+        let stream = std::net::TcpStream::connect_timeout(addr, SYNC_CONNECT_TIMEOUT)?;
         let sock_ref = socket2::SockRef::from(&stream);
         let _ = sock_ref.set_tcp_keepalive(&socket2::TcpKeepalive::new()
             .with_time(std::time::Duration::from_secs(60))

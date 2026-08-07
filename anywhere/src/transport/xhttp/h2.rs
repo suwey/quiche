@@ -161,7 +161,16 @@ pub async fn connect(
     let _ = tcp.set_nodelay(true);
 
     // 2. Determine ALPN based on http_version
-    // Auto/Http3 resolve to H2. H1 uses http/1.1 ALPN.
+    // Http3 should never reach here — it's handled by h3::H3Session in mod.rs.
+    // If it does, return an error to prevent silent downgrade.
+    if matches!(http_version, HttpVersionPref::Http3) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Http3 version should not reach h2::connect(); \
+             this is a bug — H3 is handled by h3::H3Session",
+        ));
+    }
+    // Auto resolves to H2. H1 uses http/1.1 ALPN.
     let (alpn, expect_h2) = match http_version {
         HttpVersionPref::Http1 => (vec![b"http/1.1".to_vec()], false),
         _ => (vec![b"h2".to_vec()], true),
@@ -244,9 +253,4 @@ pub fn make_stream_body(
     (tx, ChannelBody { rx })
 }
 
-/// Create an empty body (for GET requests in stream-up mode, M6).
-pub fn empty_body() -> ReqBody {
-    let (_tx, body) = make_stream_body(1);
-    // Drop tx immediately -> empty stream -> end-of-body
-    body
-}
+

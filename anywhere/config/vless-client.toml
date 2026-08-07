@@ -19,11 +19,14 @@ tag = "C"
 server = "11.11.1.11:2083"
 password = "xxxxx"
 sni = "h.p.dev"
-fp = true
-#mux = true, mux.pool not tested
-transport_type = "ws"
-transport_path = "/"
-transport_headers.Host = "h.p.dev"
+# fp = true
+
+[outbounds.transport]
+type = "ws"
+
+[outbounds.transport.ws]
+path = "/"
+headers.Host = "h.p.dev"
 
 [[rules]]
 outbound = "C"
