@@ -70,6 +70,18 @@ pool_size = 5
 ```
 Recommend to deploy `openclaw` and `hermes` both, one for `vless/ss/trojan` one for `mless` then cloudflare's free plan will be very enough to use. Many thanks to @cmliu for [edgetunnel](https://github.com/cmliu/edgetunnel), see it for more info.
 
+11. SS 2022 outbound:
+```
+[[outbounds]]
+type = "shadowsocks"
+tag = "ss"
+server = "V.z.t:3"
+method = "2022-blake3-aes-128-gcm"
+password = "jgjhkhkkhnknknk==:gjhbkhkhkkhii=="
+plugin = "obfs-local"
+plugin_opts = "obfs=http;obfs-host=os.i.a.com"
+```
+
 ## Deploy to arm64 router running koolshare with jffs enabled
 Tun inbound only support linux now and need ip & iptables commands (as root), other platform will just ignore it, config is very simple and most are setted, linux desktop can use too, see [config.toml](./anywhere/deploy/koolshare/config.toml), build for arm64 router:
 ```

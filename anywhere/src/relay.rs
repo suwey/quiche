@@ -303,11 +303,11 @@ pub async fn bidirectional_relay(
 
         tokio::select! {
             _ = copy_one_way(a1, b1) => {
-                log::debug!("relay: direction A→B completed, waiting for B→A to drain");
+                log::trace!("relay: direction A→B completed, waiting for B→A to drain");
                 *ab_done.lock().await = true;
             },
             _ = copy_one_way(b2, a2) => {
-                log::debug!("relay: direction B→A completed, waiting for A→B to drain");
+                log::trace!("relay: direction B→A completed, waiting for A→B to drain");
                 *ba_done.lock().await = true;
             },
         }
@@ -358,12 +358,13 @@ async fn copy_one_way(src: &mut dyn StreamRelay, dst: &mut dyn StreamRelay) {
                 break;
             },
             Ok(n) => {
-                if dst.write(&buf[..n]).await.is_err() {
+                if let Err(e) = dst.write(&buf[..n]).await {
+                    log::trace!("relay: copy_one_way dst write error {e}, breaking");
                     break;
                 }
             },
             Err(e) => {
-                log::debug!(
+                log::trace!(
                     "relay: copy_one_way src read error {e}, breaking"
                 );
                 break;

@@ -8,6 +8,7 @@ use crate::outbound::anytls::AnyTlsOutboundClient;
 use crate::outbound::direct::DirectOutboundClient;
 use crate::outbound::mless::MlessOutboundClient;
 use crate::outbound::quic::QuicOutboundClient;
+use crate::outbound::shadowsocks::ShadowsocksOutboundClient;
 use crate::outbound::ssh::SshOutboundClient;
 use crate::outbound::urltest::UrlTestOutboundClient;
 use crate::outbound::urltest::UrlTestState;
@@ -133,6 +134,20 @@ impl OutboundRegistry {
             }
         }
 
+        for cfg in config.outbounds.iter().filter(|o| o.type_ == "shadowsocks") {
+            match ShadowsocksOutboundClient::from_config(cfg).await {
+                Ok(client) => {
+                    clients.insert(Self::tag(cfg)?.to_string(), Arc::new(client));
+                },
+                Err(e) => {
+                    log::error!(
+                        "failed to init shadowsocks outbound '{}': {e}",
+                        Self::tag(cfg).unwrap_or("?"),
+                    );
+                },
+            }
+        }
+
         // --- urltest outbounds (must come after all referenced outbounds are
         // registered) ---
         let mut urltest_states: HashMap<String, Arc<UrlTestState>> =
@@ -243,6 +258,9 @@ mod tests {
             tag: tag.map(str::to_string),
             server: None,
             password: None,
+            method: None,
+            plugin: None,
+            plugin_opts: None,
             cmd: None,
             proxy_type: None,
             sni: None,

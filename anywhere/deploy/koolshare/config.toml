@@ -39,7 +39,7 @@ listen = "127.0.0.1:1080"
 
 [[outbounds]]
 type = "anytls"
-tag = "A1"
+tag = "A"
 server = "001.top:423"
 password = "15e023sae"
 sni = "fafeg.qq.com"
@@ -49,18 +49,13 @@ sni = "fafeg.qq.com"
 # min_idle_session = 2
 
 [[outbounds]]
-type = "anytls"
-tag = "A2"
-server = "001.top:438"
-password = "15e023sae"
-sni = "fafeg.qq.com"
-
-[[outbounds]]
-type = "anytls"
-tag = "A3"
-server = "001.top:439"
-password = "15e023sae"
-sni = "fafeg.qq.com"
+type = "shadowsocks"
+tag = "S"
+server = "V.z.t:3"
+method = "2022-blake3-aes-128-gcm"
+password = "jgjhkhkkhnknknk==:gjhbkhkhkkhii=="
+plugin = "obfs-local"
+plugin_opts = "obfs=http;obfs-host=os.i.a.com"
 
 [[outbounds]]
 type = "mless"
@@ -103,7 +98,7 @@ server = "127.0.0.1:{PORT}"
 [[outbounds]]
 type = "urltest"
 tag = "auto"
-outbounds = ["A1", "A2", "A3", "CF1", "CF2"]
+outbounds = ["A", "S", "CF1", "CF2"]
 # outbounds = ["mac"]
 #interval = 600
 #url = "www.google.com"

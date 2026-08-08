@@ -144,6 +144,15 @@ pub struct OutboundConfig {
 
     pub password: Option<String>,
 
+    /// Shadowsocks 2022 加密方法 (e.g. "2022-blake3-aes-256-gcm").
+    pub method: Option<String>,
+
+    /// SIP003 plugin name (e.g. "obfs-local"). Shadowsocks only.
+    pub plugin: Option<String>,
+
+    /// SIP003 plugin options (semicolon-delimited k=v, e.g. "obfs=http;obfs-host=example.com").
+    pub plugin_opts: Option<String>,
+
     /// Command to spawn for tunnel creation (used by SSH outbound).
     /// e.g. `ssh -D 1080 -N user@host`.
     pub cmd: Option<String>,

@@ -14,6 +14,7 @@ pub mod urltest;
 
 pub mod mless;
 pub mod vless;
+pub mod shadowsocks;
 #[async_trait]
 pub trait OutboundClient: Send + Sync {
     /// TCP-style dial. Returns a byte-stream relay.
