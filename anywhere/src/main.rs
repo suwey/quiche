@@ -20,6 +20,19 @@ struct Args {
     #[arg(short = 'c', long = "config", default_value = "config.toml")]
     config: String,
 
+    /// Fetch a subscription URL and convert to sub.toml
+    #[arg(long = "sub")]
+    sub: Option<String>,
+
+    /// User-Agent for subscription fetch.
+    /// Default: `clash-verge/v{ver} Platform/{os}`.
+    #[arg(long = "sub-ua")]
+    sub_ua: Option<String>,
+
+    /// Output path for `--sub` (default: `sub.toml`).
+    #[arg(long = "sub-out", default_value = "sub.toml")]
+    sub_out: String,
+
     /// Command to restart the process (used by the UI).
     /// If set, `restart` is invoked as `<start_cmd> restart <service_name>`.
     /// If unset, the process re-executes itself via execve.
@@ -67,6 +80,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     raise_fd_limit();
 
     let args = Args::parse();
+
+    // Handle subscription import mode.
+    if let Some(sub_url) = &args.sub {
+        let ua = args.sub_ua.clone().unwrap_or_else(|| {
+            format!(
+                "clash-verge/v{} Platform/{}",
+                "20.0.0",
+                std::env::consts::OS
+            )
+        });
+        anywhere::subscription::run_subscription(sub_url, &ua, &args.sub_out).await?;
+        return Ok(());
+    }
 
     let opts = RunOptions {
         config_path: Some(args.config.clone()),

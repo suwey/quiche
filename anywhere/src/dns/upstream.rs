@@ -34,11 +34,27 @@ impl Upstream {
 /// - `https://host[:port][/path]` → [`Upstream::Doh`] (path defaults to
 ///   `/dns-query`).
 /// - `ip` / `ip:port` (v4 or v6) → [`Upstream::Plain`], default port 53.
+///
+/// Other schemes (`tls://`, `quic://`, etc.) are rejected here with a
+/// clear message so the user knows exactly what's wrong instead of
+/// getting a generic "not an IP literal" error downstream.
 pub fn parse_upstream(s: &str) -> Result<Upstream, String> {
     let s = s.trim();
 
     if let Some(rest) = s.strip_prefix("https://").or_else(|| s.strip_prefix("http://")) {
         return parse_doh_url(rest).map(|(host, path, port)| Upstream::Doh { host, path, port });
+    }
+
+    // Reject known-but-unsupported schemes early with a helpful message.
+    if let Some(scheme) = s
+        .split("://")
+        .next()
+        .filter(|_| s.contains("://"))
+    {
+        return Err(format!(
+            "dns upstream '{s}': scheme '{scheme}://' is not supported. \
+             Use DoH (https://host/dns-query) or a plain IP address instead"
+        ));
     }
 
     // Plain UDP/53. Accept "ip" or "ip:port"; default port 53.
@@ -95,7 +111,8 @@ pub fn parse_upstream(s: &str) -> Result<Upstream, String> {
         )));
     }
     Err(format!(
-        "dns upstream must be an IP literal or an https:// URL, got '{s}'"
+        "dns upstream '{s}': not a valid IP address or https:// URL. \
+         Use DoH (e.g. https://dns.alidns.com/dns-query) or a plain IP (e.g. 223.5.5.5)"
     ))
 }
 
@@ -277,6 +294,37 @@ mod tests {
     #[test]
     fn parse_upstream_rejects_domain() {
         assert!(parse_upstream("dns.example").is_err());
+    }
+
+    #[test]
+    fn parse_upstream_rejects_tls_scheme() {
+        let err = parse_upstream("tls://dot.pub:853").unwrap_err();
+        assert!(err.contains("not supported"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_upstream_rejects_quic_scheme() {
+        let err = parse_upstream("quic://dns.adguard.com").unwrap_err();
+        assert!(err.contains("not supported"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_upstream_rejects_tls_scheme_domain() {
+        let err = parse_upstream("tls://dns.alidns.com:853").unwrap_err();
+        assert!(err.contains("not supported"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_upstream_rejects_hostname_port() {
+        // "dot.pub:853" — looks like host:port but host is not an IP
+        let err = parse_upstream("dot.pub:853").unwrap_err();
+        assert!(err.contains("not a valid IP"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_upstream_rejects_bare_hostname() {
+        let err = parse_upstream("dns.google").unwrap_err();
+        assert!(err.contains("not a valid IP"), "got: {err}");
     }
 
     #[test]

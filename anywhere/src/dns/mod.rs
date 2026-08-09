@@ -94,7 +94,10 @@ pub struct DnsConfig {
     pub remote: Vec<String>,
     /// Fake-IP CIDR, e.g. "198.18.0.0/15". Enabled by default for TUN so
     /// domain information survives IP-only TUN packets.
-    #[serde(default = "default_fakeip")]
+    /// Set to `false` to disable FakeIP and use real DNS resolution
+    /// (redir-host mode: real IP returned, IP→domain mapping still
+    /// maintained via reverse cache for rule matching).
+    #[serde(default = "default_fakeip", deserialize_with = "de_fakeip")]
     pub fakeip: Option<String>,
 }
 
@@ -122,6 +125,26 @@ fn default_remote() -> Vec<String> {
 }
 fn default_fakeip() -> Option<String> {
     Some("198.18.0.0/15".to_string())
+}
+
+/// Deserialize fakeip field: accept a CIDR string (enabled), `false`
+/// (disabled → redir-host mode), or omit for the default CIDR.
+fn de_fakeip<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum FakeipValue {
+        Bool(bool),
+        Str(String),
+    }
+    match FakeipValue::deserialize(deserializer)? {
+        FakeipValue::Bool(false) => Ok(None),
+        FakeipValue::Bool(true) => Ok(default_fakeip()),
+        FakeipValue::Str(s) => Ok(Some(s)),
+    }
 }
 
 /// Deserialize an upstream list while accepting a single bare string as a
@@ -867,6 +890,24 @@ mod tests {
         let cfg: DnsConfig = toml::from_str(toml).unwrap();
         assert_eq!(cfg.direct.len(), 2);
         assert_eq!(cfg.remote.len(), 2);
+        assert_eq!(cfg.fakeip, Some("198.18.0.0/15".to_string()));
+    }
+
+    #[test]
+    fn dns_config_fakeip_disabled() {
+        let toml = r#"
+            fakeip = false
+        "#;
+        let cfg: DnsConfig = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.fakeip, None);
+    }
+
+    #[test]
+    fn dns_config_fakeip_enabled_shorthand() {
+        let toml = r#"
+            fakeip = true
+        "#;
+        let cfg: DnsConfig = toml::from_str(toml).unwrap();
         assert_eq!(cfg.fakeip, Some("198.18.0.0/15".to_string()));
     }
 

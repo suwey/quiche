@@ -9,10 +9,12 @@ cache_dir = "/jffs/anywhere"
 # [dns]
 # dns server used for direct out, default setted
 # support doh but pub doh server has rate limit, recommend set custom doh server
-# direct = ["https://doh.pub/dns-query", "https://dns.alidns.com/dns-query", "https://doh.360.cn/dns-query", "223.5.5.5", "114.114.114.114"]
 # default only set last two udp servers
+# direct = ["https://doh.pub/dns-query", "https://dns.alidns.com/dns-query", "https://doh.360.cn/dns-query", "223.5.5.5", "114.114.114.114"]
 # dns server ip used for others, default setted
 # remote = ["8.8.8.8", "1.1.1.1"]
+# default setted, Warn: set false can close it, but will cause dns leak
+# fakeip = "198.18.0.0/15"
 
 [[inbounds]]
 type = "tun" #only support in linux with ip & iptables, run as root.

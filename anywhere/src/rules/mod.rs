@@ -30,6 +30,61 @@ const PAYLOAD_DISPLAY_ITEMS: usize = 4;
 
 pub use geo::read_srs_bytes;
 
+/// Private/internal IPv4 CIDR ranges that should always bypass the proxy.
+///
+/// Used by:
+/// - `builtin_private_rules()` — auto-prepended to every rule set
+/// - `subscription::is_private_cidr()` — skip redundant rules in sub output
+/// - TUN handler `is_non_routable()` (via `PRIVATE_V4_CIDRS`) — drop at TUN layer
+///
+/// When updating this list, all consumers are updated automatically.
+pub const PRIVATE_V4_CIDRS: &[&str] = &[
+    "10.0.0.0/8",           // RFC1918 private
+    "17.0.0.0/8",           // Apple internal
+    "100.64.0.0/10",        // CGNAT (RFC6598)
+    "127.0.0.0/8",          // Loopback
+    "169.254.0.0/16",       // Link-local
+    "172.16.0.0/12",        // RFC1918 private
+    "192.168.0.0/16",       // RFC1918 private
+    "224.0.0.0/4",          // Multicast
+    "0.0.0.0/8",            // Unspecified
+    "255.255.255.255/32",  // Broadcast
+];
+
+/// Private/internal IPv6 CIDR ranges.
+pub const PRIVATE_V6_CIDRS: &[&str] = &[
+    "::1/128",    // Loopback
+    "fc00::/7",   // Unique local (ULA)
+    "fe80::/10",  // Link-local
+    "ff00::/8",   // Multicast
+    "::/128",     // Unspecified
+];
+
+/// All private/internal CIDR ranges (v4 + v6) as a single combined slice.
+pub const PRIVATE_CIDRS: &[&str] = {
+    // const fn to concat at compile time isn't trivial, so we list inline.
+    // Keep in sync with PRIVATE_V4_CIDRS + PRIVATE_V6_CIDRS.
+    &[
+        // IPv4
+        "10.0.0.0/8",
+        "17.0.0.0/8",
+        "100.64.0.0/10",
+        "127.0.0.0/8",
+        "169.254.0.0/16",
+        "172.16.0.0/12",
+        "192.168.0.0/16",
+        "224.0.0.0/4",
+        "0.0.0.0/8",
+        "255.255.255.255/32",
+        // IPv6
+        "::1/128",
+        "fc00::/7",
+        "fe80::/10",
+        "ff00::/8",
+        "::/128",
+    ]
+};
+
 /// A single routing rule.
 #[derive(Clone)]
 pub struct Rule {
@@ -169,22 +224,26 @@ impl Rules {
     /// should always be routed directly. It is prepended before
     /// user-configured rules so private traffic is never accidentally
     /// routed through a proxy.
+    ///
+    /// Uses `PRIVATE_V4_CIDRS` + `PRIVATE_V6_CIDRS` as the single source of
+    /// truth. Multicast / broadcast / unspecified ranges are included too —
+    /// they are harmless here and ensure defense-in-depth even if the TUN
+    /// layer's `is_non_routable` check is bypassed (e.g. SOCKS5 inbound).
     fn builtin_private_rules() -> Vec<Rule> {
+        let mut cidrs: Vec<String> = PRIVATE_V4_CIDRS
+            .iter()
+            .chain(PRIVATE_V6_CIDRS.iter())
+            .map(|s| s.to_string())
+            .collect();
+        // Note: the combined list is the same as PRIVATE_CIDRS but built
+        // from the two sub-slices to keep them as the single source of truth.
+        let _ = &mut cidrs;
         vec![Rule {
             type_: TYPE_BUILTIN.into(),
             domain: None,
             domain_suffix: None,
             domain_keyword: None,
-            ip_cidr: Some(vec![
-                "10.0.0.0/8".into(),
-                "172.16.0.0/12".into(),
-                "192.168.0.0/16".into(),
-                "127.0.0.0/8".into(),
-                "169.254.0.0/16".into(),
-                "::1/128".into(),
-                "fc00::/7".into(),
-                "fe80::/10".into(),
-            ]),
+            ip_cidr: Some(cidrs),
             port: None,
             port_range: None,
             network: None,
