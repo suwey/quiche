@@ -21,6 +21,7 @@ use tokio::sync::Notify;
 use crate::command::StateEvent;
 use crate::command::UiCommand;
 use crate::outbound::registry::OutboundRegistry;
+use crate::outbound::select::SelectState;
 use crate::outbound::urltest::UrlTestState;
 use crate::rules::Rules;
 use crate::ui::log::LogMsg;
@@ -46,6 +47,9 @@ pub struct AppContext {
     pub shutdown_signal: Arc<Notify>,
     pub outbound_tags: Vec<(String, String)>,
     pub urltest_states: HashMap<String, Arc<UrlTestState>>,
+    pub select_states: HashMap<String, Arc<SelectState>>,
+    /// Persistent cache store (redb) for select-group selections, mode, etc.
+    pub cache: Arc<crate::cache::CacheStore>,
     pub cmd_tx: mpsc::Sender<UiCommand>,
     pub event_tx: broadcast::Sender<StateEvent>,
     /// JoinHandles of per-connection relay tasks spawned by `run_inbound`.
@@ -76,6 +80,8 @@ impl Clone for AppContext {
             shutdown_signal: self.shutdown_signal.clone(),
             outbound_tags: self.outbound_tags.clone(),
             urltest_states: self.urltest_states.clone(),
+            select_states: self.select_states.clone(),
+            cache: self.cache.clone(),
             cmd_tx: self.cmd_tx.clone(),
             event_tx: self.event_tx.clone(),
             conn_handles: self.conn_handles.clone(),
@@ -97,6 +103,8 @@ impl AppContext {
         logs_tx: broadcast::Sender<LogMsg>, start_cmd: Option<String>,
         outbound_tags: Vec<(String, String)>,
         urltest_states: HashMap<String, Arc<UrlTestState>>,
+        select_states: HashMap<String, Arc<SelectState>>,
+        cache: Arc<crate::cache::CacheStore>,
         cmd_tx: mpsc::Sender<UiCommand>, event_tx: broadcast::Sender<StateEvent>,
     ) -> Self {
         Self {
@@ -108,6 +116,8 @@ impl AppContext {
             shutdown_signal: Arc::new(Notify::new()),
             outbound_tags,
             urltest_states,
+            select_states,
+            cache,
             cmd_tx,
             event_tx,
             conn_handles: Arc::new(std::sync::Mutex::new(Vec::new())),

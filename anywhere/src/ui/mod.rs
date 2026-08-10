@@ -15,6 +15,7 @@ use axum::response::IntoResponse;
 use axum::response::Json;
 use axum::routing::get;
 use axum::routing::post;
+use axum::routing::put;
 use tower_http::cors::CorsLayer;
 use tower_http::services::ServeDir;
 
@@ -65,6 +66,11 @@ pub async fn start(config: UiConfig, ctx: AppContext) {
         .route("/configs/file", get(config_file_handler))
         .route("/rules", get(rules_handler))
         .route("/proxies", get(proxies_handler))
+        .route(
+            "/proxies/{tag}",
+            put(select_proxy_handler).delete(unfix_proxy_handler),
+        )
+        .route("/proxies/{tag}/delay", get(proxy_delay_handler))
         .route("/group/{tag}/delay", get(group_delay_handler))
         .route("/providers/rules", get(providers_rules_handler))
         .route("/providers/proxies", get(providers_proxies_handler))
@@ -489,6 +495,19 @@ async fn proxies_handler(
         }
     }
 
+    // Collect select child tags (same pattern, for rendering select children).
+    let mut select_child_tags: std::collections::HashSet<&str> =
+        std::collections::HashSet::new();
+    for (tag, type_) in &state.ctx.outbound_tags {
+        if type_ == "select" {
+            if let Some(sel_state) = state.ctx.select_states.get(tag.as_str()) {
+                for child_tag in &sel_state.children {
+                    select_child_tags.insert(child_tag.as_str());
+                }
+            }
+        }
+    }
+
     // Lookup map for outbound type by tag.
     let outbound_type_map: std::collections::HashMap<&str, &str> = state
         .ctx
@@ -531,6 +550,7 @@ async fn proxies_handler(
                     "history": history,
                     "all": ut_state.children,
                     "now": now,
+                    "fixed": ut_state.fixed_name(),
                 });
 
                 // Embed child proxy entries as sub-keys.
@@ -562,10 +582,105 @@ async fn proxies_handler(
 
                 proxies.insert(tag.clone(), obj);
             }
+        } else if type_ == "select" {
+            if let Some(sel_state) =
+                state.ctx.select_states.get(tag.as_str())
+            {
+                let now = sel_state.current_name();
+
+                proxies.insert(
+                    tag.clone(),
+                    serde_json::json!({
+                        "type": "Selector",
+                        "name": tag,
+                        "udp": true,
+                        "history": [],
+                        "all": sel_state.children,
+                        "now": now,
+                    }),
+                );
+
+                // Render child proxy entries not already present (urltest
+                // children with history take priority).
+                for child_tag in &sel_state.children {
+                    if proxies.contains_key(child_tag.as_str()) {
+                        continue;
+                    }
+                    let child_type = outbound_type_map
+                        .get(child_tag.as_str())
+                        .unwrap_or(&"");
+                    proxies.insert(
+                        child_tag.clone(),
+                        serde_json::json!({
+                            "type": child_type,
+                            "name": child_tag,
+                            "udp": true,
+                            "history": [],
+                        }),
+                    );
+                }
+            }
         }
     }
 
     Json(serde_json::json!({ "proxies": proxies }))
+}
+
+// ---------------------------------------------------------------------------
+// PUT /proxies/{tag} - select node in group (Selector) or pin (URLTest)
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct SelectProxyBody {
+    name: String,
+}
+
+async fn select_proxy_handler(
+    State(state): State<Arc<UiState>>,
+    Path(tag): Path<String>,
+    axum::extract::Json(body): axum::extract::Json<SelectProxyBody>,
+) -> impl IntoResponse {
+    // Select group: set current selection by child name.
+    if let Some(sel_state) = state.ctx.select_states.get(&tag) {
+        if sel_state.set_by_name(&body.name) {
+            state.ctx.cache.set_group_selection(&tag, &body.name);
+            ::log::info!("select: '{tag}' -> '{}'", body.name);
+            return StatusCode::NO_CONTENT;
+        }
+        return StatusCode::BAD_REQUEST;
+    }
+    // URLTest group: pin to the named child (fixed).
+    if let Some(ut_state) = state.ctx.urltest_states.get(&tag) {
+        if ut_state.set_fixed_by_name(&body.name) {
+            state.ctx.cache.set_group_selection(&tag, &body.name);
+            ::log::info!("urltest: pinned '{tag}' -> '{}'", body.name);
+            return StatusCode::NO_CONTENT;
+        }
+        return StatusCode::BAD_REQUEST;
+    }
+    StatusCode::NOT_FOUND
+}
+
+// ---------------------------------------------------------------------------
+// DELETE /proxies/{tag} - unfix node (URLTest/fallback only)
+// ---------------------------------------------------------------------------
+
+async fn unfix_proxy_handler(
+    State(state): State<Arc<UiState>>,
+    Path(tag): Path<String>,
+) -> impl IntoResponse {
+    // Selector groups have no "unfix" concept.
+    if state.ctx.select_states.contains_key(&tag) {
+        return StatusCode::BAD_REQUEST;
+    }
+    // URLTest group: clear the pin, return to auto mode.
+    if let Some(ut_state) = state.ctx.urltest_states.get(&tag) {
+        ut_state.clear_fixed();
+        state.ctx.cache.clear_group_selection(&tag);
+        ::log::info!("urltest: unpinned '{tag}'");
+        return StatusCode::NO_CONTENT;
+    }
+    StatusCode::NOT_FOUND
 }
 
 // ---------------------------------------------------------------------------
@@ -602,31 +717,100 @@ async fn group_delay_handler(
         };
         (host, port)
     };
-    let mut timeout_dur = std::time::Duration::from_millis(params.timeout);
+    let timeout_dur = std::time::Duration::from_millis(params.timeout);
 
-    // For urltest nodes, each child gets the per-node timeout.
-    if let Some(ut_state) = state.ctx.urltest_states.get(&tag) {
-        let n = ut_state.children.len().max(1) as u32;
-        timeout_dur *= n;
-    }
+    // Collect children for the group (urltest or select).
+    let children: Vec<String> =
+        if let Some(ut_state) = state.ctx.urltest_states.get(&tag) {
+            ut_state.children.clone()
+        } else if let Some(sel_state) =
+            state.ctx.select_states.get(&tag)
+        {
+            sel_state.children.clone()
+        } else {
+            return Err(StatusCode::NOT_FOUND);
+        };
 
-    let client_arc = state
-        .ctx
-        .registry
-        .get(&tag)
-        .ok_or(StatusCode::BAD_REQUEST)?;
-
-    let mut result = serde_json::Map::new();
-    let delay =
-        tokio::time::timeout(timeout_dur, client_arc.test_latency(&host, port))
+    // Look up each child's outbound client and test latency concurrently.
+    let mut join_set = tokio::task::JoinSet::new();
+    for child_tag in &children {
+        // Skip "direct" - it has no proxy to test.
+        if child_tag == "direct" {
+            continue;
+        }
+        let Some(client) = state.ctx.registry.get(child_tag) else {
+            continue;
+        };
+        let client = client.clone();
+        let host = host.clone();
+        let child_tag = child_tag.clone();
+        join_set.spawn(async move {
+            let delay = tokio::time::timeout(
+                timeout_dur,
+                client.test_latency(&host, port),
+            )
             .await
             .ok()
-            .flatten();
-    if let Some(d) = delay {
-        result.insert(tag, serde_json::json!(d));
+            .flatten()
+            .unwrap_or(0);
+            (child_tag, delay)
+        });
+    }
+
+    let mut result = serde_json::Map::new();
+    while let Some(res) = join_set.join_next().await {
+        if let Ok((name, delay)) = res {
+            result.insert(name, serde_json::json!(delay));
+        }
     }
 
     Ok(Json(serde_json::json!(result)))
+}
+
+// ---------------------------------------------------------------------------
+// GET /proxies/{tag}/delay - single proxy latency test
+// ---------------------------------------------------------------------------
+
+async fn proxy_delay_handler(
+    State(state): State<Arc<UiState>>, Path(tag): Path<String>,
+    Query(params): Query<GroupDelayParams>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let rest = params
+        .url
+        .strip_prefix("https://")
+        .or_else(|| params.url.strip_prefix("http://"))
+        .ok_or(StatusCode::BAD_REQUEST)?;
+
+    let (host, port) = if let Some((h, rest)) = rest.split_once(':') {
+        let port_str = rest.split('/').next().unwrap_or(rest);
+        let port: u16 = port_str.parse().map_err(|_| StatusCode::BAD_REQUEST)?;
+        (h.to_string(), port)
+    } else {
+        let host = rest.split('/').next().unwrap_or(rest).to_string();
+        let port = if params.url.starts_with("https") {
+            443
+        } else {
+            80
+        };
+        (host, port)
+    };
+
+    let client = state
+        .ctx
+        .registry
+        .get(&tag)
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    let delay = tokio::time::timeout(
+        std::time::Duration::from_millis(params.timeout),
+        client.test_latency(&host, port),
+    )
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or(0);
+
+    Ok(Json(serde_json::json!({ "delay": delay })))
 }
 
 async fn ws_traffic_handler(

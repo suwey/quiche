@@ -13,6 +13,7 @@
 //! - [`doh`] — DNS-over-HTTPS (RFC 8484) client.
 
 pub mod doh;
+pub mod fakeip_filter;
 pub mod upstream;
 pub mod wire;
 
@@ -99,6 +100,13 @@ pub struct DnsConfig {
     /// maintained via reverse cache for rule matching).
     #[serde(default = "default_fakeip", deserialize_with = "de_fakeip")]
     pub fakeip: Option<String>,
+
+    /// FakeIP filter - domains in this list use real DNS instead of FakeIP.
+    /// Supports exact domains (`dns.msftnsci.com`) and wildcards
+    /// (`+.msftnsci.com` or `*.local`). If empty or omitted, a built-in
+    /// default list (Windows connectivity checks) is used.
+    #[serde(default)]
+    pub fakeip_filter: Option<Vec<String>>,
 }
 
 impl Default for DnsConfig {
@@ -107,6 +115,7 @@ impl Default for DnsConfig {
             direct: default_direct(),
             remote: default_remote(),
             fakeip: default_fakeip(),
+            fakeip_filter: None,
         }
     }
 }
@@ -261,6 +270,8 @@ pub struct DnsHijack {
     direct_plain: Vec<Upstream>,
     doh: DohClient,
     fakeip: Option<FakeIpPool>,
+    /// FakeIP domain filter - matched domains use real DNS instead of FakeIP.
+    fakeip_filter: Option<crate::dns::fakeip_filter::FakeIPFilter>,
     /// When true, DNS queries from 127.0.0.1 skip rule matching and go
     /// directly to the direct upstream.
     local_direct: bool,
@@ -377,12 +388,23 @@ impl DnsHijack {
             Some(cidr) => Some(FakeIpPool::parse(cidr)?),
             None => None,
         };
+
+        let fakeip_filter =
+            match config.fakeip_filter.as_deref().filter(|l| !l.is_empty()) {
+                Some(list) => Some(
+                    crate::dns::fakeip_filter::FakeIPFilter::from_list(list),
+                ),
+                None => Some(
+                    crate::dns::fakeip_filter::FakeIPFilter::default_filter(),
+                ),
+            };
         Ok(Self {
             remote_upstreams,
             direct_doh_upstreams,
             direct_plain,
             doh,
             fakeip,
+            fakeip_filter,
             cache: Mutex::new(LruCache::new(
                 NonZeroUsize::new(CACHE_CAPACITY).unwrap(),
             )),
@@ -485,6 +507,10 @@ impl DnsHijack {
         if q.qtype == 1
             && plan.outbound_tag != "direct"
             && let Some(fakeip) = &self.fakeip
+            && !self
+                .fakeip_filter
+                .as_ref()
+                .is_some_and(|f| f.should_skip(&q.name))
         {
             let ip = fakeip.allocate(&q.name).await;
             self.reverse_cache

@@ -104,6 +104,10 @@ pub struct TunConfig {
     /// for these IPs via the original gateway so direct outbound
     /// connections to proxy servers don't loop back through TUN.
     pub bypass_ips: Vec<String>,
+    /// Whether fake-ip DNS mode is enabled. On macOS, this controls whether
+    /// system DNS servers are changed to public IPs (only when fakeip is on).
+    /// Set by runner from DnsConfig before setup_routing is called.
+    pub fakeip_enabled: bool,
 }
 
 impl TunConfig {
@@ -150,6 +154,7 @@ impl TunConfig {
             local_direct,
             sniff,
             bypass_ips: Vec::new(),
+            fakeip_enabled: false,
         })
     }
 }
@@ -529,6 +534,7 @@ impl TunInbound {
                 addr,
                 config.auto_hijack,
             );
+            mgr.set_fakeip_enabled(config.fakeip_enabled);
 
             if let Err(e) = mgr.setup_interface() {
                 log::warn!("Failed to setup TUN interface: {e}");

@@ -40,6 +40,41 @@ pub struct UrlTestState {
     pub records: Vec<RwLock<Option<LatencyRecord>>>,
     /// Failed children, tracked per-dial for immediate fallback.
     pub failed: Vec<AtomicBool>,
+    /// Pinned child index (`usize::MAX` = not fixed / auto mode).
+    /// When set, `dial` uses this child; `test_latency` won't switch.
+    pub fixed: AtomicUsize,
+}
+
+impl UrlTestState {
+    /// Pin the group to a child by name. Returns `true` if found.
+    pub fn set_fixed_by_name(&self, name: &str) -> bool {
+        if let Some(idx) = self.children.iter().position(|c| c == name) {
+            self.fixed.store(idx, Ordering::Relaxed);
+            self.current.store(idx, Ordering::Relaxed);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Clear the pin, returning to auto mode.
+    pub fn clear_fixed(&self) {
+        self.fixed.store(usize::MAX, Ordering::Relaxed);
+    }
+
+    /// The pinned child index, if any.
+    pub fn fixed_index(&self) -> Option<usize> {
+        let f = self.fixed.load(Ordering::Relaxed);
+        (f != usize::MAX).then_some(f)
+    }
+
+    /// The pinned child name, or empty string if not fixed.
+    pub fn fixed_name(&self) -> String {
+        self.fixed_index()
+            .and_then(|i| self.children.get(i))
+            .cloned()
+            .unwrap_or_default()
+    }
 }
 
 pub struct UrlTestOutboundClient {
@@ -70,6 +105,7 @@ impl UrlTestOutboundClient {
             current: AtomicUsize::new(0),
             records: children.iter().map(|_| RwLock::new(None)).collect(),
             failed: children.iter().map(|_| AtomicBool::new(false)).collect(),
+            fixed: AtomicUsize::new(usize::MAX),
         });
 
         Self {
@@ -128,7 +164,8 @@ impl OutboundClient for UrlTestOutboundClient {
     async fn dial(
         &self, dest: &Destination,
     ) -> Result<Box<dyn StreamRelay>, Box<dyn std::error::Error>> {
-        let idx = self.best_child_index();
+        let idx =
+            self.state.fixed_index().unwrap_or_else(|| self.best_child_index());
         match self.children[idx].dial(dest).await {
             Ok(relay) => {
                 self.state.current.store(idx, Ordering::Relaxed);
@@ -181,7 +218,8 @@ impl OutboundClient for UrlTestOutboundClient {
     async fn dial_udp(
         &self, initial_dest: &Destination,
     ) -> Result<Box<dyn PacketRelay>, Box<dyn std::error::Error>> {
-        let idx = self.best_child_index();
+        let idx =
+            self.state.fixed_index().unwrap_or_else(|| self.best_child_index());
         match self.children[idx].dial_udp(initial_dest).await {
             Ok(relay) => {
                 self.state.current.store(idx, Ordering::Relaxed);
@@ -296,12 +334,16 @@ impl OutboundClient for UrlTestOutboundClient {
             }
         }
 
-        self.state.current.store(best_idx, Ordering::Relaxed);
-        log::info!(
-            "urltest: selected child '{}' (delay={}ms)",
-            self.state.children[best_idx],
-            best_delay,
-        );
+        // Don't switch the current (pinned) node when fixed; still test all
+        // children to keep their latency records fresh.
+        if self.state.fixed_index().is_none() {
+            self.state.current.store(best_idx, Ordering::Relaxed);
+            log::info!(
+                "urltest: selected child '{}' (delay={}ms)",
+                self.state.children[best_idx],
+                best_delay,
+            );
+        }
 
         if best_delay == u64::MAX {
             None

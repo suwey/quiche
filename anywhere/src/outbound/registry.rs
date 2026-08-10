@@ -8,6 +8,7 @@ use crate::outbound::anytls::AnyTlsOutboundClient;
 use crate::outbound::direct::DirectOutboundClient;
 use crate::outbound::mless::MlessOutboundClient;
 use crate::outbound::quic::QuicOutboundClient;
+use crate::outbound::select::SelectOutboundClient;
 use crate::outbound::shadowsocks::ShadowsocksOutboundClient;
 use crate::outbound::ssh::SshOutboundClient;
 use crate::outbound::urltest::UrlTestOutboundClient;
@@ -22,6 +23,8 @@ pub struct OutboundRegistry {
     clients: Arc<HashMap<String, Arc<dyn OutboundClient>>>,
     /// Per-urltest-node shared states for UI access.
     pub urltest_states: HashMap<String, Arc<UrlTestState>>,
+    /// Per-select-node shared states for UI access.
+    pub select_states: HashMap<String, Arc<crate::outbound::select::SelectState>>,
     /// JoinHandles of urltest background test loops. Aborted on in-process
     /// reload so the outbound clients they hold (esp. mless/vless mux
     /// persistent connections) are released before the next run() iteration.
@@ -207,6 +210,47 @@ impl OutboundRegistry {
             clients.insert(tag.clone(), client_arc);
         }
 
+        // --- select outbounds (manual selection, no health check) ---
+        let mut select_states: HashMap<
+            String, Arc<crate::outbound::select::SelectState>,
+        > = HashMap::new();
+
+        for cfg in config.outbounds.iter().filter(|o| o.type_ == "select") {
+            let tag = Self::tag(cfg)?.to_string();
+            let child_tags = cfg.outbounds.clone().ok_or_else(|| {
+                format!("select '{tag}': missing 'outbounds' field")
+            })?;
+
+            let valid_children: Vec<String> = child_tags
+                .into_iter()
+                .filter(|t| {
+                    if clients.contains_key(t) {
+                        true
+                    } else {
+                        log::warn!(
+                            "select '{tag}': child '{}' not found, skipping",
+                            t,
+                        );
+                        false
+                    }
+                })
+                .collect();
+
+            if valid_children.is_empty() {
+                log::error!(
+                    "select '{tag}': no valid children, skipping select"
+                );
+                continue;
+            }
+
+            let client = SelectOutboundClient::new(
+                valid_children, &clients, None,
+            );
+            select_states.insert(tag.clone(), client.state.clone());
+            let client_arc = Arc::new(client) as Arc<dyn OutboundClient>;
+            clients.insert(tag, client_arc);
+        }
+
         // Ensure a "direct" outbound is always available (used by built-in
         // private rules).
         clients.entry("direct".to_string()).or_insert_with(|| {
@@ -216,6 +260,7 @@ impl OutboundRegistry {
         Ok(Self {
             clients: Arc::new(clients),
             urltest_states,
+            select_states,
             test_loop_handles: std::sync::Mutex::new(test_loop_handles),
         })
     }

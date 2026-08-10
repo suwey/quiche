@@ -25,6 +25,12 @@ pub struct MacosTunManager {
     original_gateway: Option<IpAddr>,
     /// Whether DNS hijacking is active (copied from config at startup).
     auto_hijack: bool,
+    /// Whether fake-ip mode is enabled (only set system DNS when fakeip is on).
+    fakeip_enabled: bool,
+    /// Original system DNS servers (saved for cleanup).
+    original_dns: Option<Vec<String>>,
+    /// Network service name (e.g. "Wi-Fi") for DNS restore.
+    network_service: Option<String>,
 }
 
 impl MacosTunManager {
@@ -41,7 +47,19 @@ impl MacosTunManager {
             routes_installed: false,
             original_gateway: None,
             auto_hijack,
+            fakeip_enabled: false,
+            original_dns: None,
+            network_service: None,
         }
+    }
+
+    /// Set whether fake-ip DNS mode is enabled.
+    /// When true, setup_routing will set system DNS to public IPs so that
+    /// DNS queries go through TUN and get fake-ip responses.
+    /// When false, system DNS is left untouched (DNS may leak but this is
+    /// expected when fake-ip is disabled).
+    pub fn set_fakeip_enabled(&mut self, enabled: bool) {
+        self.fakeip_enabled = enabled;
     }
 
     /// Set up the TUN interface address and MTU.
@@ -171,12 +189,164 @@ impl MacosTunManager {
         // IP_BOUND_IF does NOT work (gateway unreachable → ENETUNREACH).
         self.setup_bypass_pf()?;
 
-        // DNS hijacking via pfctl.
+        // DNS hijacking: set system DNS to a public IP so mDNSResponder
+        // sends queries to a public address (not the router). These queries
+        // flow through TUN split routes and are intercepted by the TUN
+        // handler's dst_port==53 check. Also install pf rdr for LAN DNS as
+        // a fallback for apps that hardcode router DNS.
         if auto_hijack {
+            // Only set system DNS when fake-ip is enabled. In fake-ip mode,
+            // DNS queries are answered locally (fake IP allocated), so
+            // redirecting system DNS through TUN is safe and prevents leaks.
+            // When fake-ip is disabled, DNS queries need real upstream
+            // resolution — setting system DNS to a public IP would force
+            // all DNS through TUN, which breaks if the proxy outbound
+            // doesn't support UDP relay (e.g. SS with obfs plugin).
+            if self.fakeip_enabled {
+                self.setup_system_dns()?;
+            }
             self.setup_dns_hijack()?;
         }
 
         Ok(())
+    }
+
+    /// Set system DNS servers to public IPs so DNS queries route through
+    /// TUN instead of the LAN bypass route to the router.
+    ///
+    /// macOS `mDNSResponder` sends DNS queries to the configured system DNS
+    /// server. When the system DNS is the router (e.g. 192.168.50.1), the
+    /// LAN bypass route (192.168.0.0/16 → physical gateway) takes precedence
+    /// over TUN split routes, so DNS queries never reach TUN.
+    ///
+    /// By setting the system DNS to a public IP (e.g. 223.5.5.5), DNS queries
+    /// match the TUN split route (0.0.0.0/1 or 128.0.0.0/1 → 10.0.0.1) and
+    /// are intercepted by the TUN handler's dst_port==53 check.
+    ///
+    /// The proxy's own DNS queries use IP_BOUND_IF to bypass TUN, so they
+    /// are not affected.
+    fn setup_system_dns(&mut self) -> Result<(), String> {
+        // Find the active network service (e.g. "Wi-Fi").
+        //
+        // Strategy: use `route -n get default` to find the default interface
+        // (e.g. en0), then map it to a network service name via
+        // `networksetup -listallhardwareports`. This reliably picks the
+        // primary interface regardless of connection type (Wi-Fi, Ethernet,
+        // USB tethering, etc.). Falls back to iterating services by IPv4.
+        let service = self.find_primary_network_service();
+
+        let Some(service) = service else {
+            log::warn!("DNS hijack: could not find active network service");
+            return Ok(());
+        };
+        log::info!("DNS hijack: active network service: {service}");
+
+        // Save original DNS servers.
+        let original = run_networksetup_cmd(&["-getdnsservers", &service]);
+        let original_dns: Vec<String> = if original.contains("There aren't any DNS Servers set") {
+            Vec::new()
+        } else {
+            original.lines().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()
+        };
+        self.original_dns = Some(original_dns.clone());
+        self.network_service = Some(service.clone());
+
+        // Set system DNS to public IPs. These addresses will route through
+        // TUN split routes and be intercepted by the TUN handler.
+        // Using 223.5.5.5 and 114.114.114.114 (Alibaba DNS) as they are
+        // fast public resolvers in China. The actual resolution is handled
+        // by anywhere's DNS engine (direct upstream), not these IPs directly.
+        let _ = Command::new("networksetup")
+            .args(["-setdnsservers", &service, "223.5.5.5", "114.114.114.114"])
+            .output();
+        log::info!("DNS hijack: system DNS set to 223.5.5.5, 114.114.114.114 (was {:?})", original_dns);
+
+        // Flush DNS cache so mDNSResponder picks up the new servers.
+        let _ = Command::new("dscacheutil").arg("-flushcache").output();
+        let _ = Command::new("killall").arg("-HUP").arg("mDNSResponder").output();
+
+        Ok(())
+    }
+
+    /// Restore original system DNS servers.
+    fn restore_system_dns(&mut self) {
+        let Some(ref service) = self.network_service else { return };
+        let Some(ref original) = self.original_dns else { return };
+
+        if original.is_empty() {
+            // Clear DNS (back to DHCP-assigned): pass no server args.
+            let _ = Command::new("networksetup")
+                .args(["-setdnsservers", service])
+                .output();
+        } else {
+            let mut args = vec!["-setdnsservers".to_string(), service.clone()];
+            args.extend(original.iter().cloned());
+            let _ = Command::new("networksetup")
+                .args(&args)
+                .output();
+        }
+        log::info!("DNS hijack: system DNS restored to {:?}", original);
+
+        // Flush DNS cache.
+        let _ = Command::new("dscacheutil").arg("-flushcache").output();
+        let _ = Command::new("killall").arg("-HUP").arg("mDNSResponder").output();
+    }
+
+    /// Find the primary network service name by looking up the default
+    /// route's interface and mapping it via `networksetup -listallhardwareports`.
+    /// Falls back to iterating services for one with a real IPv4 address.
+    fn find_primary_network_service(&self) -> Option<String> {
+        // 1. Get the default route's interface (e.g. "en0").
+        let route_output = Command::new("route")
+            .args(["-n", "get", "default"])
+            .output()
+            .ok()?;
+        let route_str = String::from_utf8_lossy(&route_output.stdout);
+        let iface: Option<&str> = route_str
+            .lines()
+            .map(|l| l.trim())
+            .find_map(|l| l.strip_prefix("interface:").map(|s| s.trim()));
+
+        if let Some(iface) = iface {
+            log::debug!("DNS hijack: default route interface: {iface}");
+            // 2. Map interface (en0) → hardware port name (Wi-Fi) via
+            // `networksetup -listallhardwareports` which outputs:
+            //   Hardware Port: Wi-Fi
+            //   Device: en0
+            //   Ethernet Address: ...
+            let hw_output = run_networksetup_cmd(&["-listallhardwareports"]);
+            let mut last_port: Option<String> = None;
+            for line in hw_output.lines() {
+                let line = line.trim();
+                if let Some(rest) = line.strip_prefix("Hardware Port:") {
+                    last_port = Some(rest.trim().to_string());
+                } else if line.strip_prefix("Device:").map(|s| s.trim()) == Some(iface) {
+                    if let Some(port) = &last_port {
+                        // Verify this service has a real IPv4 address.
+                        let info = run_networksetup_cmd(&["-getinfo", port]);
+                        let has_ipv4 = info.lines().any(|l| {
+                            l.trim().starts_with("IP address") && !l.contains("none")
+                        });
+                        if has_ipv4 {
+                            return Some(port.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        // 3. Fallback: iterate services, find first with real IPv4.
+        log::debug!("DNS hijack: falling back to service iteration");
+        run_networksetup_cmd(&["-listallnetworkservices"])
+            .lines()
+            .filter(|l| !l.is_empty() && !l.starts_with('*') && !l.starts_with("An asterisk"))
+            .find(|l| {
+                let info = run_networksetup_cmd(&["-getinfo", l]);
+                info.lines().any(|line| {
+                    line.trim().starts_with("IP address") && !line.contains("none")
+                })
+            })
+            .map(|s| s.trim().to_string())
     }
 
     /// Install pf `route-to` rules to bypass TUN for direct outbound traffic.
@@ -269,29 +439,29 @@ impl MacosTunManager {
         Ok(())
     }
 
-    /// Set up DNS hijacking: redirect all UDP port 53 traffic to 1053
-    /// using pfctl rdr rules.
+    /// Set up DNS hijacking: redirect LAN DNS traffic to the loopback
+    /// listener using pfctl rdr rules.
+    ///
+    /// Only redirect UDP port 53 traffic destined to private/LAN ranges
+    /// (192.168.0.0/16, 172.16.0.0/12, 10.0.0.0/8). This covers the common
+    /// case where the system DNS server is the router (e.g. 192.168.50.1)
+    /// and that traffic bypasses TUN via LAN bypass routes.
+    ///
+    /// DNS queries to public IPs (e.g. 223.5.5.5) are NOT redirected here —
+    /// they flow through TUN split routes and are intercepted by the TUN
+    /// handler's `dst_port == 53` check.
+    ///
+    /// The proxy's own DNS queries (resolve_direct_udp) target public IPs
+    /// (223.5.5.5, 114.114.114.114) and use IP_BOUND_IF to bypass TUN, so
+    /// they are not caught by this rdr (not in LAN ranges).
+    ///
+    /// This avoids the need for `no rdr from <en0_ip>` which was too broad
+    /// and exempted ALL local DNS traffic, causing DNS leaks.
     fn setup_dns_hijack(&mut self) -> Result<(), String> {
-        // Build DNS rdr rules.
-        // Don't bind to a specific interface - the TUN interface name is
-        // assigned dynamically by the kernel (utunN) and may not be
-        // resolved correctly at this point. A global rdr catches all
-        // DNS traffic regardless of which interface it arrives on.
-        //
-        // CRITICAL: add a `no rdr` exclusion for traffic from the physical
-        // interface IP. The DNS resolver (resolve_direct_udp) binds to the
-        // en0 IP via bind_udp_bypass and sends queries to upstream DNS
-        // servers (e.g. 223.5.5.5:53). Without the exclusion, the rdr rule
-        // redirects the resolver's own queries back to the listener,
-        // creating an infinite loop. On Linux this is handled by SO_MARK +
-        // iptables `! --mark`; macOS has no SO_MARK, so we exclude by
-        // source IP instead.
-        let en0_ip = get_en0_ipv4().unwrap_or_else(|| "0.0.0.0".to_string());
         let dns_rules = format!(
-            "no rdr inet proto udp from {en0_ip} to any port 53\n\
-             rdr pass inet proto udp from any to any port 53 -> 127.0.0.1 port {hijack_port}\n\
-             rdr pass inet6 proto udp from any to any port 53 -> ::1 port {hijack_port}\n",
-            en0_ip = en0_ip,
+            "rdr pass inet proto udp from any to 192.168.0.0/16 port 53 -> 127.0.0.1 port {hijack_port}\n\
+             rdr pass inet proto udp from any to 172.16.0.0/12 port 53 -> 127.0.0.1 port {hijack_port}\n\
+             rdr pass inet proto udp from any to 10.0.0.0/8 port 53 -> 127.0.0.1 port {hijack_port}\n",
             hijack_port = crate::dns::DNS_REDIRECT_PORT,
         );
 
@@ -400,6 +570,9 @@ impl MacosTunManager {
             log::info!("macOS TUN routes removed");
             self.routes_installed = false;
         }
+
+        // Restore original system DNS servers.
+        self.restore_system_dns();
     }
 
     /// Enable TUN routing (install routes + pf rules + DNS hijack).
@@ -511,6 +684,19 @@ fn run_pfctl_cmd(args: &[&str]) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// Run a `networksetup` command and return stdout as a string.
+fn run_networksetup_cmd(args: &[&str]) -> String {
+    log::debug!("networksetup {}", args.join(" "));
+    let output = Command::new("networksetup").args(args).output();
+    match output {
+        Ok(o) => String::from_utf8_lossy(&o.stdout).to_string(),
+        Err(e) => {
+            log::warn!("networksetup {} failed: {e}", args.join(" "));
+            String::new()
+        }
+    }
 }
 
 /// Get the IPv4 address of the primary physical interface (en0/en1/...).

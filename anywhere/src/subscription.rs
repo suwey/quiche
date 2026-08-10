@@ -352,21 +352,33 @@ fn parse_clash_yaml(
         }
     }
 
-    // proxy-groups: only `url-test` maps (to a `urltest` outbound).
-    let urltest_names: std::collections::HashSet<String> = yaml
+    // proxy-groups: collect url-test and select group names for valid_refs.
+    let (urltest_names, select_names): (
+        std::collections::HashSet<String>,
+        std::collections::HashSet<String>,
+    ) = yaml
         .get("proxy-groups")
         .and_then(|v| v.as_sequence())
         .map(|gs| {
-            gs.iter()
-                .filter(|g| g.get("type").and_then(|v| v.as_str()) == Some("url-test"))
-                .filter_map(|g| g.get("name").and_then(|v| v.as_str()).map(|s| s.to_string()))
-                .collect()
+            let mut ut = std::collections::HashSet::new();
+            let mut sel = std::collections::HashSet::new();
+            for g in gs {
+                let gtype = g.get("type").and_then(|v| v.as_str());
+                let name = g.get("name").and_then(|v| v.as_str()).map(|s| s.to_string());
+                match (gtype, name) {
+                    (Some("url-test"), Some(n)) => { ut.insert(n); },
+                    (Some("select"), Some(n)) => { sel.insert(n); },
+                    _ => {},
+                }
+            }
+            (ut, sel)
         })
         .unwrap_or_default();
 
-    // Valid outbound reference set = proxies + url-test groups.
+    // Valid outbound reference set = proxies + url-test groups + select groups.
     let mut valid_refs = proxy_tags.clone();
     valid_refs.extend(urltest_names.iter().cloned());
+    valid_refs.extend(select_names.iter().cloned());
 
     if let Some(groups) = yaml.get("proxy-groups").and_then(|v| v.as_sequence()) {
         for g in groups {
@@ -376,7 +388,11 @@ fn parse_clash_yaml(
                 if let Some(ob) = parse_clash_urltest(g, gname, &valid_refs) {
                     outbounds.push(ob);
                 }
-            } else if !matches!(gtype, "select" | "fallback" | "load-balance" | "relay" | "") {
+            } else if gtype == "select" {
+                if let Some(ob) = parse_clash_select(g, gname, &valid_refs) {
+                    outbounds.push(ob);
+                }
+            } else if !matches!(gtype, "fallback" | "load-balance" | "relay" | "") {
                 skips.push(format!("group:{gtype}"));
             }
         }
@@ -566,6 +582,30 @@ fn parse_clash_urltest(
     }
 
     Some(ob)
+}
+
+/// Parse a Clash `select` proxy-group into a `select` outbound.
+///
+/// References not in `valid_refs` (proxies + url-test groups + select groups)
+/// are dropped. `DIRECT` is mapped to `direct` (always available). If no valid
+/// children remain the group is skipped.
+fn parse_clash_select(
+    group: &noyalib::Value,
+    name: &str,
+    valid_refs: &std::collections::HashSet<String>,
+) -> Option<TomlOutbound> {
+    let proxies = group.get("proxies").and_then(|v| v.as_sequence())?;
+    let refs: Vec<String> = proxies
+        .iter()
+        .filter_map(|v| v.as_str())
+        .filter(|s| valid_refs.contains(*s) || *s == "DIRECT")
+        .map(|s| if s == "DIRECT" { "direct".to_string() } else { s.to_string() })
+        .collect();
+    if refs.is_empty() {
+        return None;
+    }
+
+    Some(TomlOutbound::new("select", name).field("outbounds", refs))
 }
 
 /// Check if a CIDR string falls within the private/internal ranges that
@@ -795,6 +835,16 @@ fn parse_clash_dns(dns: &noyalib::Mapping) -> Option<TomlDns> {
     }
     if let Some(fip) = dns.get("fake-ip-range").and_then(|v| v.as_str()) {
         fields.push(("fakeip".to_string(), TomlValue::Str(fip.to_string())));
+    }
+
+    if let Some(filter) = dns.get("fake-ip-filter").and_then(|v| v.as_sequence()) {
+        let list: Vec<String> = filter
+            .iter()
+            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+            .collect();
+        if !list.is_empty() {
+            fields.push(("fakeip_filter".to_string(), TomlValue::List(list)));
+        }
     }
 
     if fields.is_empty() {

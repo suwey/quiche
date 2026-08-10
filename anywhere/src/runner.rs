@@ -394,6 +394,26 @@ pub async fn run(opts: RunOptions) -> Result<(), Box<dyn std::error::Error>> {
             .collect();
 
         let urltest_states = registry.urltest_states.clone();
+        let select_states = registry.select_states.clone();
+
+        // Apply persisted group selections from cache (select + urltest fixed).
+        let saved_selections = cache.get_group_selections();
+        for (group, child) in &saved_selections {
+            if let Some(state) = select_states.get(group) {
+                if state.set_by_name(child) {
+                    log::info!(
+                        "select: restored selection for '{group}' -> '{child}'"
+                    );
+                }
+            }
+            if let Some(state) = urltest_states.get(group) {
+                if state.set_fixed_by_name(child) {
+                    log::info!(
+                        "urltest: restored pin for '{group}' -> '{child}'"
+                    );
+                }
+            }
+        }
 
         AppContext::new(
             registry.clone(),
@@ -403,6 +423,8 @@ pub async fn run(opts: RunOptions) -> Result<(), Box<dyn std::error::Error>> {
             start_cmd,
             outbound_tags,
             urltest_states,
+            select_states,
+            cache.clone(),
             cmd_tx,
             event_tx,
         )
@@ -417,6 +439,8 @@ pub async fn run(opts: RunOptions) -> Result<(), Box<dyn std::error::Error>> {
             None,
             Vec::new(),
             HashMap::new(),
+            HashMap::new(),
+            cache.clone(),
             cmd_tx,
             event_tx,
         )
@@ -450,6 +474,11 @@ pub async fn run(opts: RunOptions) -> Result<(), Box<dyn std::error::Error>> {
             };
 
             let local_direct = tun_config.local_direct;
+            let fakeip_enabled = dns_cfg.fakeip.is_some();
+            // Pass fakeip state to TunConfig so platform managers know
+            // whether to set system DNS.
+            let mut tun_config = tun_config;
+            tun_config.fakeip_enabled = fakeip_enabled;
             let dns_cfg_for_builder = dns_cfg.clone();
             let rules_for_builder = rules.clone();
             let registry_clients = registry.clients_arc();

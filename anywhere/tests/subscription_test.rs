@@ -161,6 +161,58 @@ dns:
 }
 
 #[test]
+fn test_clash_select_group_parsing() {
+    let yaml = r#"
+proxies:
+  - name: "node-ss"
+    type: ss
+    server: ss.example.com
+    port: 8388
+    cipher: aes-256-gcm
+    password: "pass1"
+  - name: "node-vless"
+    type: vless
+    server: vless.example.com
+    port: 443
+    uuid: "abc-uuid"
+    servername: vless.example.com
+    skip-cert-verify: true
+    client-fingerprint: chrome
+
+proxy-groups:
+  - name: "auto"
+    type: url-test
+    proxies: ["node-ss", "node-vless"]
+    url: "http://www.gstatic.com/generate_204"
+    interval: 300
+  - name: "manual"
+    type: select
+    proxies: ["auto", "node-ss", "DIRECT"]
+
+rules:
+  - DOMAIN-SUFFIX,google.com,manual
+  - MATCH,manual
+"#;
+    let mut skips = Vec::new();
+    let toml_out = convert_subscription(yaml.as_bytes(), &mut skips).unwrap();
+
+    // 2 proxies + 1 urltest + 1 select.
+    assert_eq!(toml_out.matches("[[outbounds]]").count(), 4);
+
+    // select group.
+    assert!(toml_out.contains("type = \"select\""));
+    assert!(toml_out.contains("tag = \"manual\""));
+    // DIRECT mapped to "direct"; children include the urltest group + proxies.
+    assert!(toml_out.contains("\"auto\""));
+    assert!(toml_out.contains("\"node-ss\""));
+    assert!(toml_out.contains("\"direct\""));
+
+    // Rules referencing the select group are preserved (not dropped).
+    assert!(toml_out.contains("outbound = \"manual\""));
+    assert_eq!(toml_out.matches("[[rules]]").count(), 2);
+}
+
+#[test]
 fn test_merge_and_skip() {
     let yaml = std::fs::read_to_string("/tmp/test_merge.yaml").unwrap();
     let mut skips = Vec::new();

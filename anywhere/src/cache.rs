@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: BSD-2-Clause
 // Copyright © The anywhere project contributors.
 
-//! Engine status cache — persistent state + runtime status for UI consumption.
+//! Engine status cache - persistent state + runtime status for UI consumption.
 //!
 //! Architecture:
 //!
@@ -18,6 +18,7 @@
 //!   on Android, syncs a JSON snapshot for Kotlin to read.
 //! - Kotlin reads `engine_status.json` directly — no JNI needed.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -218,6 +219,62 @@ impl CacheStore {
             let snapshot = self.status.read().clone();
             if let Ok(json) = serde_json::to_string_pretty(&snapshot) {
                 let _ = std::fs::write(&path, json);
+            }
+        }
+    }
+
+    // -- Per-group selection persistence -------------------------------------
+
+    /// redb key prefix for select-group selections: `select:{group_tag}`.
+    const SELECT_PREFIX: &str = "select:";
+
+    /// Load all persisted group selections (group_tag -> child_tag).
+    pub fn get_group_selections(&self) -> HashMap<String, String> {
+        let mut result = HashMap::new();
+        if let Some(db) = &self.db {
+            let table_def: redb::TableDefinition<&str, &str> =
+                redb::TableDefinition::new("state");
+            if let Ok(txn) = db.begin_read() {
+                if let Ok(table) = txn.open_table(table_def) {
+                    let range = table.range::<&str>(..);
+                    if let Ok(iter) = range {
+                        for item in iter {
+                            if let Ok((k, v)) = item {
+                                let key = k.value();
+                                if let Some(group) =
+                                    key.strip_prefix(Self::SELECT_PREFIX)
+                                {
+                                    result.insert(
+                                        group.to_string(),
+                                        v.value().to_string(),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        result
+    }
+
+    /// Persist a single group selection to redb.
+    pub fn set_group_selection(&self, group: &str, child: &str) {
+        let key = format!("{}{group}", Self::SELECT_PREFIX);
+        self.persist(&key, child);
+    }
+
+    /// Remove a persisted group selection from redb (restore auto mode).
+    pub fn clear_group_selection(&self, group: &str) {
+        if let Some(db) = &self.db {
+            let table_def: redb::TableDefinition<&str, &str> =
+                redb::TableDefinition::new("state");
+            if let Ok(txn) = db.begin_write() {
+                if let Ok(mut table) = txn.open_table(table_def) {
+                    let key = format!("{}{group}", Self::SELECT_PREFIX);
+                    let _ = table.remove(key.as_str());
+                }
+                let _ = txn.commit();
             }
         }
     }
