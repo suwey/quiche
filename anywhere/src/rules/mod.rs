@@ -507,11 +507,8 @@ impl Rules {
                     }
                 }
                 return Some(RuleMatch {
-                    outbound_tag: self.global_outbound.clone(),
-                    description: format!(
-                        "global mode => route({})",
-                        self.global_outbound
-                    ),
+                    outbound_tag: "GLOBAL".into(),
+                    description: "global mode => route(GLOBAL)".into(),
                 });
             },
             _ => {
@@ -1047,21 +1044,21 @@ mod tests {
                 .as_deref(),
             Some("direct")
         );
-        // example.com doesn't match builtin, falls through to global_outbound.
+        // example.com doesn't match builtin, falls through to GLOBAL.
         assert_eq!(
             rules
                 .match_conn(&dest("example.com:443"), Network::Tcp, None)
                 .map(|m| m.outbound_tag)
                 .as_deref(),
-            Some("proxy")
+            Some("GLOBAL")
         );
-        // Unmatched traffic catches to global_outbound (= last user rule).
+        // Unmatched traffic catches to GLOBAL.
         assert_eq!(
             rules
                 .match_conn(&dest("1.1.1.1:443"), Network::Tcp, None)
                 .map(|m| m.outbound_tag)
                 .as_deref(),
-            Some("proxy")
+            Some("GLOBAL")
         );
     }
 

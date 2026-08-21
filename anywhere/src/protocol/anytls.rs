@@ -4,15 +4,12 @@
 //! Shared AnyTLS protocol primitives used by both inbound and outbound.
 //!
 //! Contains command constants, frame encoding/decoding, SOCKS address helpers,
-//! padding scheme management, settings serialization, hash utilities, and
-//! UoT (UDP-over-TCP) associate-mode datagram encoding/parsing.
+//! padding scheme management, settings serialization, and hash utilities.
+//! UoT (UDP-over-TCP) lives in [`crate::protocol::uot`] and is re-exported.
 
 use std::collections::HashMap;
 use std::io;
 use std::io::Read;
-
-use crate::inbound::Address;
-use crate::inbound::Destination;
 
 use boring::hash::MessageDigest;
 use boring::hash::hash;
@@ -426,163 +423,12 @@ pub enum WriteMsg {
     RawFrame(Vec<u8>),
 }
 
-// ========== UoT (UDP-over-TCP) ==========
-//
-// Protocol v2 (`sp.v2.udp-over-tcp.arpa`), associate mode.
-//
-// Frame formats (all big-endian):
-//
-// - Request (sent once at stream open) — uses SOCKS5 ATYP:
-//   `[isConnect:u8][ATYP:u8][addr...][port:u16]`
-//
-// - Associate datagram (repeating) — uses UoT ATYP:
-//   `[ATYP:u8][addr...][port:u16][len:u16][data...]`
-//
-// Important: the Request frame uses sing's `SocksaddrSerializer` (SOCKS5
-// ATYP — 0x01=v4 / 0x03=fqdn / 0x04=v6), while the associate datagrams
-// use `AddrParser` (UoT ATYP — 0x00=v4 / 0x01=v6 / 0x02=fqdn).
-
-/// UoT v2 magic FQDN used to negotiate a UDP-over-TCP stream.
-pub const UOT_MAGIC_ADDRESS: &str = "sp.v2.udp-over-tcp.arpa";
-
-// UoT ATYP (used in associate datagrams).
-pub const UOT_ATYP_IPV4: u8 = 0x00;
-pub const UOT_ATYP_IPV6: u8 = 0x01;
-pub const UOT_ATYP_DOMAIN: u8 = 0x02;
-
-// SOCKS5 ATYP (used in UoT request header and anytls SYN target).
-pub const SOCKS_ATYP_IPV4: u8 = 0x01;
-pub const SOCKS_ATYP_DOMAIN: u8 = 0x03;
-pub const SOCKS_ATYP_IPV6: u8 = 0x04;
-
-/// Magic address with a placeholder port; the server only inspects the FQDN.
-pub fn uot_magic_address_with_port() -> String {
-    format!("{UOT_MAGIC_ADDRESS}:443")
-}
-
-/// Write `dest` using UoT ATYP (for associate datagrams).
-fn write_uot_addr(buf: &mut Vec<u8>, dest: &Destination) -> io::Result<()> {
-    match &dest.address {
-        Address::Ipv4(o) => {
-            buf.put_u8(UOT_ATYP_IPV4);
-            buf.extend_from_slice(o);
-        },
-        Address::Ipv6(o) => {
-            buf.put_u8(UOT_ATYP_IPV6);
-            buf.extend_from_slice(o);
-        },
-        Address::Domain(d) => {
-            if d.len() > 255 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "uot domain too long",
-                ));
-            }
-            buf.put_u8(UOT_ATYP_DOMAIN);
-            buf.put_u8(d.len() as u8);
-            buf.extend_from_slice(d.as_bytes());
-        },
-    }
-    buf.put_u16(dest.port);
-    Ok(())
-}
-
-/// On-the-wire length of `dest`'s UoT addr+port encoding.
-fn uot_addr_len(dest: &Destination) -> usize {
-    let addr = match &dest.address {
-        Address::Ipv4(_) => 1 + 4,
-        Address::Ipv6(_) => 1 + 16,
-        Address::Domain(d) => 1 + 1 + d.len(),
-    };
-    addr + 2
-}
-
-/// Encode one associate-mode UoT datagram. Uses UoT ATYP.
-pub fn uot_encode_associate_packet(
-    dest: &Destination, data: &[u8],
-) -> io::Result<Vec<u8>> {
-    if data.len() > u16::MAX as usize {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "uot datagram too large",
-        ));
-    }
-    let mut buf = Vec::with_capacity(uot_addr_len(dest) + 2 + data.len());
-    write_uot_addr(&mut buf, dest)?;
-    buf.put_u16(data.len() as u16);
-    buf.extend_from_slice(data);
-    Ok(buf)
-}
-
-/// Attempt to parse one associate-mode UoT datagram from `buf`.
-///
-/// Returns:
-/// - `Ok(Some((dest, data_range, consumed)))` on a complete frame
-/// - `Ok(None)` if more bytes are needed
-/// - `Err(...)` on protocol violation
-pub fn uot_try_parse_associate_packet(
-    buf: &[u8],
-) -> io::Result<Option<(Destination, std::ops::Range<usize>, usize)>> {
-    if buf.is_empty() {
-        return Ok(None);
-    }
-    let atyp = buf[0];
-    let (address, addr_end) = match atyp {
-        UOT_ATYP_IPV4 => {
-            if buf.len() < 1 + 4 {
-                return Ok(None);
-            }
-            let mut o = [0u8; 4];
-            o.copy_from_slice(&buf[1..5]);
-            (Address::Ipv4(o), 5)
-        },
-        UOT_ATYP_IPV6 => {
-            if buf.len() < 1 + 16 {
-                return Ok(None);
-            }
-            let mut o = [0u8; 16];
-            o.copy_from_slice(&buf[1..17]);
-            (Address::Ipv6(o), 17)
-        },
-        UOT_ATYP_DOMAIN => {
-            if buf.len() < 2 {
-                return Ok(None);
-            }
-            let dlen = buf[1] as usize;
-            let end = 2 + dlen;
-            if buf.len() < end {
-                return Ok(None);
-            }
-            let s = std::str::from_utf8(&buf[2..end]).map_err(|_| {
-                io::Error::new(io::ErrorKind::InvalidData, "uot bad domain utf8")
-            })?;
-            (Address::Domain(s.to_string()), end)
-        },
-        _ => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("uot associate bad ATYP {atyp:#04x}"),
-            ));
-        },
-    };
-
-    let port_end = addr_end + 2;
-    if buf.len() < port_end + 2 {
-        return Ok(None);
-    }
-    let port = u16::from_be_bytes([buf[addr_end], buf[addr_end + 1]]);
-
-    let len_end = port_end + 2;
-    let dlen = u16::from_be_bytes([buf[port_end], buf[port_end + 1]]) as usize;
-
-    let data_end = len_end + dlen;
-    if buf.len() < data_end {
-        return Ok(None);
-    }
-
-    Ok(Some((
-        Destination::new(address, port),
-        len_end..data_end,
-        data_end,
-    )))
-}
+// UoT (UDP-over-TCP) protocol moved to [`crate::protocol::uot`].
+// Re-exported here so existing `protocol::anytls` callers (inbound/outbound
+// anytls) keep resolving without import churn. New callers (e.g.
+// shadowsocks UoT) should use `crate::protocol::uot` directly.
+pub use crate::protocol::uot::{
+    uot_magic_address_with_port, UOT_MAGIC_ADDRESS, UOT_ATYP_IPV4,
+    UOT_ATYP_IPV6, UOT_ATYP_DOMAIN, SOCKS_ATYP_IPV4, SOCKS_ATYP_DOMAIN,
+    SOCKS_ATYP_IPV6, uot_encode_associate_packet, uot_try_parse_associate_packet,
+};

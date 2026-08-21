@@ -26,11 +26,10 @@ use crate::relay::PacketRelay;
 use crate::relay::StreamRelay;
 use crate::tlsfragment::FragmentConfig;
 
-pub mod uot;
-
+use crate::protocol::uot;
 use uot::UotPacketRelay;
 use uot::encode_request;
-use uot::magic_address_with_port;
+use uot::uot_magic_address_with_port as magic_address_with_port;
 
 // Re-import shared protocol primitives.
 use proto::CHECK_MARK;
@@ -1015,10 +1014,12 @@ impl OutboundClient for AnyTlsOutboundClient {
         let session = self.udp_pool.acquire(|| self.create_session())?;
         let magic = magic_address_with_port();
         let stream = session.open_stream(&magic)?;
-
+        // Wrap in the existing StreamRelay adapter so the shared
+        // UotPacketRelay can drive this anytls stream like any other.
+        let mut s = AnyTlsStreamRelay::new(stream);
         let req = encode_request(false, initial_dest)?;
-        stream.write(&req)?;
-        Ok(Box::new(UotPacketRelay::new(stream)))
+        s.write(&req).await?;
+        Ok(Box::new(UotPacketRelay::new(s)))
     }
 
 }

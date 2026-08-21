@@ -391,25 +391,35 @@ pub async fn run(opts: RunOptions) -> Result<(), Box<dyn std::error::Error>> {
             .iter()
             .enumerate()
             .map(|(i, o)| (o.tag_or_default(i), o.type_.clone()))
+            .chain(std::iter::once(("GLOBAL".to_string(), "urltest".to_string())))
             .collect();
 
         let urltest_states = registry.urltest_states.clone();
-        let select_states = registry.select_states.clone();
 
-        // Apply persisted group selections from cache (select + urltest fixed).
+        // Restore persisted mode from cache.
+        let saved_mode = cache.status().mode;
+        let mode_idx = match saved_mode.as_str() {
+            "direct" => Some(crate::rules::MODE_DIRECT),
+            "global" => Some(crate::rules::MODE_GLOBAL),
+            "rule" => Some(crate::rules::MODE_RULE),
+            _ => None,
+        };
+        if let Some(idx) = mode_idx {
+            rules.set_mode(idx);
+            log::info!("restored mode from cache: {saved_mode}");
+        }
+
+        // Apply persisted group selections from cache.
+        // All group types (select, urltest, GLOBAL) are unified into
+        // urltest_states. For select-mode groups we use set_fixed_by_name
+        // which sets both `fixed` and `current`, effectively restoring the
+        // manual selection.
         let saved_selections = cache.get_group_selections();
         for (group, child) in &saved_selections {
-            if let Some(state) = select_states.get(group) {
-                if state.set_by_name(child) {
-                    log::info!(
-                        "select: restored selection for '{group}' -> '{child}'"
-                    );
-                }
-            }
             if let Some(state) = urltest_states.get(group) {
                 if state.set_fixed_by_name(child) {
                     log::info!(
-                        "urltest: restored pin for '{group}' -> '{child}'"
+                        "restored selection for '{group}' -> '{child}'"
                     );
                 }
             }
@@ -423,7 +433,6 @@ pub async fn run(opts: RunOptions) -> Result<(), Box<dyn std::error::Error>> {
             start_cmd,
             outbound_tags,
             urltest_states,
-            select_states,
             cache.clone(),
             cmd_tx,
             event_tx,
@@ -438,7 +447,6 @@ pub async fn run(opts: RunOptions) -> Result<(), Box<dyn std::error::Error>> {
             logs_tx,
             None,
             Vec::new(),
-            HashMap::new(),
             HashMap::new(),
             cache.clone(),
             cmd_tx,

@@ -8,23 +8,20 @@ use crate::outbound::anytls::AnyTlsOutboundClient;
 use crate::outbound::direct::DirectOutboundClient;
 use crate::outbound::mless::MlessOutboundClient;
 use crate::outbound::quic::QuicOutboundClient;
-use crate::outbound::select::SelectOutboundClient;
-use crate::outbound::shadowsocks::ShadowsocksOutboundClient;
-use crate::outbound::ssh::SshOutboundClient;
 use crate::outbound::urltest::UrlTestOutboundClient;
 use crate::outbound::urltest::UrlTestState;
 use crate::outbound::urltest::{
-    self,
+    self, SelectMode,
 };
+use crate::outbound::shadowsocks::ShadowsocksOutboundClient;
+use crate::outbound::ssh::SshOutboundClient;
 use crate::outbound::vless::VlessOutboundClient;
 
 /// Holds outbound clients keyed by configured tag.
 pub struct OutboundRegistry {
     clients: Arc<HashMap<String, Arc<dyn OutboundClient>>>,
-    /// Per-urltest-node shared states for UI access.
+    /// Per-group shared states for UI access (all group types unified).
     pub urltest_states: HashMap<String, Arc<UrlTestState>>,
-    /// Per-select-node shared states for UI access.
-    pub select_states: HashMap<String, Arc<crate::outbound::select::SelectState>>,
     /// JoinHandles of urltest background test loops. Aborted on in-process
     /// reload so the outbound clients they hold (esp. mless/vless mux
     /// persistent connections) are released before the next run() iteration.
@@ -153,15 +150,23 @@ impl OutboundRegistry {
 
         // --- urltest outbounds (must come after all referenced outbounds are
         // registered) ---
+        // Handles both `type = "urltest"` and legacy `type = "select"`.
+        // `select` is treated as `urltest` with `mode = "select"`.
+        // The health-check loop is only spawned when `needs_health_check()`
+        // is true (i.e. mode is latency or seq, not select).
         let mut urltest_states: HashMap<String, Arc<UrlTestState>> =
             HashMap::new();
         let mut test_loop_handles: Vec<tokio::task::JoinHandle<()>> =
             Vec::new();
 
-        for cfg in config.outbounds.iter().filter(|o| o.type_ == "urltest") {
+        for cfg in config
+            .outbounds
+            .iter()
+            .filter(|o| o.type_ == "urltest" || o.type_ == "select")
+        {
             let tag = Self::tag(cfg)?.to_string();
             let child_tags = cfg.outbounds.clone().ok_or_else(|| {
-                format!("urltest '{tag}': missing 'outbounds' field")
+                format!("{} '{tag}': missing 'outbounds' field", cfg.type_)
             })?;
 
             // Filter out children that failed initialization, log a warning.
@@ -172,7 +177,8 @@ impl OutboundRegistry {
                         true
                     } else {
                         log::warn!(
-                            "urltest '{tag}': child '{}' not found, skipping",
+                            "{} '{tag}': child '{}' not found, skipping",
+                            cfg.type_,
                             t,
                         );
                         false
@@ -182,73 +188,48 @@ impl OutboundRegistry {
 
             if valid_children.is_empty() {
                 log::error!(
-                    "urltest '{tag}': no valid children, skipping urltest"
+                    "{} '{tag}': no valid children, skipping",
+                    cfg.type_
                 );
                 continue;
             }
+
+            // Resolve mode: `type = "select"` implies Select mode;
+            // `type = "urltest"` uses the `mode` field (default Latency).
+            let mode = if cfg.type_ == "select" {
+                urltest::SelectMode::Select
+            } else {
+                cfg.mode
+                    .as_deref()
+                    .map(urltest::SelectMode::from_str)
+                    .unwrap_or_default()
+            };
 
             let test_url = cfg
                 .url
                 .clone()
                 .unwrap_or_else(|| "www.google.com".to_string());
-            let interval = cfg.interval.unwrap_or(600);
+            let interval = cfg.interval.unwrap_or(300);
 
             let client =
-                UrlTestOutboundClient::new(valid_children, &clients, test_url);
+                UrlTestOutboundClient::new(valid_children, &clients, test_url, mode);
             let state = client.state.clone();
             let test_url_for_loop = client.test_url.clone();
 
             urltest_states.insert(tag.clone(), state.clone());
 
             let client_arc = Arc::new(client) as Arc<dyn OutboundClient>;
-            test_loop_handles.push(urltest::spawn_test_loop(
-                Arc::clone(&client_arc),
-                test_url_for_loop,
-                interval,
-            ));
 
-            clients.insert(tag.clone(), client_arc);
-        }
-
-        // --- select outbounds (manual selection, no health check) ---
-        let mut select_states: HashMap<
-            String, Arc<crate::outbound::select::SelectState>,
-        > = HashMap::new();
-
-        for cfg in config.outbounds.iter().filter(|o| o.type_ == "select") {
-            let tag = Self::tag(cfg)?.to_string();
-            let child_tags = cfg.outbounds.clone().ok_or_else(|| {
-                format!("select '{tag}': missing 'outbounds' field")
-            })?;
-
-            let valid_children: Vec<String> = child_tags
-                .into_iter()
-                .filter(|t| {
-                    if clients.contains_key(t) {
-                        true
-                    } else {
-                        log::warn!(
-                            "select '{tag}': child '{}' not found, skipping",
-                            t,
-                        );
-                        false
-                    }
-                })
-                .collect();
-
-            if valid_children.is_empty() {
-                log::error!(
-                    "select '{tag}': no valid children, skipping select"
-                );
-                continue;
+            // Only spawn the health-check loop for modes that need it.
+            if mode.needs_health_check() {
+                test_loop_handles.push(urltest::spawn_test_loop(
+                    Arc::clone(&client_arc),
+                    test_url_for_loop,
+                    interval,
+                ));
             }
 
-            let client = SelectOutboundClient::new(
-                valid_children, &clients, None,
-            );
-            select_states.insert(tag.clone(), client.state.clone());
-            let client_arc = Arc::new(client) as Arc<dyn OutboundClient>;
-            clients.insert(tag, client_arc);
+            clients.insert(tag.clone(), client_arc);
         }
 
         // Ensure a "direct" outbound is always available (used by built-in
@@ -257,10 +238,72 @@ impl OutboundRegistry {
             Arc::new(DirectOutboundClient) as Arc<dyn OutboundClient>
         });
 
+        // --- GLOBAL group ---
+        // Auto-created urltest(mode=seq) containing all leaf outbounds.
+        // In GLOBAL mode the rules engine routes all non-builtin traffic
+        // here.  Seq mode gives automatic failover by default; the user
+        // can pin a specific node via PUT /proxies/GLOBAL.
+        //
+        // Skip auto-creation if the user already configured an outbound
+        // named "GLOBAL" — theirs wins.
+        if !clients.contains_key("GLOBAL") {
+        let global_children: Vec<String> = config
+            .outbounds
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.type_ != "urltest")
+            .map(|(i, c)| c.tag_or_default(i))
+            .filter(|tag| tag != "direct" && tag != "reject")
+            .filter(|tag| clients.contains_key(tag))
+            .collect();
+
+        if !global_children.is_empty() {
+            let global_client = UrlTestOutboundClient::new(
+                global_children,
+                &clients,
+                "www.google.com".to_string(),
+                SelectMode::Seq,
+            );
+
+            // Derive pin from the last user rule (MATCH/catch-all).
+            // If its outbound is a leaf proxy in GLOBAL's children, pin to it.
+            let pin_tag = config.rules.iter().rev().find_map(|r| {
+                let is_catch_all = r.domain.is_none()
+                    && r.domain_suffix.is_none()
+                    && r.domain_keyword.is_none()
+                    && r.ip_cidr.is_none()
+                    && r.port.is_none()
+                    && r.port_range.is_none()
+                    && r.network.is_none()
+                    && r.protocol.is_none()
+                    && r.geo_url.is_none();
+                if is_catch_all { Some(r.outbound.clone()) } else { None }
+            });
+            if let Some(ref pin) = pin_tag {
+                if global_client.state.set_fixed_by_name(pin) {
+                    log::info!("GLOBAL: pinned to '{pin}' (from catch-all rule)");
+                } else {
+                    log::warn!("GLOBAL: catch-all rule outbound '{pin}' is not a child, not pinning");
+                }
+            }
+
+            urltest_states.insert(
+                "GLOBAL".to_string(),
+                global_client.state.clone(),
+            );
+            let global_arc = Arc::new(global_client) as Arc<dyn OutboundClient>;
+            test_loop_handles.push(urltest::spawn_test_loop(
+                Arc::clone(&global_arc),
+                "www.google.com".to_string(),
+                300,
+            ));
+            clients.insert("GLOBAL".to_string(), global_arc);
+        }
+        } // end if !clients.contains_key("GLOBAL")
+
         Ok(Self {
             clients: Arc::new(clients),
             urltest_states,
-            select_states,
             test_loop_handles: std::sync::Mutex::new(test_loop_handles),
         })
     }
@@ -298,30 +341,28 @@ mod tests {
     use crate::config::OutboundConfig;
 
     fn outbound(type_: &str, tag: Option<&str>) -> OutboundConfig {
-        OutboundConfig {
-            type_: type_.to_string(),
-            tag: tag.map(str::to_string),
-            server: None,
-            password: None,
-            method: None,
-            plugin: None,
-            plugin_opts: None,
-            cmd: None,
-            proxy_type: None,
-            sni: None,
-            fp: false,
-            ech_config: None,
-            outbounds: None,
-            interval: None,
-            url: None,
-            insecure: false,
-            idle_session_check_interval: None,
-            idle_session_timeout: None,
-            min_idle_session: None,
-            xmux: None,
-            transport: None,
-            tls_fragment: false,
-        }
+        OutboundConfig { type_: type_.to_string(),
+        tag: tag.map(str::to_string),
+        server: None,
+        password: None,
+        method: None,
+        plugin: None,
+        plugin_opts: None,
+        cmd: None,
+        proxy_type: None,
+        sni: None,
+        fp: false,
+        ech_config: None,
+        outbounds: None,
+        interval: None,
+        url: None,
+        insecure: false,
+        idle_session_check_interval: None,
+        idle_session_timeout: None,
+        min_idle_session: None,
+        xmux: None,
+        transport: None,
+        tls_fragment: false, uot: false, mode: None }
     }
 
     #[test]

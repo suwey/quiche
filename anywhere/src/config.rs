@@ -153,6 +153,12 @@ pub struct OutboundConfig {
     /// SIP003 plugin options (semicolon-delimited k=v, e.g. "obfs=http;obfs-host=example.com").
     pub plugin_opts: Option<String>,
 
+    /// UDP-over-TCP (UoT): tunnel UDP over the TCP stream instead of native
+    /// UDP relay. For servers without UDP support (shadowsocks / anytls).
+    /// Default: false.
+    #[serde(default)]
+    pub uot: bool,
+
     /// Command to spawn for tunnel creation (used by SSH outbound).
     /// e.g. `ssh -D 1080 -N user@host`.
     pub cmd: Option<String>,
@@ -181,6 +187,11 @@ pub struct OutboundConfig {
 
     /// Interval between latency tests in seconds (default: 600).
     pub interval: Option<u64>,
+
+    /// Selection mode for urltest groups: "latency" (default) picks the
+    /// lowest-latency child; "seq" picks the first alive child in order
+    /// (a.k.a. fallback semantics).
+    pub mode: Option<String>,
 
     /// URL to test latency against (e.g. "www.google.com").
     pub url: Option<String>,

@@ -366,7 +366,7 @@ fn parse_clash_yaml(
                 let gtype = g.get("type").and_then(|v| v.as_str());
                 let name = g.get("name").and_then(|v| v.as_str()).map(|s| s.to_string());
                 match (gtype, name) {
-                    (Some("url-test"), Some(n)) => { ut.insert(n); },
+                    (Some("url-test") | Some("fallback"), Some(n)) => { ut.insert(n); },
                     (Some("select"), Some(n)) => { sel.insert(n); },
                     _ => {},
                 }
@@ -389,10 +389,14 @@ fn parse_clash_yaml(
                     outbounds.push(ob);
                 }
             } else if gtype == "select" {
-                if let Some(ob) = parse_clash_select(g, gname, &valid_refs) {
-                    outbounds.push(ob);
+                if let Some(ob) = parse_clash_urltest(g, gname, &valid_refs) {
+                    outbounds.push(ob.field("mode", "select"));
                 }
-            } else if !matches!(gtype, "fallback" | "load-balance" | "relay" | "") {
+            } else if gtype == "fallback" {
+                if let Some(ob) = parse_clash_urltest(g, gname, &valid_refs) {
+                    outbounds.push(ob.field("mode", "seq"));
+                }
+            } else if !matches!(gtype, "load-balance" | "relay" | "") {
                 skips.push(format!("group:{gtype}"));
             }
         }
@@ -561,8 +565,9 @@ fn parse_clash_urltest(
     let refs: Vec<String> = proxies
         .iter()
         .filter_map(|v| v.as_str())
-        .filter(|s| valid_refs.contains(*s))
-        .map(|s| s.to_string())
+        // Allow DIRECT (Clash) — mapped to "direct" (anywhere built-in).
+        .filter(|s| valid_refs.contains(*s) || *s == "DIRECT")
+        .map(|s| if s == "DIRECT" { "direct".to_string() } else { s.to_string() })
         .collect();
     if refs.is_empty() {
         return None;
@@ -582,30 +587,6 @@ fn parse_clash_urltest(
     }
 
     Some(ob)
-}
-
-/// Parse a Clash `select` proxy-group into a `select` outbound.
-///
-/// References not in `valid_refs` (proxies + url-test groups + select groups)
-/// are dropped. `DIRECT` is mapped to `direct` (always available). If no valid
-/// children remain the group is skipped.
-fn parse_clash_select(
-    group: &noyalib::Value,
-    name: &str,
-    valid_refs: &std::collections::HashSet<String>,
-) -> Option<TomlOutbound> {
-    let proxies = group.get("proxies").and_then(|v| v.as_sequence())?;
-    let refs: Vec<String> = proxies
-        .iter()
-        .filter_map(|v| v.as_str())
-        .filter(|s| valid_refs.contains(*s) || *s == "DIRECT")
-        .map(|s| if s == "DIRECT" { "direct".to_string() } else { s.to_string() })
-        .collect();
-    if refs.is_empty() {
-        return None;
-    }
-
-    Some(TomlOutbound::new("select", name).field("outbounds", refs))
 }
 
 /// Check if a CIDR string falls within the private/internal ranges that
@@ -1187,14 +1168,19 @@ fn parse_vless_uri(uri: &str, idx: &mut usize) -> Option<TomlOutbound> {
 /// Heuristic: did the server return an HTML page (e.g. a "please upgrade
 /// client" notice) instead of a subscription payload?
 fn is_html_response(content_type: Option<&str>, body: &[u8]) -> bool {
-    if content_type
-        .is_some_and(|ct| ct.to_ascii_lowercase().contains("text/html"))
-    {
-        return true;
-    }
+    // Only treat as HTML when the body actually looks like HTML.
+    // Some airports return `content-type: text/html` even for valid YAML/JSON
+    // subscriptions, so content-type alone is not reliable.
     let prefix: Vec<u8> = body.iter().take(32).copied().collect();
     let s = String::from_utf8_lossy(&prefix).trim_start().to_ascii_lowercase();
-    s.starts_with("<!doctype") || s.starts_with("<html")
+    let body_is_html = s.starts_with("<!doctype") || s.starts_with("<html");
+    if body_is_html {
+        return true;
+    }
+    // If content-type says HTML but body doesn't look like HTML, still don't
+    // treat it as HTML — the body is what matters.
+    let _ = content_type;
+    false
 }
 
 /// Parse and print the `subscription-userinfo` header
@@ -1242,10 +1228,23 @@ pub async fn run_subscription(
     eprintln!("Downloaded {} bytes", resp.body.len());
 
     if is_html_response(resp.content_type.as_deref(), &resp.body) {
+        let save_path = std::path::Path::new("sub_error.html");
+        let saved = std::fs::write(&save_path, &resp.body).is_ok();
+        let saved_msg = if saved {
+            format!(
+                "，响应内容已保存到 {}",
+                save_path.display()
+            )
+        } else {
+            String::new()
+        };
         return Err(
-            "订阅返回了 HTML 页面（多为\"请升级客户端\"提示）。\
-             可用 --sub-ua 指定一个被机场识别的 UA 后重试。"
-                .into(),
+            format!(
+                "订阅返回了 HTML 页面（多为\"请升级客户端\"提示）。\
+                 可用 --sub-ua 指定一个被机场识别的 UA 后重试{}",
+                saved_msg
+            )
+            .into(),
         );
     }
 

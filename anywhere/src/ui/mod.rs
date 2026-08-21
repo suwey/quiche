@@ -468,41 +468,48 @@ async fn proxies_handler(
         .map(|(tag, _)| tag.as_str())
         .collect();
 
-    // GLOBAL group
-    let now_tag = state.ctx.rules.global_outbound().to_string();
-    proxies.insert(
-        "GLOBAL".into(),
-        serde_json::json!({
-            "all": all_tags,
-            "history": [],
-            "name": "GLOBAL",
-            "now": now_tag,
-            "type": "Fallback",
-            "udp": true,
-        }),
-    );
+    // GLOBAL group — auto-created urltest(mode=seq).
+    if let Some(ut_state) = state.ctx.urltest_states.get("GLOBAL") {
+        let current_idx =
+            ut_state.current.load(std::sync::atomic::Ordering::Relaxed);
+        let now = ut_state.children.get(current_idx).cloned().unwrap_or_default();
+        proxies.insert(
+            "GLOBAL".into(),
+            serde_json::json!({
+                "type": "Fallback",
+                "name": "GLOBAL",
+                "udp": true,
+                "history": [],
+                "all": ut_state.children,
+                "now": now,
+                "fixed": ut_state.fixed_name(),
+            }),
+        );
+    } else {
+        // Fallback: no GLOBAL group (e.g. empty config).
+        proxies.insert(
+            "GLOBAL".into(),
+            serde_json::json!({
+                "all": all_tags,
+                "history": [],
+                "name": "GLOBAL",
+                "now": "",
+                "type": "Selector",
+                "udp": true,
+            }),
+        );
+    }
 
     // Collect urltest child tags so we skip them at the top level.
     let mut urltest_child_tags: std::collections::HashSet<&str> =
         std::collections::HashSet::new();
     for (tag, type_) in &state.ctx.outbound_tags {
-        if type_ == "urltest" {
+        // `select` is an alias for `urltest mode=select`; both are in
+        // urltest_states.
+        if type_ == "urltest" || type_ == "select" {
             if let Some(ut_state) = state.ctx.urltest_states.get(tag.as_str()) {
                 for child_tag in &ut_state.children {
                     urltest_child_tags.insert(child_tag.as_str());
-                }
-            }
-        }
-    }
-
-    // Collect select child tags (same pattern, for rendering select children).
-    let mut select_child_tags: std::collections::HashSet<&str> =
-        std::collections::HashSet::new();
-    for (tag, type_) in &state.ctx.outbound_tags {
-        if type_ == "select" {
-            if let Some(sel_state) = state.ctx.select_states.get(tag.as_str()) {
-                for child_tag in &sel_state.children {
-                    select_child_tags.insert(child_tag.as_str());
                 }
             }
         }
@@ -516,11 +523,13 @@ async fn proxies_handler(
         .map(|(tag, type_)| (tag.as_str(), type_.as_str()))
         .collect();
 
-    // Top-level entries: urltest nodes (with children embedded) +
-    // non-urltest-children.
+    // Top-level entries: all group types (select, urltest, fallback)
+    // are unified into urltest_states.
     for (tag, type_) in &state.ctx.outbound_tags {
-        if type_ == "urltest" {
-            if let Some(ut_state) = state.ctx.urltest_states.get(tag.as_str()) {
+        if type_ == "urltest" || type_ == "select" {
+            if let Some(ut_state) =
+                state.ctx.urltest_states.get(tag.as_str())
+            {
                 let current_idx =
                     ut_state.current.load(std::sync::atomic::Ordering::Relaxed);
                 let now = ut_state
@@ -529,7 +538,6 @@ async fn proxies_handler(
                     .cloned()
                     .unwrap_or_default();
 
-                // urltest own history = only the now child's record
                 let mut history = Vec::new();
                 if let Some(idx) =
                     ut_state.children.iter().position(|c| c == &now)
@@ -543,8 +551,14 @@ async fn proxies_handler(
                     }
                 }
 
+                let group_type = match ut_state.mode {
+                    crate::outbound::urltest::SelectMode::Select => "Selector",
+                    crate::outbound::urltest::SelectMode::Seq => "Fallback",
+                    crate::outbound::urltest::SelectMode::Latency => "URLTest",
+                };
+
                 let mut obj = serde_json::json!({
-                    "type": "URLTest",
+                    "type": group_type,
                     "name": tag,
                     "udp": true,
                     "history": history,
@@ -553,9 +567,11 @@ async fn proxies_handler(
                     "fixed": ut_state.fixed_name(),
                 });
 
-                // Embed child proxy entries as sub-keys.
                 if let Some(_obj_map) = obj.as_object_mut() {
                     for (i, child_tag) in ut_state.children.iter().enumerate() {
+                        if proxies.contains_key(child_tag.as_str()) {
+                            continue;
+                        }
                         let child_type = outbound_type_map
                             .get(child_tag.as_str())
                             .unwrap_or(&"");
@@ -582,44 +598,6 @@ async fn proxies_handler(
 
                 proxies.insert(tag.clone(), obj);
             }
-        } else if type_ == "select" {
-            if let Some(sel_state) =
-                state.ctx.select_states.get(tag.as_str())
-            {
-                let now = sel_state.current_name();
-
-                proxies.insert(
-                    tag.clone(),
-                    serde_json::json!({
-                        "type": "Selector",
-                        "name": tag,
-                        "udp": true,
-                        "history": [],
-                        "all": sel_state.children,
-                        "now": now,
-                    }),
-                );
-
-                // Render child proxy entries not already present (urltest
-                // children with history take priority).
-                for child_tag in &sel_state.children {
-                    if proxies.contains_key(child_tag.as_str()) {
-                        continue;
-                    }
-                    let child_type = outbound_type_map
-                        .get(child_tag.as_str())
-                        .unwrap_or(&"");
-                    proxies.insert(
-                        child_tag.clone(),
-                        serde_json::json!({
-                            "type": child_type,
-                            "name": child_tag,
-                            "udp": true,
-                            "history": [],
-                        }),
-                    );
-                }
-            }
         }
     }
 
@@ -640,20 +618,12 @@ async fn select_proxy_handler(
     Path(tag): Path<String>,
     axum::extract::Json(body): axum::extract::Json<SelectProxyBody>,
 ) -> impl IntoResponse {
-    // Select group: set current selection by child name.
-    if let Some(sel_state) = state.ctx.select_states.get(&tag) {
-        if sel_state.set_by_name(&body.name) {
-            state.ctx.cache.set_group_selection(&tag, &body.name);
-            ::log::info!("select: '{tag}' -> '{}'", body.name);
-            return StatusCode::NO_CONTENT;
-        }
-        return StatusCode::BAD_REQUEST;
-    }
-    // URLTest group: pin to the named child (fixed).
+    // All group types are unified into urltest_states.
+    // PUT sets the pinned/selected child by name.
     if let Some(ut_state) = state.ctx.urltest_states.get(&tag) {
         if ut_state.set_fixed_by_name(&body.name) {
             state.ctx.cache.set_group_selection(&tag, &body.name);
-            ::log::info!("urltest: pinned '{tag}' -> '{}'", body.name);
+            ::log::info!("group '{tag}' -> '{}'", body.name);
             return StatusCode::NO_CONTENT;
         }
         return StatusCode::BAD_REQUEST;
@@ -669,15 +639,14 @@ async fn unfix_proxy_handler(
     State(state): State<Arc<UiState>>,
     Path(tag): Path<String>,
 ) -> impl IntoResponse {
-    // Selector groups have no "unfix" concept.
-    if state.ctx.select_states.contains_key(&tag) {
-        return StatusCode::BAD_REQUEST;
-    }
-    // URLTest group: clear the pin, return to auto mode.
+    // All group types are unified. Clearing the pin returns to auto mode:
+    // - select mode: stays at current (no automatic switching)
+    // - latency mode: resumes picking the lowest-latency child
+    // - seq mode: resumes picking the first alive child
     if let Some(ut_state) = state.ctx.urltest_states.get(&tag) {
         ut_state.clear_fixed();
         state.ctx.cache.clear_group_selection(&tag);
-        ::log::info!("urltest: unpinned '{tag}'");
+        ::log::info!("group '{tag}': cleared pin");
         return StatusCode::NO_CONTENT;
     }
     StatusCode::NOT_FOUND
@@ -724,7 +693,7 @@ async fn group_delay_handler(
         if let Some(ut_state) = state.ctx.urltest_states.get(&tag) {
             ut_state.children.clone()
         } else if let Some(sel_state) =
-            state.ctx.select_states.get(&tag)
+            state.ctx.urltest_states.get(&tag)
         {
             sel_state.children.clone()
         } else {

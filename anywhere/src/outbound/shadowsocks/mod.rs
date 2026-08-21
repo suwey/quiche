@@ -20,6 +20,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 
 use crate::config::OutboundConfig;
+use crate::inbound::Address;
 use crate::inbound::Destination;
 use crate::outbound::OutboundClient;
 use crate::relay::PacketRelay;
@@ -90,6 +91,8 @@ pub struct ShadowsocksOutboundClient {
     server_addr: SocketAddr,
     /// 可选 SIP003 插件配置。
     obfs_plugin: Option<plugin::ObfsPlugin>,
+    /// Tunnel UDP over the SS TCP stream (for servers without UDP relay).
+    uot: bool,
 }
 
 impl ShadowsocksOutboundClient {
@@ -118,7 +121,34 @@ impl ShadowsocksOutboundClient {
             None => None,
         };
 
-        Ok(Self { method, server_addr, obfs_plugin })
+        Ok(Self { method, server_addr, obfs_plugin, uot: cfg.uot })
+    }
+
+    /// UDP-over-TCP: open a SS TCP stream to the UoT magic address, send the
+    /// UoT request (bundled as SS early data), and wrap as a `PacketRelay`.
+    /// Used when the server has no UDP relay (`uot = true`).
+    async fn dial_udp_uot(
+        &self, initial_dest: &Destination,
+    ) -> Result<Box<dyn PacketRelay>, Box<dyn std::error::Error>> {
+        use crate::protocol::uot::{self, UotPacketRelay};
+
+        let tcp =
+            crate::outbound::common::connect_tcp_bypass(self.server_addr)
+                .await?;
+        let conn = match &self.obfs_plugin {
+            Some(p) => SsConn::Obfs(p.wrap(tcp)),
+            None => SsConn::Plain(tcp),
+        };
+        // SS dials the magic FQDN; a UoT-aware server switches to UDP relay.
+        let magic = Destination::new(
+            Address::Domain(uot::UOT_MAGIC_ADDRESS.to_string()),
+            443,
+        );
+        let mut stream =
+            stream::SsTcpStream::new(conn, self.method.clone(), magic);
+        let req = uot::encode_request(false, initial_dest)?;
+        stream.write(&req).await?;
+        Ok(Box::new(UotPacketRelay::new(stream)))
     }
 }
 
@@ -142,8 +172,11 @@ impl OutboundClient for ShadowsocksOutboundClient {
     }
 
     async fn dial_udp(
-        &self, _initial_dest: &Destination,
+        &self, initial_dest: &Destination,
     ) -> Result<Box<dyn PacketRelay>, Box<dyn std::error::Error>> {
+        if self.uot {
+            return self.dial_udp_uot(initial_dest).await;
+        }
         let bind_addr: SocketAddr = match self.server_addr {
             SocketAddr::V4(_) => "0.0.0.0:0".parse().unwrap(),
             SocketAddr::V6(_) => "[::]:0".parse().unwrap(),

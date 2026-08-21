@@ -196,12 +196,12 @@ rules:
     let mut skips = Vec::new();
     let toml_out = convert_subscription(yaml.as_bytes(), &mut skips).unwrap();
 
-    // 2 proxies + 1 urltest + 1 select.
+    // 2 proxies + 1 urltest + 1 urltest(mode=select) = 4 outbounds.
     assert_eq!(toml_out.matches("[[outbounds]]").count(), 4);
 
-    // select group.
-    assert!(toml_out.contains("type = \"select\""));
+    // Clash `select` group → urltest with mode = "select".
     assert!(toml_out.contains("tag = \"manual\""));
+    assert!(toml_out.contains("mode = \"select\""));
     // DIRECT mapped to "direct"; children include the urltest group + proxies.
     assert!(toml_out.contains("\"auto\""));
     assert!(toml_out.contains("\"node-ss\""));

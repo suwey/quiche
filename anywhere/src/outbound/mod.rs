@@ -9,7 +9,6 @@ pub mod common;
 pub mod direct;
 pub mod quic;
 pub mod registry;
-pub mod select;
 pub mod ssh;
 pub mod urltest;
 
