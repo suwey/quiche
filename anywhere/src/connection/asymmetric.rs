@@ -8,6 +8,9 @@
 //! - CDN optimization: uplink -> CDN-A (low latency), downlink -> CDN-B (high bandwidth)
 //! - Protocol optimization: uplink -> H2 (compatible), downlink -> H3 (0-RTT)
 //! - Censorship evasion: uplink -> CDN (domain fronting), downlink -> direct
+//!
+//! NOTE: Designed but not currently used. XHTTP's asymmetric mode is
+//! implemented inline in `transport/xhttp/mod.rs` via `merge_direction_config()`.
 
 use std::sync::Arc;
 
@@ -40,11 +43,15 @@ impl AsymmetricConnectionManager {
 
 #[async_trait]
 impl ConnectionManager for AsymmetricConnectionManager {
-    async fn acquire_uplink(&self) -> Result<Box<dyn TransportSession>, ConnError> {
+    async fn acquire_uplink(
+        &self,
+    ) -> Result<Box<dyn TransportSession>, ConnError> {
         self.uplink_mgr.acquire_uplink().await
     }
 
-    async fn acquire_downlink(&self) -> Result<Box<dyn TransportSession>, ConnError> {
+    async fn acquire_downlink(
+        &self,
+    ) -> Result<Box<dyn TransportSession>, ConnError> {
         self.downlink_mgr.acquire_downlink().await
     }
 
@@ -91,12 +98,16 @@ mod tests {
 
     #[async_trait]
     impl ConnectionManager for MockConnMgr {
-        async fn acquire_uplink(&self) -> Result<Box<dyn TransportSession>, ConnError> {
+        async fn acquire_uplink(
+            &self,
+        ) -> Result<Box<dyn TransportSession>, ConnError> {
             self.acquire_count
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Err(ConnError::NoAvailable) // Mock: no real session
         }
-        async fn acquire_downlink(&self) -> Result<Box<dyn TransportSession>, ConnError> {
+        async fn acquire_downlink(
+            &self,
+        ) -> Result<Box<dyn TransportSession>, ConnError> {
             Err(ConnError::NoAvailable)
         }
         async fn release(&self, _session: Box<dyn TransportSession>) {}
@@ -112,18 +123,23 @@ mod tests {
     async fn asymmetric_delegates_to_sub_managers() {
         let uplink = Arc::new(MockConnMgr::new(true));
         let downlink = Arc::new(MockConnMgr::new(true));
-        let mgr = AsymmetricConnectionManager::new(uplink.clone(), downlink.clone());
+        let mgr =
+            AsymmetricConnectionManager::new(uplink.clone(), downlink.clone());
 
         assert!(mgr.is_healthy());
 
         // acquire_uplink delegates to uplink manager
         let _ = mgr.acquire_uplink().await;
         assert_eq!(
-            uplink.acquire_count.load(std::sync::atomic::Ordering::Relaxed),
+            uplink
+                .acquire_count
+                .load(std::sync::atomic::Ordering::Relaxed),
             1
         );
         assert_eq!(
-            downlink.acquire_count.load(std::sync::atomic::Ordering::Relaxed),
+            downlink
+                .acquire_count
+                .load(std::sync::atomic::Ordering::Relaxed),
             0
         );
     }
@@ -141,7 +157,8 @@ mod tests {
     async fn asymmetric_shutdown_both() {
         let uplink = Arc::new(MockConnMgr::new(true));
         let downlink = Arc::new(MockConnMgr::new(true));
-        let mgr = AsymmetricConnectionManager::new(uplink.clone(), downlink.clone());
+        let mgr =
+            AsymmetricConnectionManager::new(uplink.clone(), downlink.clone());
 
         mgr.shutdown().await;
         assert!(!mgr.is_healthy());

@@ -30,20 +30,33 @@ use crate::obfuscation::range::Range;
 const HPACK_HUFFMAN_BITS: [u8; 256] = [
     13, 23, 28, 28, 28, 28, 28, 28, 28, 24, 30, 28, 28, 30, 28, 28, // 0-15
     28, 28, 28, 28, 28, 28, 28, 28, 30, 28, 28, 28, 28, 28, 28, 28, // 16-31
-     6, 10, 10, 12, 13,  6, 15, 13, 10, 10,  8, 11,  8,  6,  6,  6, // 32-47  (space, !, ", #, $, %, &, ', (, ), *, +, ,, -, ., /)
-     5,  5,  5,  5,  5,  5,  5,  5,  5,  5,  6,  5,  8,  7,  8,  6, // 48-63  (0-9, :, ;, <, =, >, ?, @)
-     8,  8,  8,  8,  8,  8,  8,  8,  8,  8,  8,  8,  8,  8,  8,  8, // 64-79  (A-O)
-     8,  8,  8,  8,  8,  8,  8,  8,  8,  8,  8, 12, 10, 12, 12, 13, // 80-95  (P-Z, [, \, ], ^, _)
-    12, 10, 13, 12, 12, 12, 12, 12, 12, 11, 12, 12, 12, 12, 12, 12, // 96-111 (`a-o)
-    12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, // 112-127 (p-z, {, |, }, ~, DEL)
-    28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, // 128-143
-    28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, // 144-159
-    28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, // 160-175
-    28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, // 176-191
-    28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, // 192-207
-    28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, // 208-223
-    28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, // 224-239
-    28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, // 240-255
+    6, 10, 10, 12, 13, 6, 15, 13, 10, 10, 8, 11, 8, 6, 6,
+    6, // 32-47  (space, !, ", #, $, %, &, ', (, ), *, +, ,, -, ., /)
+    5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 6, 5, 8, 7, 8,
+    6, // 48-63  (0-9, :, ;, <, =, >, ?, @)
+    8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, // 64-79  (A-O)
+    8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 12, 10, 12, 12,
+    13, // 80-95  (P-Z, [, \, ], ^, _)
+    12, 10, 13, 12, 12, 12, 12, 12, 12, 11, 12, 12, 12, 12, 12,
+    12, // 96-111 (`a-o)
+    12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12,
+    12, // 112-127 (p-z, {, |, }, ~, DEL)
+    28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28,
+    28, // 128-143
+    28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28,
+    28, // 144-159
+    28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28,
+    28, // 160-175
+    28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28,
+    28, // 176-191
+    28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28,
+    28, // 192-207
+    28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28,
+    28, // 208-223
+    28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28,
+    28, // 224-239
+    28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28,
+    28, // 240-255
 ];
 
 /// Compute the HPACK Huffman-encoded length (in bytes) of a string.
@@ -225,7 +238,8 @@ pub fn generate_tokenish_padding(target_huffman_bytes: usize) -> String {
         return String::new();
     }
 
-    let n = (target_huffman_bytes as f64 / AVG_HUFFMAN_BYTES_PER_CHAR_BASE62).ceil() as usize;
+    let n = (target_huffman_bytes as f64 / AVG_HUFFMAN_BYTES_PER_CHAR_BASE62)
+        .ceil() as usize;
     let n = n.max(1);
 
     let mut s = rand_base62(n);
@@ -234,7 +248,8 @@ pub fn generate_tokenish_padding(target_huffman_bytes: usize) -> String {
     for _ in 0..MAX_TOKENISH_ITERS {
         let current_len = hpack_huffman_encoded_len(&s);
 
-        if current_len >= target_huffman_bytes.saturating_sub(VALIDATION_TOLERANCE)
+        if current_len
+            >= target_huffman_bytes.saturating_sub(VALIDATION_TOLERANCE)
             && current_len <= target_huffman_bytes + VALIDATION_TOLERANCE
         {
             return s;
@@ -255,7 +270,8 @@ pub fn generate_tokenish_padding(target_huffman_bytes: usize) -> String {
         } else {
             // Too long — need to remove chars.
             // Each base62 char averages 0.8 bytes, so remove ~diff/0.8 chars.
-            let need = (diff as f64 / AVG_HUFFMAN_BYTES_PER_CHAR_BASE62).ceil() as usize;
+            let need =
+                (diff as f64 / AVG_HUFFMAN_BYTES_PER_CHAR_BASE62).ceil() as usize;
             let remove = need.min(s.len() - 1).max(1);
             let new_len = s.len() - remove;
             s.truncate(new_len);
@@ -282,7 +298,7 @@ pub fn generate_padding(method: PaddingMethod, length: usize) -> String {
             } else {
                 padding
             }
-        }
+        },
     }
 }
 
@@ -318,13 +334,13 @@ impl XPaddingConfig {
             PaddingMethod::RepeatX => {
                 let n = padding.len();
                 n >= from && n <= to
-            }
+            },
             PaddingMethod::Tokenish => {
                 let n = hpack_huffman_encoded_len(padding);
                 let lo = from.saturating_sub(VALIDATION_TOLERANCE);
                 let hi = to + VALIDATION_TOLERANCE;
                 n >= lo && n <= hi
-            }
+            },
         }
     }
 }
@@ -492,7 +508,10 @@ mod tests {
         };
         // Generate a valid tokenish padding and verify
         let p = generate_tokenish_padding(500);
-        assert!(cfg.is_valid(&p), "generated tokenish padding should be valid");
+        assert!(
+            cfg.is_valid(&p),
+            "generated tokenish padding should be valid"
+        );
 
         // A very short string should fail (encoded length too small)
         assert!(!cfg.is_valid("X"));
@@ -550,4 +569,3 @@ mod tests {
         );
     }
 }
-

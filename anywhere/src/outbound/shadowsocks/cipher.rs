@@ -94,7 +94,8 @@ impl CipherMethod {
         // 3. ChaCha20Poly1305 does not support EIH / multi-PSK.
         if is_chacha && psk_list.len() > 1 {
             return Err(
-                "Shadowsocks 2022 EIH support only available in AES ciphers".to_string(),
+                "Shadowsocks 2022 EIH support only available in AES ciphers"
+                    .to_string(),
             );
         }
 
@@ -160,7 +161,9 @@ impl CipherMethod {
         match self {
             CipherMethod::Aes128Gcm { .. } => "2022-blake3-aes-128-gcm",
             CipherMethod::Aes256Gcm { .. } => "2022-blake3-aes-256-gcm",
-            CipherMethod::ChaCha20Poly1305 { .. } => "2022-blake3-chacha20-poly1305",
+            CipherMethod::ChaCha20Poly1305 { .. } => {
+                "2022-blake3-chacha20-poly1305"
+            },
         }
     }
 
@@ -173,7 +176,8 @@ impl CipherMethod {
         let mut key_material = Vec::with_capacity(psk.len() + salt.len());
         key_material.extend_from_slice(psk);
         key_material.extend_from_slice(salt);
-        let derived = blake3::derive_key("shadowsocks 2022 session subkey", &key_material);
+        let derived =
+            blake3::derive_key("shadowsocks 2022 session subkey", &key_material);
         derived[..self.key_salt_length()].to_vec()
     }
 
@@ -186,21 +190,23 @@ impl CipherMethod {
                     aes_gcm::Aes128Gcm::new_from_slice(session_key)
                         .expect("invalid session key length for Aes128Gcm"),
                 )
-            }
+            },
             CipherMethod::Aes256Gcm { .. } => {
                 use aes_gcm::aead::KeyInit;
                 SsAead::Aes256(
                     aes_gcm::Aes256Gcm::new_from_slice(session_key)
                         .expect("invalid session key length for Aes256Gcm"),
                 )
-            }
+            },
             CipherMethod::ChaCha20Poly1305 { .. } => {
                 use chacha20poly1305::aead::KeyInit;
                 SsAead::ChaCha20(
-                    chacha20poly1305::ChaCha20Poly1305::new_from_slice(session_key)
-                        .expect("invalid session key length for ChaCha20Poly1305"),
+                    chacha20poly1305::ChaCha20Poly1305::new_from_slice(
+                        session_key,
+                    )
+                    .expect("invalid session key length for ChaCha20Poly1305"),
                 )
-            }
+            },
         }
     }
 
@@ -215,12 +221,14 @@ impl CipherMethod {
     pub fn generate_eih(&self, salt: &[u8]) -> Vec<u8> {
         let ksl = self.key_salt_length();
         let (psk_refs, psk_hash): (Vec<&[u8]>, &[u8]) = match self {
-            CipherMethod::Aes128Gcm { psk_list, psk_hash } => {
-                (psk_list.iter().map(|p| p.as_slice()).collect(), psk_hash.as_slice())
-            }
-            CipherMethod::Aes256Gcm { psk_list, psk_hash } => {
-                (psk_list.iter().map(|p| p.as_slice()).collect(), psk_hash.as_slice())
-            }
+            CipherMethod::Aes128Gcm { psk_list, psk_hash } => (
+                psk_list.iter().map(|p| p.as_slice()).collect(),
+                psk_hash.as_slice(),
+            ),
+            CipherMethod::Aes256Gcm { psk_list, psk_hash } => (
+                psk_list.iter().map(|p| p.as_slice()).collect(),
+                psk_hash.as_slice(),
+            ),
             CipherMethod::ChaCha20Poly1305 { .. } => return Vec::new(),
         };
 
@@ -234,8 +242,10 @@ impl CipherMethod {
             let mut key_material = Vec::with_capacity(ksl * 2);
             key_material.extend_from_slice(psk);
             key_material.extend_from_slice(salt);
-            let identity_subkey =
-                blake3::derive_key("shadowsocks 2022 identity subkey", &key_material);
+            let identity_subkey = blake3::derive_key(
+                "shadowsocks 2022 identity subkey",
+                &key_material,
+            );
             let identity_subkey = &identity_subkey[..ksl];
 
             let psk_hash_block = &psk_hash[i * 16..(i + 1) * 16];
@@ -261,10 +271,10 @@ impl CipherMethod {
         match self {
             CipherMethod::Aes128Gcm { psk_list, .. } => {
                 psk_list.last().expect("psk_list must not be empty")
-            }
+            },
             CipherMethod::Aes256Gcm { psk_list, .. } => {
                 psk_list.last().expect("psk_list must not be empty")
-            }
+            },
             CipherMethod::ChaCha20Poly1305 { psk } => psk,
         }
     }
@@ -276,7 +286,7 @@ impl CipherMethod {
             CipherMethod::Aes256Gcm { psk_list, .. } => AesEcb::new(&psk_list[0]),
             CipherMethod::ChaCha20Poly1305 { .. } => {
                 panic!("udp_block_encryptor not available for ChaCha20Poly1305")
-            }
+            },
         }
     }
 
@@ -285,13 +295,13 @@ impl CipherMethod {
         match self {
             CipherMethod::Aes128Gcm { psk_list, .. } => {
                 AesEcb::new(psk_list.last().expect("psk_list must not be empty"))
-            }
+            },
             CipherMethod::Aes256Gcm { psk_list, .. } => {
                 AesEcb::new(psk_list.last().expect("psk_list must not be empty"))
-            }
+            },
             CipherMethod::ChaCha20Poly1305 { .. } => {
                 panic!("udp_block_decryptor not available for ChaCha20Poly1305")
-            }
+            },
         }
     }
 }
@@ -329,56 +339,55 @@ impl SsAead {
         match self {
             SsAead::Aes128(c) => {
                 use aes_gcm::aead::Aead;
-                let n: [u8; 12] = nonce
-                    .try_into()
-                    .expect("nonce must be 12 bytes");
+                let n: [u8; 12] =
+                    nonce.try_into().expect("nonce must be 12 bytes");
                 c.encrypt((&n).into(), plaintext)
                     .expect("AEAD encryption failed")
-            }
+            },
             SsAead::Aes256(c) => {
                 use aes_gcm::aead::Aead;
-                let n: [u8; 12] = nonce
-                    .try_into()
-                    .expect("nonce must be 12 bytes");
+                let n: [u8; 12] =
+                    nonce.try_into().expect("nonce must be 12 bytes");
                 c.encrypt((&n).into(), plaintext)
                     .expect("AEAD encryption failed")
-            }
+            },
             SsAead::ChaCha20(c) => {
                 use chacha20poly1305::aead::Aead;
-                let n: chacha20poly1305::aead::Nonce<chacha20poly1305::ChaCha20Poly1305> =
-                    nonce.try_into().expect("nonce must be 12 bytes");
-                c.encrypt(&n, plaintext)
-                    .expect("AEAD encryption failed")
-            }
+                let n: chacha20poly1305::aead::Nonce<
+                    chacha20poly1305::ChaCha20Poly1305,
+                > = nonce.try_into().expect("nonce must be 12 bytes");
+                c.encrypt(&n, plaintext).expect("AEAD encryption failed")
+            },
         }
     }
 
     /// Decrypt `ciphertext` (including 16-byte tag) with the given nonce.
-    pub fn open(&self, nonce: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>, String> {
+    pub fn open(
+        &self, nonce: &[u8], ciphertext: &[u8],
+    ) -> Result<Vec<u8>, String> {
         match self {
             SsAead::Aes128(c) => {
                 use aes_gcm::aead::Aead;
-                let n: [u8; 12] = nonce
-                    .try_into()
-                    .expect("nonce must be 12 bytes");
+                let n: [u8; 12] =
+                    nonce.try_into().expect("nonce must be 12 bytes");
                 c.decrypt((&n).into(), ciphertext)
                     .map_err(|e| format!("AEAD decryption failed: {e}"))
-            }
+            },
             SsAead::Aes256(c) => {
                 use aes_gcm::aead::Aead;
-                let n: [u8; 12] = nonce
-                    .try_into()
-                    .expect("nonce must be 12 bytes");
+                let n: [u8; 12] =
+                    nonce.try_into().expect("nonce must be 12 bytes");
                 c.decrypt((&n).into(), ciphertext)
                     .map_err(|e| format!("AEAD decryption failed: {e}"))
-            }
+            },
             SsAead::ChaCha20(c) => {
                 use chacha20poly1305::aead::Aead;
-                let n: chacha20poly1305::aead::Nonce<chacha20poly1305::ChaCha20Poly1305> =
-                    nonce.try_into().expect("nonce must be 12 bytes");
+                let n: chacha20poly1305::aead::Nonce<
+                    chacha20poly1305::ChaCha20Poly1305,
+                > = nonce.try_into().expect("nonce must be 12 bytes");
                 c.decrypt(&n, ciphertext)
                     .map_err(|e| format!("AEAD decryption failed: {e}"))
-            }
+            },
         }
     }
 }
@@ -491,16 +500,11 @@ mod tests {
     fn test_psk_parsing_single_chacha() {
         let psk = [0xABu8; 32];
         let password = b64_encode(&psk);
-        let method = CipherMethod::new(
-            "2022-blake3-chacha20-poly1305",
-            &password,
-        )
-        .unwrap();
+        let method =
+            CipherMethod::new("2022-blake3-chacha20-poly1305", &password)
+                .unwrap();
         assert_eq!(method.key_salt_length(), 32);
-        assert_eq!(
-            method.method_name(),
-            "2022-blake3-chacha20-poly1305"
-        );
+        assert_eq!(method.method_name(), "2022-blake3-chacha20-poly1305");
         assert!(!method.is_aes());
         assert_eq!(method.last_psk(), &psk);
     }
@@ -529,8 +533,7 @@ mod tests {
     fn test_psk_parsing_multi_aes256() {
         let psk0 = [0x10u8; 32];
         let psk1 = [0x20u8; 32];
-        let password =
-            format!("{}:{}", b64_encode(&psk0), b64_encode(&psk1));
+        let password = format!("{}:{}", b64_encode(&psk0), b64_encode(&psk1));
         let method =
             CipherMethod::new("2022-blake3-aes-256-gcm", &password).unwrap();
         assert_eq!(method.last_psk(), &psk1);
@@ -540,12 +543,9 @@ mod tests {
     fn test_psk_parsing_chacha_rejects_multi() {
         let psk0 = [0x01u8; 32];
         let psk1 = [0x02u8; 32];
-        let password =
-            format!("{}:{}", b64_encode(&psk0), b64_encode(&psk1));
-        let result = CipherMethod::new(
-            "2022-blake3-chacha20-poly1305",
-            &password,
-        );
+        let password = format!("{}:{}", b64_encode(&psk0), b64_encode(&psk1));
+        let result =
+            CipherMethod::new("2022-blake3-chacha20-poly1305", &password);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("EIH"));
     }
@@ -554,18 +554,15 @@ mod tests {
     fn test_psk_parsing_bad_key_length() {
         let psk = [0u8; 10]; // wrong length
         let password = b64_encode(&psk);
-        let result =
-            CipherMethod::new("2022-blake3-aes-128-gcm", &password);
+        let result = CipherMethod::new("2022-blake3-aes-128-gcm", &password);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("bad key length"));
     }
 
     #[test]
     fn test_psk_parsing_invalid_base64() {
-        let result = CipherMethod::new(
-            "2022-blake3-aes-128-gcm",
-            "!!!not-base64!!!",
-        );
+        let result =
+            CipherMethod::new("2022-blake3-aes-128-gcm", "!!!not-base64!!!");
         assert!(result.is_err());
     }
 
@@ -580,8 +577,7 @@ mod tests {
 
     #[test]
     fn test_psk_parsing_empty_password() {
-        let result =
-            CipherMethod::new("2022-blake3-aes-128-gcm", "");
+        let result = CipherMethod::new("2022-blake3-aes-128-gcm", "");
         assert!(result.is_err());
     }
 
@@ -590,11 +586,9 @@ mod tests {
     #[test]
     fn test_session_key_derivation() {
         let psk = [0x42u8; 16];
-        let method = CipherMethod::new(
-            "2022-blake3-aes-128-gcm",
-            &b64_encode(&psk),
-        )
-        .unwrap();
+        let method =
+            CipherMethod::new("2022-blake3-aes-128-gcm", &b64_encode(&psk))
+                .unwrap();
         let salt = [0xAAu8; 16];
 
         // Manually compute expected session key.
@@ -613,11 +607,9 @@ mod tests {
     #[test]
     fn test_session_key_derivation_aes256() {
         let psk = [0x77u8; 32];
-        let method = CipherMethod::new(
-            "2022-blake3-aes-256-gcm",
-            &b64_encode(&psk),
-        )
-        .unwrap();
+        let method =
+            CipherMethod::new("2022-blake3-aes-256-gcm", &b64_encode(&psk))
+                .unwrap();
         let salt = [0xBBu8; 32];
 
         let mut key_material = Vec::new();
@@ -636,8 +628,7 @@ mod tests {
         // Multi-PSK: session key should use the last PSK.
         let psk0 = [0x01u8; 16];
         let psk1 = [0x02u8; 16];
-        let password =
-            format!("{}:{}", b64_encode(&psk0), b64_encode(&psk1));
+        let password = format!("{}:{}", b64_encode(&psk0), b64_encode(&psk1));
         let method =
             CipherMethod::new("2022-blake3-aes-128-gcm", &password).unwrap();
         let salt = [0u8; 16];
@@ -657,11 +648,9 @@ mod tests {
     #[test]
     fn test_aead_round_trip_aes128() {
         let psk = [0x42u8; 16];
-        let method = CipherMethod::new(
-            "2022-blake3-aes-128-gcm",
-            &b64_encode(&psk),
-        )
-        .unwrap();
+        let method =
+            CipherMethod::new("2022-blake3-aes-128-gcm", &b64_encode(&psk))
+                .unwrap();
         let salt = [0u8; 16];
         let session_key = method.session_key(&salt);
         let aead = method.create_aead(&session_key);
@@ -678,11 +667,9 @@ mod tests {
     #[test]
     fn test_aead_round_trip_aes256() {
         let psk = [0x99u8; 32];
-        let method = CipherMethod::new(
-            "2022-blake3-aes-256-gcm",
-            &b64_encode(&psk),
-        )
-        .unwrap();
+        let method =
+            CipherMethod::new("2022-blake3-aes-256-gcm", &b64_encode(&psk))
+                .unwrap();
         let salt = [0xFFu8; 32];
         let session_key = method.session_key(&salt);
         let aead = method.create_aead(&session_key);
@@ -697,11 +684,9 @@ mod tests {
     #[test]
     fn test_aead_round_trip_chacha20() {
         let psk = [0xABu8; 32];
-        let method = CipherMethod::new(
-            "2022-blake3-chacha20-poly1305",
-            &b64_encode(&psk),
-        )
-        .unwrap();
+        let method =
+            CipherMethod::new("2022-blake3-chacha20-poly1305", &b64_encode(&psk))
+                .unwrap();
         let salt = [0xCDu8; 32];
         let session_key = method.session_key(&salt);
         let aead = method.create_aead(&session_key);
@@ -716,11 +701,9 @@ mod tests {
     #[test]
     fn test_aead_open_wrong_nonce_fails() {
         let psk = [0x42u8; 16];
-        let method = CipherMethod::new(
-            "2022-blake3-aes-128-gcm",
-            &b64_encode(&psk),
-        )
-        .unwrap();
+        let method =
+            CipherMethod::new("2022-blake3-aes-128-gcm", &b64_encode(&psk))
+                .unwrap();
         let salt = [0u8; 16];
         let session_key = method.session_key(&salt);
         let aead = method.create_aead(&session_key);
@@ -735,11 +718,9 @@ mod tests {
     #[test]
     fn test_aead_open_tampered_ciphertext_fails() {
         let psk = [0x42u8; 16];
-        let method = CipherMethod::new(
-            "2022-blake3-aes-128-gcm",
-            &b64_encode(&psk),
-        )
-        .unwrap();
+        let method =
+            CipherMethod::new("2022-blake3-aes-128-gcm", &b64_encode(&psk))
+                .unwrap();
         let salt = [0u8; 16];
         let session_key = method.session_key(&salt);
         let aead = method.create_aead(&session_key);
@@ -757,11 +738,9 @@ mod tests {
     #[test]
     fn test_eih_single_psk_empty() {
         let psk = [0x42u8; 16];
-        let method = CipherMethod::new(
-            "2022-blake3-aes-128-gcm",
-            &b64_encode(&psk),
-        )
-        .unwrap();
+        let method =
+            CipherMethod::new("2022-blake3-aes-128-gcm", &b64_encode(&psk))
+                .unwrap();
         let salt = [0u8; 16];
         let eih = method.generate_eih(&salt);
         assert!(eih.is_empty());
@@ -770,11 +749,9 @@ mod tests {
     #[test]
     fn test_eih_chacha_empty() {
         let psk = [0xABu8; 32];
-        let method = CipherMethod::new(
-            "2022-blake3-chacha20-poly1305",
-            &b64_encode(&psk),
-        )
-        .unwrap();
+        let method =
+            CipherMethod::new("2022-blake3-chacha20-poly1305", &b64_encode(&psk))
+                .unwrap();
         let salt = [0u8; 32];
         let eih = method.generate_eih(&salt);
         assert!(eih.is_empty());
@@ -832,8 +809,7 @@ mod tests {
     fn test_eih_multi_psk_aes256() {
         let psk0 = [0x10u8; 32];
         let psk1 = [0x20u8; 32];
-        let password =
-            format!("{}:{}", b64_encode(&psk0), b64_encode(&psk1));
+        let password = format!("{}:{}", b64_encode(&psk0), b64_encode(&psk1));
         let method =
             CipherMethod::new("2022-blake3-aes-256-gcm", &password).unwrap();
         let salt = [0xBBu8; 32];
@@ -927,8 +903,8 @@ mod tests {
         let key = [0x99u8; 32];
         let ecb = AesEcb::new(&key);
         let original = [
-            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09,
-            0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F,
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A,
+            0x0B, 0x0C, 0x0D, 0x0E, 0x0F,
         ];
         let mut block = original;
         ecb.encrypt_block(&mut block);
@@ -948,11 +924,9 @@ mod tests {
     #[test]
     fn test_udp_block_encryptor_decryptor_single_psk() {
         let psk = [0x42u8; 16];
-        let method = CipherMethod::new(
-            "2022-blake3-aes-128-gcm",
-            &b64_encode(&psk),
-        )
-        .unwrap();
+        let method =
+            CipherMethod::new("2022-blake3-aes-128-gcm", &b64_encode(&psk))
+                .unwrap();
 
         // Single PSK: encryptor and decryptor use the same key.
         let enc = method.udp_block_encryptor();
@@ -968,8 +942,7 @@ mod tests {
     fn test_udp_block_encryptor_decryptor_multi_psk() {
         let psk0 = [0x01u8; 16];
         let psk1 = [0x02u8; 16];
-        let password =
-            format!("{}:{}", b64_encode(&psk0), b64_encode(&psk1));
+        let password = format!("{}:{}", b64_encode(&psk0), b64_encode(&psk1));
         let method =
             CipherMethod::new("2022-blake3-aes-128-gcm", &password).unwrap();
 
@@ -999,7 +972,10 @@ mod tests {
         enc.encrypt_block(&mut b_enc);
         let mut b_dec = original;
         dec.encrypt_block(&mut b_dec);
-        assert_ne!(b_enc, b_dec, "different keys should produce different ciphertext");
+        assert_ne!(
+            b_enc, b_dec,
+            "different keys should produce different ciphertext"
+        );
     }
 
     // ── Constants sanity ────────────────────────────────────────────────────

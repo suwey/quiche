@@ -53,6 +53,8 @@ pub struct ConnMetadata {
     pub source_ip: String,
     #[serde(rename = "sourcePort")]
     pub source_port: String,
+    /// Process path for the originating connection (Clash API compat).
+    /// NOTE: Always empty - process lookup is not implemented.
     #[serde(rename = "processPath")]
     pub process_path: String,
     #[serde(rename = "dnsMode")]
@@ -212,8 +214,8 @@ pub fn read_macos_memory() -> u64 {
         use mach2::vm_types::natural_t;
 
         let mut info = std::mem::MaybeUninit::<mach_task_basic_info>::uninit();
-        let mut count = (std::mem::size_of::<mach_task_basic_info>() /
-            std::mem::size_of::<natural_t>()) as u32;
+        let mut count = (std::mem::size_of::<mach_task_basic_info>()
+            / std::mem::size_of::<natural_t>()) as u32;
         let result = unsafe {
             libc::task_info(
                 mach2::traps::mach_task_self() as libc::mach_port_t,

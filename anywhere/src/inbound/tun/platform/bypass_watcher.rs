@@ -18,9 +18,7 @@ use std::collections::HashMap;
 use std::net::IpAddr;
 use std::net::Ipv4Addr;
 use std::sync::mpsc::Receiver;
-use std::sync::mpsc::{
-    self,
-};
+use std::sync::mpsc::{self};
 
 use futures_util::stream::StreamExt;
 use rtnetlink::Handle;
@@ -187,8 +185,9 @@ impl WatcherState {
     /// Return the source-rule slot (= priority offset) for an interface.
     fn from_slot_of(&self, kind: RuleKind, iface: &str) -> Option<u32> {
         match kind {
-            RuleKind::Wan =>
-                self.monitor_wan_ifaces.iter().position(|x| x == iface),
+            RuleKind::Wan => {
+                self.monitor_wan_ifaces.iter().position(|x| x == iface)
+            },
             RuleKind::Lan => self
                 .bypass_lan_ifaces
                 .iter()
@@ -321,7 +320,7 @@ impl WatcherState {
             Some((ip, prefix_len)) => {
                 self.reconcile_iface(kind, iface, ip, prefix_len);
             },
-            None =>
+            None => {
                 if self.installed.contains_key(&key) {
                     log::info!(
                         "bypass_iface '{iface}': IPv4 address removed; \
@@ -331,7 +330,8 @@ impl WatcherState {
                     if kind == RuleKind::Wan {
                         self.refresh_policy_tables();
                     }
-                },
+                }
+            },
         }
     }
 
@@ -404,9 +404,9 @@ impl WatcherState {
             self.reconcile_iface(RuleKind::Wan, &name, ip, m.header.prefix_len);
         } else {
             let key = Self::key(RuleKind::Wan, &name);
-            if let Some(cur) = self.installed.get(&key) &&
-                let Some(removed) = new_ip &&
-                cur.ip == removed
+            if let Some(cur) = self.installed.get(&key)
+                && let Some(removed) = new_ip
+                && cur.ip == removed
             {
                 log::info!(
                     "bypass_iface '{name}': address {removed} removed; \
@@ -454,13 +454,14 @@ impl WatcherState {
         let from_prio = FROM_PRIO_BASE + from_slot;
         let to_prio = match kind {
             RuleKind::Wan => None,
-            RuleKind::Lan =>
-                self.lan_to_slot_of(iface).map(|slot| TO_PRIO_BASE + slot),
+            RuleKind::Lan => {
+                self.lan_to_slot_of(iface).map(|slot| TO_PRIO_BASE + slot)
+            },
         };
 
-        if let Some(cur) = self.installed.get(&key) &&
-            cur.ip == ip &&
-            cur.subnet == subnet
+        if let Some(cur) = self.installed.get(&key)
+            && cur.ip == ip
+            && cur.subnet == subnet
         {
             return;
         }
@@ -516,14 +517,17 @@ impl WatcherState {
             self.refresh_policy_tables();
         }
 
-        self.installed.insert(key, InstalledRule {
-            iface: iface.to_string(),
-            kind,
-            ip,
-            subnet,
-            from_prio,
-            to_prio,
-        });
+        self.installed.insert(
+            key,
+            InstalledRule {
+                iface: iface.to_string(),
+                kind,
+                ip,
+                subnet,
+                from_prio,
+                to_prio,
+            },
+        );
     }
 
     /// Remove the rules currently installed for `iface` (if any).
@@ -580,23 +584,26 @@ fn install_to_rule(
 
 fn install_mangle_rule(iface: &str) -> Result<(), Box<dyn std::error::Error>> {
     let fwmark = BYPASS_FWMARK.to_string();
-    run_cmd("iptables", &[
-        "-t",
-        "mangle",
-        "-I",
-        "PREROUTING",
-        "1",
-        "-i",
-        iface,
-        "-m",
-        "conntrack",
-        "--ctstate",
-        "DNAT",
-        "-j",
-        "MARK",
-        "--set-mark",
-        &fwmark,
-    ])
+    run_cmd(
+        "iptables",
+        &[
+            "-t",
+            "mangle",
+            "-I",
+            "PREROUTING",
+            "1",
+            "-i",
+            iface,
+            "-m",
+            "conntrack",
+            "--ctstate",
+            "DNAT",
+            "-j",
+            "MARK",
+            "--set-mark",
+            &fwmark,
+        ],
+    )
 }
 
 fn uninstall_rule(prio: u32) -> Result<(), Box<dyn std::error::Error>> {
@@ -606,22 +613,25 @@ fn uninstall_rule(prio: u32) -> Result<(), Box<dyn std::error::Error>> {
 
 fn uninstall_mangle_rule(iface: &str) -> Result<(), Box<dyn std::error::Error>> {
     let fwmark = BYPASS_FWMARK.to_string();
-    run_cmd("iptables", &[
-        "-t",
-        "mangle",
-        "-D",
-        "PREROUTING",
-        "-i",
-        iface,
-        "-m",
-        "conntrack",
-        "--ctstate",
-        "DNAT",
-        "-j",
-        "MARK",
-        "--set-mark",
-        &fwmark,
-    ])
+    run_cmd(
+        "iptables",
+        &[
+            "-t",
+            "mangle",
+            "-D",
+            "PREROUTING",
+            "-i",
+            iface,
+            "-m",
+            "conntrack",
+            "--ctstate",
+            "DNAT",
+            "-j",
+            "MARK",
+            "--set-mark",
+            &fwmark,
+        ],
+    )
 }
 
 // ---------------------------------------------------------------------------

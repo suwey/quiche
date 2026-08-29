@@ -129,8 +129,7 @@ impl UrlTestOutboundClient {
     pub fn new(
         children: Vec<String>,
         registry: &std::collections::HashMap<String, Arc<dyn OutboundClient>>,
-        test_url: String,
-        mode: SelectMode,
+        test_url: String, mode: SelectMode,
     ) -> Self {
         let child_clients: Vec<Arc<dyn OutboundClient>> = children
             .iter()
@@ -253,7 +252,8 @@ impl OutboundClient for UrlTestOutboundClient {
             return Err(format!(
                 "select: child '{}' unavailable",
                 self.state.children[idx]
-            ).into());
+            )
+            .into());
         }
 
         // Fallback: try other non-failed, non-direct children.
@@ -316,7 +316,8 @@ impl OutboundClient for UrlTestOutboundClient {
             return Err(format!(
                 "select: child '{}' udp unavailable",
                 self.state.children[idx]
-            ).into());
+            )
+            .into());
         }
 
         for (i, child) in self.children.iter().enumerate() {
@@ -433,7 +434,8 @@ impl OutboundClient for UrlTestOutboundClient {
                 let mut chosen = current_idx;
                 for (i, failed) in self.state.failed.iter().enumerate() {
                     if !failed.load(Ordering::Relaxed)
-                        && self.state.records[i].try_read()
+                        && self.state.records[i]
+                            .try_read()
                             .ok()
                             .and_then(|r| r.as_ref().map(|rec| rec.delay))
                             .is_some()

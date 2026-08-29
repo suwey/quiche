@@ -27,7 +27,9 @@ use std::sync::atomic::Ordering;
 
 use parking_lot::Mutex;
 use tokio::sync::Notify;
+use tokio::sync::Semaphore;
 use tokio::sync::mpsc;
+use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::connection::ConnectionManager;
 use crate::crypto::{CryptoFactory, CryptoLayer};
@@ -53,9 +55,7 @@ pub enum MlessMessage {
         payload: Vec<u8>,
     },
     /// Close frame (no payload, no encryption needed).
-    Close {
-        stream_id: u64,
-    },
+    Close { stream_id: u64 },
 }
 
 // ---------------------------------------------------------------------------
@@ -69,10 +69,18 @@ pub struct MlessStreamHandle {
     pub(crate) multiplexer: Weak<MlessMultiplexer>,
 }
 
+impl Drop for MlessStreamHandle {
+    fn drop(&mut self) {
+        if let Some(mux) = self.multiplexer.upgrade() {
+            mux.close_stream(self.stream_id);
+        }
+    }
+}
+
 impl MlessStreamHandle {
     pub async fn close(&mut self) {
         if let Some(mux) = self.multiplexer.upgrade() {
-            mux.close_stream(self.stream_id).await;
+            mux.close_stream(self.stream_id);
         }
     }
 }
@@ -82,8 +90,24 @@ impl MlessStreamHandle {
 // ---------------------------------------------------------------------------
 
 /// Shared multiplexer state.
+pub(crate) struct MlessStreamEntry {
+    pub(crate) sender: mpsc::UnboundedSender<Vec<u8>>,
+    _permit: MlessStreamPermit,
+}
+
+struct MlessStreamPermit {
+    _permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    capacity_notify: Arc<Notify>,
+}
+
+impl Drop for MlessStreamPermit {
+    fn drop(&mut self) {
+        self.capacity_notify.notify_waiters();
+    }
+}
+
 pub(crate) struct MlessMultiplexerInner {
-    pub(crate) streams: HashMap<u64, mpsc::UnboundedSender<Vec<u8>>>,
+    pub(crate) streams: HashMap<u64, MlessStreamEntry>,
     pub(crate) active_streams: std::collections::HashSet<u64>,
 }
 
@@ -94,6 +118,8 @@ pub(crate) struct MlessMultiplexerInner {
 pub struct MlessMultiplexer {
     pub(crate) inner: Mutex<MlessMultiplexerInner>,
     pub(crate) ws_tx: mpsc::UnboundedSender<MlessMessage>,
+    stream_slots: Option<Arc<Semaphore>>,
+    capacity_notify: Arc<Notify>,
     pub disconnected: Notify,
     pub(crate) next_stream_id: AtomicU64,
     pub(crate) dead: AtomicBool,
@@ -109,8 +135,8 @@ impl MlessMultiplexer {
     /// that handles encryption/decryption and frame I/O.
     pub async fn connect_pluggable(
         conn_mgr: Arc<dyn ConnectionManager>,
-        crypto_factory: Arc<dyn CryptoFactory>,
-        uuid_str: &str,
+        crypto_factory: Arc<dyn CryptoFactory>, uuid_str: &str,
+        max_streams: usize, capacity_notify: Arc<Notify>,
     ) -> Result<Arc<Self>, Box<dyn std::error::Error>> {
         log::debug!("mless: acquiring transport session...");
         let session = conn_mgr
@@ -130,6 +156,9 @@ impl MlessMultiplexer {
                 active_streams: std::collections::HashSet::new(),
             }),
             ws_tx,
+            stream_slots: (max_streams > 0)
+                .then(|| Arc::new(Semaphore::new(max_streams))),
+            capacity_notify,
             disconnected: Notify::new(),
             next_stream_id: AtomicU64::new(1),
             dead: AtomicBool::new(false),
@@ -152,14 +181,9 @@ impl MlessMultiplexer {
     /// delegates to `connect_pluggable()`.
     #[allow(clippy::too_many_arguments)]
     pub async fn connect(
-        addr: SocketAddr,
-        uuid_str: &str,
-        tls_server: &str,
-        insecure: bool,
-        tls_fp: bool,
-        fragment: Option<&crate::tlsfragment::FragmentConfig>,
-        path: &str,
-        headers: &HashMap<String, String>,
+        addr: SocketAddr, uuid_str: &str, tls_server: &str, insecure: bool,
+        tls_fp: bool, fragment: Option<&crate::tlsfragment::FragmentConfig>,
+        path: &str, headers: &HashMap<String, String>,
     ) -> Result<Arc<Self>, Box<dyn std::error::Error>> {
         use crate::connection::SingleConnectionManager;
         use crate::transport::{TransportContext, ws::WsTransportFactory};
@@ -174,36 +198,55 @@ impl MlessMultiplexer {
             headers: headers.clone(),
             fragment: fragment.cloned(),
         };
-        let conn_mgr: Arc<dyn ConnectionManager> = Arc::new(SingleConnectionManager::new(
-            Box::new(WsTransportFactory),
-            ctx,
-        ));
+        let conn_mgr: Arc<dyn ConnectionManager> = Arc::new(
+            SingleConnectionManager::new(Box::new(WsTransportFactory), ctx),
+        );
         let crypto_factory: Arc<dyn CryptoFactory> = Arc::new(AheadXorFactory);
 
-        Self::connect_pluggable(conn_mgr, crypto_factory, uuid_str).await
+        Self::connect_pluggable(
+            conn_mgr,
+            crypto_factory,
+            uuid_str,
+            0,
+            Arc::new(Notify::new()),
+        )
+        .await
     }
 
     /// Register a new stream without sending any frame.
-    pub fn register_stream(
+    pub(crate) fn try_register_stream(
         self: &Arc<Self>,
-    ) -> (u64, mpsc::UnboundedReceiver<Vec<u8>>) {
-        let stream_id = self
-            .next_stream_id
-            .fetch_add(1, Ordering::Relaxed);
+    ) -> Option<(u64, UnboundedReceiver<Vec<u8>>)> {
+        let permit = match self.stream_slots.as_ref() {
+            Some(stream_slots) => {
+                Some(stream_slots.clone().try_acquire_owned().ok()?)
+            },
+            None => None,
+        };
+        let stream_id = self.next_stream_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = mpsc::unbounded_channel();
         {
             let mut inner = self.inner.lock();
-            inner.streams.insert(stream_id, tx);
+            inner.streams.insert(
+                stream_id,
+                MlessStreamEntry {
+                    sender: tx,
+                    _permit: MlessStreamPermit {
+                        _permit: permit,
+                        capacity_notify: self.capacity_notify.clone(),
+                    },
+                },
+            );
             log::debug!(
                 "mless: NEW stream#{} (active: {})",
                 stream_id,
                 inner.streams.len(),
             );
         }
-        (stream_id, rx)
+        Some((stream_id, rx))
     }
 
-    pub async fn close_stream(&self, stream_id: u64) {
+    pub fn close_stream(&self, stream_id: u64) {
         let removed = {
             let mut inner = self.inner.lock();
             inner.streams.remove(&stream_id)
@@ -243,10 +286,8 @@ impl MlessMultiplexer {
             let was_active = inner.active_streams.remove(&stream_id);
             inner.streams.remove(&stream_id);
             if !was_active {
-                let rejects = self
-                    .reject_count
-                    .fetch_add(1, Ordering::Relaxed) +
-                    1;
+                let rejects =
+                    self.reject_count.fetch_add(1, Ordering::Relaxed) + 1;
                 log::warn!(
                     "mless: CLOSE stream#{} rejected ({}, active: {})",
                     stream_id,
@@ -259,12 +300,10 @@ impl MlessMultiplexer {
                         rejects
                     );
                     self.dead.store(true, Ordering::Relaxed);
-                    self.reject_count
-                        .store(0, Ordering::Relaxed);
+                    self.reject_count.store(0, Ordering::Relaxed);
                 }
             } else {
-                self.reject_count
-                    .store(0, Ordering::Relaxed);
+                self.reject_count.store(0, Ordering::Relaxed);
                 log::debug!(
                     "mless: CLOSE stream#{} (active: {})",
                     stream_id,
@@ -292,7 +331,8 @@ impl MlessMultiplexer {
         // Only insert into active_streams if the stream channel still exists.
         // If the stream was already closed (CLOSE sent/received), the channel
         // is gone and we should not re-activate it.
-        if let Some(tx) = inner.streams.get(&stream_id).cloned() {
+        if let Some(entry) = inner.streams.get(&stream_id) {
+            let tx = entry.sender.clone();
             inner.active_streams.insert(stream_id);
             let _ = tx.send(payload);
         } else {
@@ -328,8 +368,7 @@ impl MlessMultiplexer {
 /// the `CryptoLayer` (no sharing needed - crypto state is local to this
 /// task).
 async fn io_loop(
-    mut session: Box<dyn TransportSession>,
-    mut crypto: Box<dyn CryptoLayer>,
+    mut session: Box<dyn TransportSession>, mut crypto: Box<dyn CryptoLayer>,
     mut ws_rx: mpsc::UnboundedReceiver<MlessMessage>,
     mux: Weak<MlessMultiplexer>,
 ) {
@@ -343,7 +382,7 @@ async fn io_loop(
                 m.on_disconnect();
             }
             return;
-        }
+        },
     };
 
     let mut downlink = match session.downlink().await {
@@ -354,7 +393,7 @@ async fn io_loop(
                 m.on_disconnect();
             }
             return;
-        }
+        },
     };
 
     // Keep session alive to prevent connection closure.
@@ -492,5 +531,64 @@ async fn io_loop(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn multiplexer(max_streams: usize) -> Arc<MlessMultiplexer> {
+        let (ws_tx, _ws_rx) = mpsc::unbounded_channel();
+        Arc::new(MlessMultiplexer {
+            inner: Mutex::new(MlessMultiplexerInner {
+                streams: HashMap::new(),
+                active_streams: std::collections::HashSet::new(),
+            }),
+            ws_tx,
+            stream_slots: (max_streams > 0)
+                .then(|| Arc::new(Semaphore::new(max_streams))),
+            capacity_notify: Arc::new(Notify::new()),
+            disconnected: Notify::new(),
+            next_stream_id: AtomicU64::new(1),
+            dead: AtomicBool::new(false),
+            reject_count: AtomicU32::new(0),
+            reconnecting: AtomicBool::new(false),
+        })
+    }
+
+    #[test]
+    fn stream_limit_releases_on_close() {
+        let mux = multiplexer(1);
+        let (stream_id, _rx) = mux.try_register_stream().unwrap();
+        assert_eq!(mux.stream_slots.as_ref().unwrap().available_permits(), 0);
+
+        assert!(mux.try_register_stream().is_none());
+        mux.close_stream(stream_id);
+        assert!(mux.try_register_stream().is_some());
+    }
+
+    #[test]
+    fn stream_limit_releases_when_handle_drops() {
+        let mux = multiplexer(1);
+        let (stream_id, rx) = mux.try_register_stream().unwrap();
+        let handle = MlessStreamHandle {
+            stream_id,
+            rx,
+            multiplexer: Arc::downgrade(&mux),
+        };
+
+        assert!(mux.try_register_stream().is_none());
+        drop(handle);
+        assert!(mux.try_register_stream().is_some());
+    }
+
+    #[test]
+    fn zero_stream_limit_is_unlimited() {
+        let mux = multiplexer(0);
+
+        assert!(mux.try_register_stream().is_some());
+        assert!(mux.try_register_stream().is_some());
+        assert!(mux.try_register_stream().is_some());
     }
 }

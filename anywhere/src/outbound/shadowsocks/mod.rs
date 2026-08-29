@@ -80,7 +80,6 @@ impl AsyncWrite for SsConn {
     }
 }
 
-
 /// Shadowsocks 2022 outbound client.
 ///
 /// 连接远端 SS2022 服务器，通过 `SsTcpStream` (TCP) 和 `SsUdpRelay` (UDP)
@@ -103,8 +102,10 @@ impl ShadowsocksOutboundClient {
             cfg.server.as_deref().ok_or("shadowsocks: missing server")?;
         let method_str =
             cfg.method.as_deref().ok_or("shadowsocks: missing method")?;
-        let password =
-            cfg.password.as_deref().ok_or("shadowsocks: missing password")?;
+        let password = cfg
+            .password
+            .as_deref()
+            .ok_or("shadowsocks: missing password")?;
 
         let method = CipherMethod::new(method_str, password)
             .map_err(|e| format!("shadowsocks: {e}"))?;
@@ -112,16 +113,23 @@ impl ShadowsocksOutboundClient {
             .map_err(|e| format!("shadowsocks: {e}"))?;
 
         let obfs_plugin = match &cfg.plugin {
-            Some(name) => Some(plugin::ObfsPlugin::parse(
-                name,
-                cfg.plugin_opts.as_deref().unwrap_or(""),
-                server_addr.port(),
-            )
-            .map_err(|e| format!("shadowsocks: {e}"))?),
+            Some(name) => Some(
+                plugin::ObfsPlugin::parse(
+                    name,
+                    cfg.plugin_opts.as_deref().unwrap_or(""),
+                    server_addr.port(),
+                )
+                .map_err(|e| format!("shadowsocks: {e}"))?,
+            ),
             None => None,
         };
 
-        Ok(Self { method, server_addr, obfs_plugin, uot: cfg.uot })
+        Ok(Self {
+            method,
+            server_addr,
+            obfs_plugin,
+            uot: cfg.uot,
+        })
     }
 
     /// UDP-over-TCP: open a SS TCP stream to the UoT magic address, send the
@@ -133,8 +141,7 @@ impl ShadowsocksOutboundClient {
         use crate::protocol::uot::{self, UotPacketRelay};
 
         let tcp =
-            crate::outbound::common::connect_tcp_bypass(self.server_addr)
-                .await?;
+            crate::outbound::common::connect_tcp_bypass(self.server_addr).await?;
         let conn = match &self.obfs_plugin {
             Some(p) => SsConn::Obfs(p.wrap(tcp)),
             None => SsConn::Plain(tcp),
@@ -158,8 +165,7 @@ impl OutboundClient for ShadowsocksOutboundClient {
         &self, dest: &Destination,
     ) -> Result<Box<dyn StreamRelay>, Box<dyn std::error::Error>> {
         let tcp =
-            crate::outbound::common::connect_tcp_bypass(self.server_addr)
-                .await?;
+            crate::outbound::common::connect_tcp_bypass(self.server_addr).await?;
         let conn = match &self.obfs_plugin {
             Some(p) => SsConn::Obfs(p.wrap(tcp)),
             None => SsConn::Plain(tcp),
@@ -181,8 +187,7 @@ impl OutboundClient for ShadowsocksOutboundClient {
             SocketAddr::V4(_) => "0.0.0.0:0".parse().unwrap(),
             SocketAddr::V6(_) => "[::]:0".parse().unwrap(),
         };
-        let socket =
-            crate::outbound::common::bind_udp_bypass(bind_addr).await?;
+        let socket = crate::outbound::common::bind_udp_bypass(bind_addr).await?;
         socket.connect(self.server_addr).await?;
         Ok(Box::new(packet::SsUdpRelay::new(
             socket,

@@ -13,9 +13,9 @@
 //! native method args) and `Env` (full API, obtained via `with_env`).
 //! `GlobalRef` became generic `Global<JObject<'static>>`.
 
+use parking_lot::Mutex;
 use std::os::fd::RawFd;
 use std::sync::Arc;
-use parking_lot::Mutex;
 use std::sync::atomic::Ordering;
 
 use jni::EnvUnowned;
@@ -38,7 +38,6 @@ static RUNTIME: Mutex<Option<tokio::runtime::Runtime>> = Mutex::new(None);
 /// Global shutdown channel - used by stopEngine to signal the engine.
 static SHUTDOWN_TX: Mutex<Option<tokio::sync::oneshot::Sender<()>>> =
     Mutex::new(None);
-
 
 /// Stored JavaVM + VpnService global ref for restart callback.
 /// The VpnService must have an `onEngineRestart()V` method.
@@ -64,20 +63,22 @@ struct JniSocketProtector {
 impl SocketProtect for JniSocketProtector {
     fn protect(&self, fd: RawFd) -> bool {
         // jni 0.22: attach_current_thread takes a closure with an owned Env.
-        match self.vm.attach_current_thread(|env| -> jni::errors::Result<bool> {
-            let val = env.call_method(
-                &self.protect_obj,
-                JNIString::from("protect"),
-                jni::jni_sig!((int) -> boolean),
-                &[JValue::Int(fd as jint)],
-            )?;
-            val.z()
-        }) {
+        match self
+            .vm
+            .attach_current_thread(|env| -> jni::errors::Result<bool> {
+                let val = env.call_method(
+                    &self.protect_obj,
+                    JNIString::from("protect"),
+                    jni::jni_sig!((int) -> boolean),
+                    &[JValue::Int(fd as jint)],
+                )?;
+                val.z()
+            }) {
             Ok(b) => b,
             Err(e) => {
                 log::error!("VpnService.protect() JNI call failed: {e}");
                 false
-            }
+            },
         }
     }
 }
@@ -89,12 +90,8 @@ impl SocketProtect for JniSocketProtector {
 /// Start the proxy engine. Returns 0 on success, non-zero error code.
 #[unsafe(no_mangle)]
 pub extern "C" fn Java_com_anywhere_android_EngineBridge_startEngine(
-    mut env: EnvUnowned,
-    _class: JClass,
-    config: JString,
-    tun_fd: jint,
-    cache_dir: JString,
-    protect_obj: JObject,
+    mut env: EnvUnowned, _class: JClass, config: JString, tun_fd: jint,
+    cache_dir: JString, protect_obj: JObject,
 ) -> jint {
     init_android_logger();
     log::info!("startEngine called, tun_fd={tun_fd}");
@@ -102,26 +99,42 @@ pub extern "C" fn Java_com_anywhere_android_EngineBridge_startEngine(
     // Extract strings + JavaVM + two global refs in one with_env closure.
     // JavaVM is not Clone, so we fetch it twice. All values are 'static/owned
     // and can escape the closure.
-    let (config_str, cache_dir_str, vm_for_callback, callback_ref, vm_for_protector, protector_ref) =
-        match env.with_env(|e| -> jni::errors::Result<_> {
+    let (
+        config_str,
+        cache_dir_str,
+        vm_for_callback,
+        callback_ref,
+        vm_for_protector,
+        protector_ref,
+    ) = match env
+        .with_env(|e| -> jni::errors::Result<_> {
             let config_str: String = config.try_to_string(&e)?;
             let cache_dir_str: String = cache_dir.try_to_string(&e)?;
             let vm_for_callback = e.get_java_vm()?;
             let vm_for_protector = e.get_java_vm()?;
             let callback_ref = e.new_global_ref(&protect_obj)?;
             let protector_ref = e.new_global_ref(&protect_obj)?;
-            Ok((config_str, cache_dir_str, vm_for_callback, callback_ref, vm_for_protector, protector_ref))
-        }).into_outcome() {
-            Outcome::Ok(v) => v,
-            Outcome::Err(e) => {
-                log::error!("JNI setup failed: {e}");
-                return 2;
-            },
-            Outcome::Panic(_) => {
-                log::error!("JNI setup panicked");
-                return 2;
-            },
-        };
+            Ok((
+                config_str,
+                cache_dir_str,
+                vm_for_callback,
+                callback_ref,
+                vm_for_protector,
+                protector_ref,
+            ))
+        })
+        .into_outcome()
+    {
+        Outcome::Ok(v) => v,
+        Outcome::Err(e) => {
+            log::error!("JNI setup failed: {e}");
+            return 2;
+        },
+        Outcome::Panic(_) => {
+            log::error!("JNI setup panicked");
+            return 2;
+        },
+    };
 
     let config_path_str = format!("{cache_dir_str}/anywhere.toml");
 
@@ -144,7 +157,7 @@ pub extern "C" fn Java_com_anywhere_android_EngineBridge_startEngine(
         Err(e) => {
             log::error!("Failed to create tokio runtime: {e}");
             return 3;
-        }
+        },
     };
 
     // Create shutdown channel.
@@ -197,17 +210,21 @@ pub extern "C" fn Java_com_anywhere_android_EngineBridge_startEngine(
                 std::thread::sleep(std::time::Duration::from_millis(300));
                 let guard = RESTART_CALLBACK.lock();
                 if let Some((vm, callback)) = guard.as_ref() {
-                    match vm.attach_current_thread(|env| -> jni::errors::Result<()> {
-                        env.call_method(
-                            callback,
-                            JNIString::from("onEngineRestart"),
-                            jni::jni_sig!(() -> void),
-                            &[],
-                        )?;
-                        Ok(())
-                    }) {
+                    match vm.attach_current_thread(
+                        |env| -> jni::errors::Result<()> {
+                            env.call_method(
+                                callback,
+                                JNIString::from("onEngineRestart"),
+                                jni::jni_sig!(() -> void),
+                                &[],
+                            )?;
+                            Ok(())
+                        },
+                    ) {
                         Ok(_) => log::info!("Kotlin onEngineRestart() called"),
-                        Err(e) => log::error!("Failed to call onEngineRestart(): {e}"),
+                        Err(e) => {
+                            log::error!("Failed to call onEngineRestart(): {e}")
+                        },
                     }
                 }
             });
@@ -221,8 +238,7 @@ pub extern "C" fn Java_com_anywhere_android_EngineBridge_startEngine(
 /// Stop the proxy engine. Returns 0 on success.
 #[unsafe(no_mangle)]
 pub extern "C" fn Java_com_anywhere_android_EngineBridge_stopEngine(
-    _env: EnvUnowned,
-    _class: JClass,
+    _env: EnvUnowned, _class: JClass,
 ) -> jint {
     if let Some(tx) = SHUTDOWN_TX.lock().take() {
         let _ = tx.send(());
@@ -237,13 +253,15 @@ pub extern "C" fn Java_com_anywhere_android_EngineBridge_stopEngine(
 /// Get the engine version string.
 #[unsafe(no_mangle)]
 pub extern "C" fn Java_com_anywhere_android_EngineBridge_engineVersion(
-    mut env: EnvUnowned,
-    _class: JClass,
+    mut env: EnvUnowned, _class: JClass,
 ) -> jstring {
     let version = format!("anywhere v{}", env!("CARGO_PKG_VERSION"));
-    match env.with_env(|e| -> jni::errors::Result<jstring> {
-        Ok(e.new_string(version)?.into_raw())
-    }).into_outcome() {
+    match env
+        .with_env(|e| -> jni::errors::Result<jstring> {
+            Ok(e.new_string(version)?.into_raw())
+        })
+        .into_outcome()
+    {
         Outcome::Ok(ptr) => ptr,
         _ => std::ptr::null_mut(),
     }

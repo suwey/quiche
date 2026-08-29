@@ -42,10 +42,10 @@ pub fn decode_varint(data: &[u8], offset: usize) -> Result<(u64, usize)> {
                     "varint: unexpected end of data",
                 ));
             }
-            let value = (u64::from(b & 0x3f) << 24) |
-                (u64::from(data[offset + 1]) << 16) |
-                (u64::from(data[offset + 2]) << 8) |
-                u64::from(data[offset + 3]);
+            let value = (u64::from(b & 0x3f) << 24)
+                | (u64::from(data[offset + 1]) << 16)
+                | (u64::from(data[offset + 2]) << 8)
+                | u64::from(data[offset + 3]);
             Ok((value, 4))
         },
         3 => {
@@ -55,14 +55,14 @@ pub fn decode_varint(data: &[u8], offset: usize) -> Result<(u64, usize)> {
                     "varint: unexpected end of data",
                 ));
             }
-            let value = (u64::from(b & 0x3f) << 56) |
-                (u64::from(data[offset + 1]) << 48) |
-                (u64::from(data[offset + 2]) << 40) |
-                (u64::from(data[offset + 3]) << 32) |
-                (u64::from(data[offset + 4]) << 24) |
-                (u64::from(data[offset + 5]) << 16) |
-                (u64::from(data[offset + 6]) << 8) |
-                u64::from(data[offset + 7]);
+            let value = (u64::from(b & 0x3f) << 56)
+                | (u64::from(data[offset + 1]) << 48)
+                | (u64::from(data[offset + 2]) << 40)
+                | (u64::from(data[offset + 3]) << 32)
+                | (u64::from(data[offset + 4]) << 24)
+                | (u64::from(data[offset + 5]) << 16)
+                | (u64::from(data[offset + 6]) << 8)
+                | u64::from(data[offset + 7]);
             Ok((value, 8))
         },
         _ => Err(Error::new(

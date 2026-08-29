@@ -107,7 +107,9 @@ impl WindowsTunManager {
         // queries reach our in-process resolver (which returns fake-IPs).
         if auto_hijack {
             if let Err(e) = self.setup_dns_hijack() {
-                log::warn!("Windows DNS hijack failed (routing still active): {e}");
+                log::warn!(
+                    "Windows DNS hijack failed (routing still active): {e}"
+                );
             }
         }
 
@@ -124,20 +126,34 @@ impl WindowsTunManager {
                 IpAddr::V4(_) => {
                     let _ = run_cmd(
                         "route",
-                        &["DELETE", "0.0.0.0", "MASK", "128.0.0.0", &tun_addr_str],
+                        &[
+                            "DELETE",
+                            "0.0.0.0",
+                            "MASK",
+                            "128.0.0.0",
+                            &tun_addr_str,
+                        ],
                     );
                     let _ = run_cmd(
                         "route",
                         &[
-                            "DELETE", "128.0.0.0", "MASK", "128.0.0.0",
+                            "DELETE",
+                            "128.0.0.0",
+                            "MASK",
+                            "128.0.0.0",
                             &tun_addr_str,
                         ],
                     );
                 },
                 IpAddr::V6(_) => {
-                    let _ = run_cmd("route", &["-6", "DELETE", "::/1", &tun_addr_str]);
-                    let _ =
-                        run_cmd("route", &["-6", "DELETE", "8000::/1", &tun_addr_str]);
+                    let _ = run_cmd(
+                        "route",
+                        &["-6", "DELETE", "::/1", &tun_addr_str],
+                    );
+                    let _ = run_cmd(
+                        "route",
+                        &["-6", "DELETE", "8000::/1", &tun_addr_str],
+                    );
                 },
             }
             self.routes_installed = false;
@@ -189,8 +205,13 @@ impl WindowsTunManager {
         // Set the TUN address as the DNS server on the primary interface.
         let out = Command::new("netsh")
             .args([
-                "interface", "ip", "set", "dns", &iface,
-                "static", &tun_addr_str,
+                "interface",
+                "ip",
+                "set",
+                "dns",
+                &iface,
+                "static",
+                &tun_addr_str,
             ])
             .output()
             .map_err(|e| format!("netsh set dns failed: {e}"))?;
@@ -226,7 +247,15 @@ impl WindowsTunManager {
         match self.original_dns.take() {
             Some(dns) => {
                 let _ = Command::new("netsh")
-                    .args(["interface", "ip", "set", "dns", &iface, "static", &dns])
+                    .args([
+                        "interface",
+                        "ip",
+                        "set",
+                        "dns",
+                        &iface,
+                        "static",
+                        &dns,
+                    ])
                     .output();
                 log::info!("Windows DNS restored to {dns} on {iface}");
             },
@@ -248,7 +277,10 @@ impl WindowsTunManager {
 fn primary_interface() -> Option<String> {
     // `route print 0.0.0.0` lists the default route; the trailing column is
     // the interface name. We take the first default route's interface.
-    let out = Command::new("route").args(["print", "0.0.0.0"]).output().ok()?;
+    let out = Command::new("route")
+        .args(["print", "0.0.0.0"])
+        .output()
+        .ok()?;
     let text = String::from_utf8_lossy(&out.stdout);
     for line in text.lines() {
         let line = line.trim();
@@ -277,9 +309,15 @@ fn get_dns(iface: &str) -> Option<String> {
     for line in text.lines() {
         let line = line.trim();
         if !line.is_empty()
-            && line.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false)
+            && line
+                .chars()
+                .next()
+                .map(|c| c.is_ascii_digit())
+                .unwrap_or(false)
         {
-            return Some(line.split_whitespace().next().unwrap_or(line).to_string());
+            return Some(
+                line.split_whitespace().next().unwrap_or(line).to_string(),
+            );
         }
     }
     None

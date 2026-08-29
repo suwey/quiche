@@ -3,6 +3,8 @@
 //! 职责：创建、池化、回收传输会话
 //! M6: AsymmetricConnectionManager for stream-up/packet-up.
 pub mod asymmetric;
+pub mod pool;
+pub mod reconnect;
 use async_trait::async_trait;
 
 use crate::transport::TransportSession;
@@ -46,7 +48,6 @@ impl std::fmt::Display for ConnError {
 
 impl std::error::Error for ConnError {}
 
-
 // ---------------------------------------------------------------------------
 // SingleConnectionManager - one session per acquire (no pooling)
 // ---------------------------------------------------------------------------
@@ -66,21 +67,27 @@ pub struct SingleConnectionManager {
 
 #[allow(dead_code)]
 impl SingleConnectionManager {
-    pub fn new(factory: Box<dyn TransportFactory>, ctx: TransportContext) -> Self {
+    pub fn new(
+        factory: Box<dyn TransportFactory>, ctx: TransportContext,
+    ) -> Self {
         Self { factory, ctx }
     }
 }
 
 #[async_trait]
 impl ConnectionManager for SingleConnectionManager {
-    async fn acquire_uplink(&self) -> Result<Box<dyn TransportSession>, ConnError> {
+    async fn acquire_uplink(
+        &self,
+    ) -> Result<Box<dyn TransportSession>, ConnError> {
         self.factory
             .create(&self.ctx)
             .await
             .map_err(|e| ConnError::CreateFailed(e.to_string()))
     }
 
-    async fn acquire_downlink(&self) -> Result<Box<dyn TransportSession>, ConnError> {
+    async fn acquire_downlink(
+        &self,
+    ) -> Result<Box<dyn TransportSession>, ConnError> {
         self.acquire_uplink().await
     }
 

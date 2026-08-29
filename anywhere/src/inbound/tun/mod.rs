@@ -21,7 +21,12 @@ pub use platform::android::create_tun_from_fd;
 
 use std::collections::HashMap;
 use std::net::IpAddr;
-#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "windows"))]
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "windows"
+))]
 use std::net::Ipv4Addr;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -36,12 +41,12 @@ fn now_micros() -> u64 {
 }
 
 use async_trait::async_trait;
+#[cfg(target_os = "android")]
+pub use platform::android::AndroidTunManager;
 #[cfg(target_os = "linux")]
 pub use platform::linux::BYPASS_FWMARK;
 #[cfg(target_os = "linux")]
 pub use platform::linux::TunRouteManager;
-#[cfg(target_os = "android")]
-pub use platform::android::AndroidTunManager;
 #[cfg(target_os = "macos")]
 pub use platform::macos::MacosTunManager;
 #[cfg(target_os = "windows")]
@@ -177,7 +182,12 @@ pub struct TunGuard {
     _inner: Option<Arc<std::sync::Mutex<MacosTunManager>>>,
     #[cfg(target_os = "windows")]
     _inner: Option<Arc<std::sync::Mutex<WindowsTunManager>>>,
-    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "windows")))]
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "windows"
+    )))]
     _inner: (),
 }
 
@@ -281,7 +291,9 @@ impl TunLifecycle {
     /// finish (bounded) so the device handle is dropped before returning.
     pub async fn shutdown(mut self) {
         let n = self.handles.len();
-        log::info!("TUN lifecycle shutdown: cancelling token + aborting {n} task(s)");
+        log::info!(
+            "TUN lifecycle shutdown: cancelling token + aborting {n} task(s)"
+        );
         self.shutdown.cancel();
         // Take the handles out so Drop (which runs on `self` at the end of
         // this method) sees an empty vec and the join_all can consume them.
@@ -297,7 +309,9 @@ impl TunLifecycle {
             futures_util::future::join_all(handles),
         )
         .await;
-        log::info!("TUN lifecycle shutdown: complete (device handle should be released)");
+        log::info!(
+            "TUN lifecycle shutdown: complete (device handle should be released)"
+        );
     }
 }
 
@@ -419,18 +433,33 @@ impl TunInbound {
                     n
                 },
                 None => {
-                    log::warn!("macOS TUN: could not determine interface name, using configured '{name}'");
+                    log::warn!(
+                        "macOS TUN: could not determine interface name, using configured '{name}'"
+                    );
                     name.clone()
                 },
             }
         };
 
-        #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "windows")))]
+        #[cfg(not(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "macos",
+            target_os = "windows"
+        )))]
         {
-            return Err("TUN is only supported on Linux, Android, macOS, and Windows".into());
+            return Err(
+                "TUN is only supported on Linux, Android, macOS, and Windows"
+                    .into(),
+            );
         }
 
-        #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "windows")))]
+        #[cfg(not(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "macos",
+            target_os = "windows"
+        )))]
         let device: Arc<tun::AsyncDevice> = unreachable!();
 
         log::info!("TUN device {name} created at {addr}");
@@ -529,11 +558,8 @@ impl TunInbound {
         // macOS: manage routes + DNS hijack via shell commands.
         #[cfg(target_os = "macos")]
         let guard = {
-            let mut mgr = MacosTunManager::new(
-                name.clone(),
-                addr,
-                config.auto_hijack,
-            );
+            let mut mgr =
+                MacosTunManager::new(name.clone(), addr, config.auto_hijack);
             mgr.set_fakeip_enabled(config.fakeip_enabled);
 
             if let Err(e) = mgr.setup_interface() {
@@ -541,7 +567,9 @@ impl TunInbound {
             }
 
             if config.auto_route {
-                if let Err(e) = mgr.setup_routing(config.auto_hijack, &config.bypass_ips) {
+                if let Err(e) =
+                    mgr.setup_routing(config.auto_hijack, &config.bypass_ips)
+                {
                     log::warn!("Failed to set up routing: {e}");
                 }
             }
@@ -553,22 +581,36 @@ impl TunInbound {
                 }
             }
 
-            TunGuard {
-                _inner: Some(Arc::new(std::sync::Mutex::new(mgr))),
+            let mgr = Arc::new(std::sync::Mutex::new(mgr));
+            if config.auto_route {
+                let watcher_mgr = mgr.clone();
+                let watcher_shutdown = shutdown.clone();
+                tun_handles.push(tokio::spawn(async move {
+                    platform::macos::run_route_watcher(
+                        watcher_mgr,
+                        watcher_shutdown,
+                    )
+                    .await;
+                }));
             }
+
+            TunGuard { _inner: Some(mgr) }
         };
 
         // Windows: manage routes + DNS via shell commands (route/netsh).
         #[cfg(target_os = "windows")]
         let guard = {
-            let mut mgr = WindowsTunManager::new(name.clone(), addr, config.auto_hijack);
+            let mut mgr =
+                WindowsTunManager::new(name.clone(), addr, config.auto_hijack);
 
             if let Err(e) = mgr.setup_interface() {
                 log::warn!("Failed to setup TUN interface: {e}");
             }
 
             if config.auto_route {
-                if let Err(e) = mgr.setup_routing(config.auto_hijack, &config.bypass_ips) {
+                if let Err(e) =
+                    mgr.setup_routing(config.auto_hijack, &config.bypass_ips)
+                {
                     log::warn!("Failed to set up routing: {e}");
                 }
             }
@@ -584,7 +626,12 @@ impl TunInbound {
             }
         };
 
-        #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "windows")))]
+        #[cfg(not(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "macos",
+            target_os = "windows"
+        )))]
         let guard = TunGuard { _inner: () };
 
         // 5. Create channels.
@@ -677,8 +724,7 @@ async fn accept_loop(
     listener: tokio::net::TcpListener, nat: Arc<Mutex<TCPNat>>,
     cancel_registry: TcpCancelRegistry, conn_tx: mpsc::Sender<InboundConn>,
     reverse_dns: Option<Arc<ReverseDnsCache>>,
-    dns_hijack: Option<Arc<DnsHijack>>,
-    sniff_enabled: bool,
+    dns_hijack: Option<Arc<DnsHijack>>, sniff_enabled: bool,
     shutdown: CancellationToken,
 ) {
     let mut backoff = Duration::from_millis(100);
@@ -827,7 +873,8 @@ impl TunTcpRelay {
     #[inline]
     fn expired(&self) -> bool {
         now_micros().saturating_sub(
-            self.last_activity.load(std::sync::atomic::Ordering::Relaxed)
+            self.last_activity
+                .load(std::sync::atomic::Ordering::Relaxed),
         ) >= self.idle_timeout_ms * 1000
     }
 
@@ -836,12 +883,16 @@ impl TunTcpRelay {
     /// This avoids locking the shared NAT mutex on every I/O call.
     async fn touch(&self) -> bool {
         let now = now_micros();
-        self.last_activity.store(now, std::sync::atomic::Ordering::Relaxed);
-        let last = self.last_nat_touch.load(std::sync::atomic::Ordering::Relaxed);
+        self.last_activity
+            .store(now, std::sync::atomic::Ordering::Relaxed);
+        let last = self
+            .last_nat_touch
+            .load(std::sync::atomic::Ordering::Relaxed);
         if now.saturating_sub(last) < NAT_TOUCH_INTERVAL_US {
             return true; // Skip NAT touch — too recent.
         }
-        self.last_nat_touch.store(now, std::sync::atomic::Ordering::Relaxed);
+        self.last_nat_touch
+            .store(now, std::sync::atomic::Ordering::Relaxed);
         let mut guard = self.nat.lock().await;
         guard.touch_by_port(self.nat_port)
     }
@@ -937,7 +988,12 @@ fn ip_to_addr(ip: std::net::IpAddr) -> Address {
 }
 
 /// Convert a prefix length to an IPv4 netmask.
-#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "windows"))]
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "windows"
+))]
 #[allow(dead_code)]
 fn mask_to_ipv4_addr(len: u8) -> Ipv4Addr {
     let bits = if len >= 32 {
@@ -960,7 +1016,11 @@ fn find_utun_by_addr(addr: std::net::IpAddr) -> Option<String> {
         .output()
         .ok()?;
     let stdout = String::from_utf8_lossy(&output.stdout);
-    log::info!("find_utun_by_addr: route -n get {} -> {}", addr, stdout.trim());
+    log::info!(
+        "find_utun_by_addr: route -n get {} -> {}",
+        addr,
+        stdout.trim()
+    );
     for line in stdout.lines() {
         let line = line.trim();
         if let Some(iface) = line.strip_prefix("interface:") {

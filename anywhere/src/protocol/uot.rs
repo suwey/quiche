@@ -379,7 +379,11 @@ mod tests {
         // Feed truncated input one byte at a time; should keep returning None
         // until the whole frame arrives.
         for i in 0..frame.len() {
-            assert!(uot_try_parse_associate_packet(&frame[..i]).unwrap().is_none());
+            assert!(
+                uot_try_parse_associate_packet(&frame[..i])
+                    .unwrap()
+                    .is_none()
+            );
         }
         assert!(uot_try_parse_associate_packet(&frame).unwrap().is_some());
     }

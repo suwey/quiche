@@ -29,7 +29,9 @@ fn test_clash_yaml_parsing() {
     assert!(toml_out.contains("type = \"vless\""));
     assert!(toml_out.contains("tag = \"us-vless-ws-01\""));
     assert!(toml_out.contains("server = \"vless.example.com:443\""));
-    assert!(toml_out.contains("password = \"12345678-1234-1234-1234-123456789012\""));
+    assert!(
+        toml_out.contains("password = \"12345678-1234-1234-1234-123456789012\"")
+    );
     assert!(toml_out.contains("[outbounds.transport]"));
     assert!(toml_out.contains("type = \"ws\""));
     assert!(toml_out.contains("path = \"/vless-ws\""));
@@ -63,7 +65,9 @@ fn test_vless_uri_parsing() {
     assert!(toml_out.contains("type = \"vless\""));
     assert!(toml_out.contains("tag = \"test-vless\""));
     assert!(toml_out.contains("server = \"example.com:443\""));
-    assert!(toml_out.contains("password = \"12345678-1234-1234-1234-123456789012\""));
+    assert!(
+        toml_out.contains("password = \"12345678-1234-1234-1234-123456789012\"")
+    );
     assert!(toml_out.contains("sni = \"example.com\""));
     assert!(toml_out.contains("[outbounds.transport]"));
     assert!(toml_out.contains("type = \"ws\""));
@@ -218,15 +222,25 @@ fn test_merge_and_skip() {
     let mut skips = Vec::new();
     let toml_out = convert_subscription(yaml.as_bytes(), &mut skips).unwrap();
     println!("{}", toml_out);
-    
+
     // domain_suffix merged: google, youtube, github in one entry
     assert!(toml_out.contains("domain_suffix = [\n    \"google.com\",\n    \"youtube.com\",\n    \"github.com\"\n]"));
     // domain merged: example.com, test.com in one entry
-    assert!(toml_out.contains("domain = [\n    \"example.com\",\n    \"test.com\"\n]"));
+    assert!(
+        toml_out
+            .contains("domain = [\n    \"example.com\",\n    \"test.com\"\n]")
+    );
     // domain_keyword merged: facebook, instagram in one entry
-    assert!(toml_out.contains("domain_keyword = [\n    \"facebook\",\n    \"instagram\"\n]"));
+    assert!(
+        toml_out.contains(
+            "domain_keyword = [\n    \"facebook\",\n    \"instagram\"\n]"
+        )
+    );
     // ip_cidr merged: only non-private ones (8.8.8.0/24, 8.8.4.0/24)
-    assert!(toml_out.contains("ip_cidr = [\n    \"8.8.8.0/24\",\n    \"8.8.4.0/24\"\n]"));
+    assert!(
+        toml_out
+            .contains("ip_cidr = [\n    \"8.8.8.0/24\",\n    \"8.8.4.0/24\"\n]")
+    );
     // private CIDRs NOT present in output
     assert!(!toml_out.contains("10.0.0.0/8"));
     assert!(!toml_out.contains("192.168.0.0/16"));

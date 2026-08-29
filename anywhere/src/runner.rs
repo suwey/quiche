@@ -8,14 +8,14 @@ use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::net::Ipv6Addr;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use crate::config::Config;
-use crate::context::AppContext;
 #[allow(unused_imports)]
 use crate::cache::{self, StatusSink};
+use crate::config::Config;
+use crate::context::AppContext;
 use crate::inbound::Address;
 use crate::inbound::Destination;
 use crate::inbound::Inbound;
@@ -26,8 +26,8 @@ use crate::inbound::socks5::Socks5Inbound;
 use crate::outbound::registry::OutboundRegistry;
 use crate::relay::CountedPacketRelay;
 use crate::relay::CountedStreamRelay;
-use crate::relay::PrependStreamRelay;
 use crate::relay::PrependPacketRelay;
+use crate::relay::PrependStreamRelay;
 use crate::relay::bidirectional_packet_relay;
 use crate::relay::bidirectional_relay;
 
@@ -101,7 +101,8 @@ impl Default for RunOptions {
 /// On Android: called by `android/jni.rs` with `tun_fd: Some(fd)`.
 pub async fn run(opts: RunOptions) -> Result<(), Box<dyn std::error::Error>> {
     // --- Cache store (persistent state + runtime status) ---
-    let cache_dir_path = opts.cache_dir
+    let cache_dir_path = opts
+        .cache_dir
         .as_ref()
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
@@ -112,11 +113,10 @@ pub async fn run(opts: RunOptions) -> Result<(), Box<dyn std::error::Error>> {
         None
     };
     let cache: Arc<cache::CacheStore> = Arc::new(
-        cache::CacheStore::open(&db_path, json_dir)
-            .unwrap_or_else(|e| {
-                log::warn!("Failed to open cache.db: {e}, using ephemeral store");
-                cache::CacheStore::ephemeral()
-            }),
+        cache::CacheStore::open(&db_path, json_dir).unwrap_or_else(|e| {
+            log::warn!("Failed to open cache.db: {e}, using ephemeral store");
+            cache::CacheStore::ephemeral()
+        }),
     );
     let sink: cache::SharedSink = cache.clone();
     sink.emit(cache::StatusEvent::Phase(cache::EnginePhase::Starting));
@@ -124,47 +124,50 @@ pub async fn run(opts: RunOptions) -> Result<(), Box<dyn std::error::Error>> {
     // Resolve the actual config file path as an absolute path.
     // This is stored in context so `PUT /configs` can always write back to
     // the correct file — regardless of how the config was loaded.
-    let resolved_config_path: Option<String> = if let Some(path) = &opts.config_path {
-        // config_path was provided — canonicalize it.
-        let abs = std::path::Path::new(path)
-            .canonicalize()
-            .or_else(|_| {
-                // File may not exist yet (Android first run with inline content).
-                // Make it absolute relative to CWD.
-                let p = if std::path::Path::new(path).is_absolute() {
-                    std::path::PathBuf::from(path)
-                } else {
-                    std::env::current_dir().unwrap_or_default().join(path)
-                };
-                // Create parent dir if needed (Android filesDir should exist, but be safe).
-                if let Some(parent) = p.parent() {
-                    let _ = std::fs::create_dir_all(parent);
-                }
-                std::io::Result::Ok(p)
-            })
-            .map(|p| p.to_string_lossy().to_string())
-            .ok();
-        abs
-    } else if opts.config_content.is_some() {
-        // No config_path but we have inline content — we need a file to write
-        // back to. Use a default path in CWD (desktop) or cache_dir (Android).
-        #[cfg(target_os = "android")]
-        {
-            opts.cache_dir.as_ref().map(|d| format!("{d}/anywhere.toml"))
-        }
-        #[cfg(not(target_os = "android"))]
-        {
-            Some(
-                std::env::current_dir()
-                    .unwrap_or_default()
-                    .join("config.toml")
-                    .to_string_lossy()
-                    .to_string(),
-            )
-        }
-    } else {
-        None
-    };
+    let resolved_config_path: Option<String> =
+        if let Some(path) = &opts.config_path {
+            // config_path was provided — canonicalize it.
+            let abs = std::path::Path::new(path)
+                .canonicalize()
+                .or_else(|_| {
+                    // File may not exist yet (Android first run with inline content).
+                    // Make it absolute relative to CWD.
+                    let p = if std::path::Path::new(path).is_absolute() {
+                        std::path::PathBuf::from(path)
+                    } else {
+                        std::env::current_dir().unwrap_or_default().join(path)
+                    };
+                    // Create parent dir if needed (Android filesDir should exist, but be safe).
+                    if let Some(parent) = p.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    std::io::Result::Ok(p)
+                })
+                .map(|p| p.to_string_lossy().to_string())
+                .ok();
+            abs
+        } else if opts.config_content.is_some() {
+            // No config_path but we have inline content — we need a file to write
+            // back to. Use a default path in CWD (desktop) or cache_dir (Android).
+            #[cfg(target_os = "android")]
+            {
+                opts.cache_dir
+                    .as_ref()
+                    .map(|d| format!("{d}/anywhere.toml"))
+            }
+            #[cfg(not(target_os = "android"))]
+            {
+                Some(
+                    std::env::current_dir()
+                        .unwrap_or_default()
+                        .join("config.toml")
+                        .to_string_lossy()
+                        .to_string(),
+                )
+            }
+        } else {
+            None
+        };
 
     // Load config from resolved path, or fall back to inline content.
     #[allow(unused_mut)]
@@ -179,7 +182,10 @@ pub async fn run(opts: RunOptions) -> Result<(), Box<dyn std::error::Error>> {
             }
             Config::from_string(content)?
         } else {
-            return Err("config_path file does not exist and no inline content provided".into());
+            return Err(
+                "config_path file does not exist and no inline content provided"
+                    .into(),
+            );
         }
     } else if let Some(content) = &opts.config_content {
         // No config_path — try to load from resolved path (may have been written
@@ -194,7 +200,9 @@ pub async fn run(opts: RunOptions) -> Result<(), Box<dyn std::error::Error>> {
             Config::from_string(content)?
         }
     } else {
-        return Err("either config_path or config_content must be provided".into());
+        return Err(
+            "either config_path or config_content must be provided".into()
+        );
     };
 
     // --- Android: force-override path-dependent config fields ---
@@ -350,15 +358,26 @@ pub async fn run(opts: RunOptions) -> Result<(), Box<dyn std::error::Error>> {
     log::info!("Geo refresh DNS upstreams: {:?}", dns_plain);
     log::info!("Loading rules...");
     let rules = Arc::new(
-        Rules::from_config(&config.rules, &config.outbounds, &cache_dir, sink.as_ref(), &dns_plain)
-            .await
-            .map_err(|e| {
-                sink.emit(cache::StatusEvent::Notice { level: cache::NoticeLevel::Error, msg: format!("Failed to initialize rules: {e}") });
-                log::error!("Failed to initialize rules: {e}");
-                e
-            })?,
+        Rules::from_config(
+            &config.rules,
+            &config.outbounds,
+            &cache_dir,
+            sink.as_ref(),
+            &dns_plain,
+        )
+        .await
+        .map_err(|e| {
+            sink.emit(cache::StatusEvent::Notice {
+                level: cache::NoticeLevel::Error,
+                msg: format!("Failed to initialize rules: {e}"),
+            });
+            log::error!("Failed to initialize rules: {e}");
+            e
+        })?,
     );
-    sink.emit(cache::StatusEvent::Phase(cache::EnginePhase::StartingInbound));
+    sink.emit(cache::StatusEvent::Phase(
+        cache::EnginePhase::StartingInbound,
+    ));
     log::info!("All rules initialized");
 
     let mut tasks = Vec::new();
@@ -371,17 +390,16 @@ pub async fn run(opts: RunOptions) -> Result<(), Box<dyn std::error::Error>> {
 
     #[allow(unused_mut)]
     let mut ctx = if config.ui.listen.is_some() {
-        let current_memory: fn() -> u64 = if cfg!(target_os = "linux")
-            || cfg!(target_os = "android")
-        {
-            ui_state::read_linux_memory
-        } else if cfg!(target_os = "macos") {
-            ui_state::read_macos_memory
-        } else if cfg!(target_os = "windows") {
-            ui_state::read_windows_memory
-        } else {
-            || 0
-        };
+        let current_memory: fn() -> u64 =
+            if cfg!(target_os = "linux") || cfg!(target_os = "android") {
+                ui_state::read_linux_memory
+            } else if cfg!(target_os = "macos") {
+                ui_state::read_macos_memory
+            } else if cfg!(target_os = "windows") {
+                ui_state::read_windows_memory
+            } else {
+                || 0
+            };
         let stats = AppStats::new(current_memory);
         let logs_tx = logs_tx.unwrap();
         let start_cmd = opts.start_cmd.clone();
@@ -391,7 +409,10 @@ pub async fn run(opts: RunOptions) -> Result<(), Box<dyn std::error::Error>> {
             .iter()
             .enumerate()
             .map(|(i, o)| (o.tag_or_default(i), o.type_.clone()))
-            .chain(std::iter::once(("GLOBAL".to_string(), "urltest".to_string())))
+            .chain(std::iter::once((
+                "GLOBAL".to_string(),
+                "urltest".to_string(),
+            )))
             .collect();
 
         let urltest_states = registry.urltest_states.clone();
@@ -418,9 +439,7 @@ pub async fn run(opts: RunOptions) -> Result<(), Box<dyn std::error::Error>> {
         for (group, child) in &saved_selections {
             if let Some(state) = urltest_states.get(group) {
                 if state.set_fixed_by_name(child) {
-                    log::info!(
-                        "restored selection for '{group}' -> '{child}'"
-                    );
+                    log::info!("restored selection for '{group}' -> '{child}'");
                 }
             }
         }
@@ -457,7 +476,12 @@ pub async fn run(opts: RunOptions) -> Result<(), Box<dyn std::error::Error>> {
     // --- TUN inbounds ---
     // Linux: create TUN device internally via rtnetlink.
     // Android: receive fd from VpnService via JNI.
-    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "windows"))]
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "windows"
+    ))]
     let (_tun_guard, tun_lifecycle): (
         Option<crate::inbound::tun::TunGuard>,
         Option<crate::inbound::tun::TunLifecycle>,
@@ -522,7 +546,10 @@ pub async fn run(opts: RunOptions) -> Result<(), Box<dyn std::error::Error>> {
                             dns_cfg.direct,
                             dns_cfg.remote
                         );
-                        tasks.push(tokio::spawn(run_inbound(inbound, ctx.clone())));
+                        tasks.push(tokio::spawn(run_inbound(
+                            inbound,
+                            ctx.clone(),
+                        )));
                         last_guard = Some(guard);
                         last_lifecycle = Some(lifecycle);
                     },
@@ -537,7 +564,9 @@ pub async fn run(opts: RunOptions) -> Result<(), Box<dyn std::error::Error>> {
                 let fd = opts.tun_fd.ok_or_else(|| {
                     "TUN inbound configured but no fd provided from VpnService"
                 })?;
-                match TunInbound::new(&tun_config, Some(dns_builder), Some(fd)).await {
+                match TunInbound::new(&tun_config, Some(dns_builder), Some(fd))
+                    .await
+                {
                     Ok((inbound, guard, lifecycle)) => {
                         log::info!("Starting TUN inbound on Android (fd={})", fd);
                         log::info!(
@@ -545,7 +574,10 @@ pub async fn run(opts: RunOptions) -> Result<(), Box<dyn std::error::Error>> {
                             dns_cfg.direct,
                             dns_cfg.remote
                         );
-                        tasks.push(tokio::spawn(run_inbound(inbound, ctx.clone())));
+                        tasks.push(tokio::spawn(run_inbound(
+                            inbound,
+                            ctx.clone(),
+                        )));
                         last_guard = Some(guard);
                         last_lifecycle = Some(lifecycle);
                     },
@@ -559,13 +591,19 @@ pub async fn run(opts: RunOptions) -> Result<(), Box<dyn std::error::Error>> {
             {
                 match TunInbound::new(&tun_config, Some(dns_builder)).await {
                     Ok((inbound, guard, lifecycle)) => {
-                        log::info!("Starting TUN inbound on {} (macOS)", tun_config.addr);
+                        log::info!(
+                            "Starting TUN inbound on {} (macOS)",
+                            tun_config.addr
+                        );
                         log::info!(
                             "DNS hijack enabled (direct={:?}, remote={:?})",
                             dns_cfg.direct,
                             dns_cfg.remote
                         );
-                        tasks.push(tokio::spawn(run_inbound(inbound, ctx.clone())));
+                        tasks.push(tokio::spawn(run_inbound(
+                            inbound,
+                            ctx.clone(),
+                        )));
                         last_guard = Some(guard);
                         last_lifecycle = Some(lifecycle);
                     },
@@ -578,13 +616,19 @@ pub async fn run(opts: RunOptions) -> Result<(), Box<dyn std::error::Error>> {
             {
                 match TunInbound::new(&tun_config, Some(dns_builder)).await {
                     Ok((inbound, guard, lifecycle)) => {
-                        log::info!("Starting TUN inbound on {} (Windows)", tun_config.addr);
+                        log::info!(
+                            "Starting TUN inbound on {} (Windows)",
+                            tun_config.addr
+                        );
                         log::info!(
                             "DNS hijack enabled (direct={:?}, remote={:?})",
                             dns_cfg.direct,
                             dns_cfg.remote
                         );
-                        tasks.push(tokio::spawn(run_inbound(inbound, ctx.clone())));
+                        tasks.push(tokio::spawn(run_inbound(
+                            inbound,
+                            ctx.clone(),
+                        )));
                         last_guard = Some(guard);
                         last_lifecycle = Some(lifecycle);
                     },
@@ -596,7 +640,12 @@ pub async fn run(opts: RunOptions) -> Result<(), Box<dyn std::error::Error>> {
         }
         (last_guard, last_lifecycle)
     };
-    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "windows")))]
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "windows"
+    )))]
     let (_tun_guard, tun_lifecycle): (
         Option<crate::inbound::tun::TunGuard>,
         Option<crate::inbound::tun::TunLifecycle>,
@@ -625,7 +674,10 @@ pub async fn run(opts: RunOptions) -> Result<(), Box<dyn std::error::Error>> {
 
     // Store resolved absolute config path in context for reload support.
     ctx.set_config_path(resolved_config_path.clone());
-    log::info!("Config file: {}", resolved_config_path.as_deref().unwrap_or("<none>"));
+    log::info!(
+        "Config file: {}",
+        resolved_config_path.as_deref().unwrap_or("<none>")
+    );
 
     // --- UI server (optional) ---
     if config.ui.listen.is_some() {
@@ -680,8 +732,12 @@ pub async fn run(opts: RunOptions) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // --- TUN mode check ---
-    let has_tun = cfg!(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "windows"))
-        && !config.inbounds_by_type("tun").is_empty();
+    let has_tun = cfg!(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "windows"
+    )) && !config.inbounds_by_type("tun").is_empty();
 
     // --- SOCKS5 inbounds ---
     for cfg in config.inbounds_by_type("socks5") {
@@ -899,93 +955,112 @@ async fn run_inbound(mut inbound: impl Inbound + 'static, ctx: AppContext) {
                     if sniff::is_server_first(destination.port) {
                         (destination, stream, None)
                     } else {
-                    let mut buf = vec![0u8; 4096];
-                    let mut total = 0;
-                    while total < buf.len() {
-                        // Check if we have a complete TLS record — if so, stop reading.
-                        // TLS record header: type(1) + version(2) + length(2)
-                        if total >= 5 && buf[0] == 0x16 {
-                            let record_len = u16::from_be_bytes([buf[3], buf[4]]) as usize;
-                            if total >= 5 + record_len {
-                                break; // full ClientHello received
+                        let mut buf = vec![0u8; 4096];
+                        let mut total = 0;
+                        while total < buf.len() {
+                            // Check if we have a complete TLS record — if so, stop reading.
+                            // TLS record header: type(1) + version(2) + length(2)
+                            if total >= 5 && buf[0] == 0x16 {
+                                let record_len =
+                                    u16::from_be_bytes([buf[3], buf[4]]) as usize;
+                                if total >= 5 + record_len {
+                                    break; // full ClientHello received
+                                }
                             }
-                        }
-                        // Also break early for HTTP (double CRLF marks end of headers)
-                        if total >= 4 && buf[total-4] == b'\r' && buf[total-3] == b'\n' 
-                            && buf[total-2] == b'\r' && buf[total-1] == b'\n' {
-                            break;
-                        }
-                        // After the first read, check if the data looks like
-                        // something we can sniff (TLS/HTTP/QUIC/DNS/etc.).
-                        // If not, skip further sniff reads immediately to
-                        // avoid adding latency to non-standard protocols
-                        // (e.g. WeChat MMTLS).
-                        if total > 0 && !sniff::looks_sniffable(&buf[..total]) {
-                            break;
-                        }
-                        // Timeout to prevent sniff from blocking indefinitely on
-                        // protocols where the client sends a small packet then
-                        // waits for the server to respond (e.g. WeChat private
-                        // protocol). Without this, the connection stalls.
-                        match tokio::time::timeout(
-                            Duration::from_millis(500),
-                            stream.read(&mut buf[total..]),
-                        ).await {
-                            Ok(Ok(0)) => break,
-                            Ok(Ok(n)) => total += n,
-                            Ok(Err(e)) => {
-                                log::debug!("sniff: read error: {e}");
-                                let _ = stream.shutdown().await;
-                                return;
-                            }
-                            Err(_) => {
-                                // Sniff timeout — proceed with whatever we have.
-                                log::debug!(
-                                    "sniff: timeout after reading {total} bytes from {destination}"
-                                );
+                            // Also break early for HTTP (double CRLF marks end of headers)
+                            if total >= 4
+                                && buf[total - 4] == b'\r'
+                                && buf[total - 3] == b'\n'
+                                && buf[total - 2] == b'\r'
+                                && buf[total - 1] == b'\n'
+                            {
                                 break;
                             }
+                            // After the first read, check if the data looks like
+                            // something we can sniff (TLS/HTTP/QUIC/DNS/etc.).
+                            // If not, skip further sniff reads immediately to
+                            // avoid adding latency to non-standard protocols
+                            // (e.g. WeChat MMTLS).
+                            if total > 0 && !sniff::looks_sniffable(&buf[..total])
+                            {
+                                break;
+                            }
+                            // Timeout to prevent sniff from blocking indefinitely on
+                            // protocols where the client sends a small packet then
+                            // waits for the server to respond (e.g. WeChat private
+                            // protocol). Without this, the connection stalls.
+                            match tokio::time::timeout(
+                                Duration::from_millis(500),
+                                stream.read(&mut buf[total..]),
+                            )
+                            .await
+                            {
+                                Ok(Ok(0)) => break,
+                                Ok(Ok(n)) => total += n,
+                                Ok(Err(e)) => {
+                                    log::debug!("sniff: read error: {e}");
+                                    let _ = stream.shutdown().await;
+                                    return;
+                                },
+                                Err(_) => {
+                                    // Sniff timeout — proceed with whatever we have.
+                                    log::debug!(
+                                        "sniff: timeout after reading {total} bytes from {destination}"
+                                    );
+                                    break;
+                                },
+                            }
                         }
-                    }
-                    let peeked = &buf[..total];
-                    let sniffed = sniff::sniff(peeked);
-                    let sniff_info = sniffed.as_ref().map(|r| {
-                        SniffInfo::from_sniff_result(r.domain.clone(), r.protocol)
-                    });
+                        let peeked = &buf[..total];
+                        let sniffed = sniff::sniff(peeked);
+                        let sniff_info = sniffed.as_ref().map(|r| {
+                            SniffInfo::from_sniff_result(
+                                r.domain.clone(),
+                                r.protocol,
+                            )
+                        });
 
-                    let new_dest = if let Some(ref domain) = sniff_info.as_ref().and_then(|s| s.domain.as_ref()) {
-                        let ip = destination.resolved_ip
-                            .or_else(|| match &destination.address {
-                                Address::Ipv4(o) => {
-                                    Some(std::net::IpAddr::V4(Ipv4Addr::from(*o)))
+                        let new_dest = if let Some(ref domain) =
+                            sniff_info.as_ref().and_then(|s| s.domain.as_ref())
+                        {
+                            let ip = destination.resolved_ip.or_else(|| {
+                                match &destination.address {
+                                    Address::Ipv4(o) => Some(
+                                        std::net::IpAddr::V4(Ipv4Addr::from(*o)),
+                                    ),
+                                    Address::Ipv6(o) => Some(
+                                        std::net::IpAddr::V6(Ipv6Addr::from(*o)),
+                                    ),
+                                    _ => None,
                                 }
-                                Address::Ipv6(o) => {
-                                    Some(std::net::IpAddr::V6(Ipv6Addr::from(*o)))
-                                }
-                                _ => None,
                             });
-                        match ip {
-                            Some(ip) => Destination::with_resolved(
-                                Address::Domain(domain.to_string()),
-                                destination.port,
-                                ip,
-                            ),
-                            None => Destination::new(
-                                Address::Domain(domain.to_string()),
-                                destination.port,
-                            ),
-                        }
-                    } else {
-                        destination
-                    };
+                            match ip {
+                                Some(ip) => Destination::with_resolved(
+                                    Address::Domain(domain.to_string()),
+                                    destination.port,
+                                    ip,
+                                ),
+                                None => Destination::new(
+                                    Address::Domain(domain.to_string()),
+                                    destination.port,
+                                ),
+                            }
+                        } else {
+                            destination
+                        };
 
-                    let boxed: Box<dyn crate::relay::StreamRelay> =
-                        Box::new(PrependStreamRelay::new(stream, buf[..total].to_vec()));
-                    (new_dest, boxed, sniff_info)
+                        let boxed: Box<dyn crate::relay::StreamRelay> =
+                            Box::new(PrependStreamRelay::new(
+                                stream,
+                                buf[..total].to_vec(),
+                            ));
+                        (new_dest, boxed, sniff_info)
                     } // end else (not server-first)
-                }
+                },
                 InboundConn::Tcp {
-                    destination, stream, ..
+                    destination,
+                    stream,
+                    ..
                 } => (destination, stream, None),
                 InboundConn::Udp {
                     initial_destination,
@@ -999,7 +1074,10 @@ async fn run_inbound(mut inbound: impl Inbound + 'static, ctx: AppContext) {
                     let mut destination = initial_destination.clone();
 
                     let should_sniff_udp = type_ == "tun"
-                        && matches!(&initial_destination.address, Address::Ipv4(_) | Address::Ipv6(_));
+                        && matches!(
+                            &initial_destination.address,
+                            Address::Ipv4(_) | Address::Ipv6(_)
+                        );
 
                     if should_sniff_udp {
                         let mut buf = vec![0u8; 4096];
@@ -1007,25 +1085,48 @@ async fn run_inbound(mut inbound: impl Inbound + 'static, ctx: AppContext) {
                             Ok((n, dest)) if n > 0 => {
                                 let payload = &buf[..n];
                                 if let Some(result) = sniff::sniff(payload) {
-                                    sniff_info = Some(SniffInfo::from_sniff_result(
-                                        result.domain.clone(),
-                                        result.protocol,
-                                    ));
-                                    if let Some(ref domain) = sniff_info.as_ref().and_then(|s| s.domain.as_ref()) {
-                                        let ip = initial_destination.resolved_ip
-                                            .or_else(|| match &initial_destination.address {
-                                                Address::Ipv4(o) => Some(std::net::IpAddr::V4(Ipv4Addr::from(*o))),
-                                                Address::Ipv6(o) => Some(std::net::IpAddr::V6(Ipv6Addr::from(*o))),
-                                                _ => None,
-                                            });
+                                    sniff_info =
+                                        Some(SniffInfo::from_sniff_result(
+                                            result.domain.clone(),
+                                            result.protocol,
+                                        ));
+                                    if let Some(ref domain) = sniff_info
+                                        .as_ref()
+                                        .and_then(|s| s.domain.as_ref())
+                                    {
+                                        let ip = initial_destination
+                                            .resolved_ip
+                                            .or_else(
+                                                || match &initial_destination
+                                                    .address
+                                                {
+                                                    Address::Ipv4(o) => Some(
+                                                        std::net::IpAddr::V4(
+                                                            Ipv4Addr::from(*o),
+                                                        ),
+                                                    ),
+                                                    Address::Ipv6(o) => Some(
+                                                        std::net::IpAddr::V6(
+                                                            Ipv6Addr::from(*o),
+                                                        ),
+                                                    ),
+                                                    _ => None,
+                                                },
+                                            );
                                         destination = match ip {
-                                            Some(ip) => Destination::with_resolved(
-                                                Address::Domain(domain.to_string()),
-                                                initial_destination.port,
-                                                ip,
-                                            ),
+                                            Some(ip) => {
+                                                Destination::with_resolved(
+                                                    Address::Domain(
+                                                        domain.to_string(),
+                                                    ),
+                                                    initial_destination.port,
+                                                    ip,
+                                                )
+                                            },
                                             None => Destination::new(
-                                                Address::Domain(domain.to_string()),
+                                                Address::Domain(
+                                                    domain.to_string(),
+                                                ),
                                                 initial_destination.port,
                                             ),
                                         };
@@ -1037,25 +1138,33 @@ async fn run_inbound(mut inbound: impl Inbound + 'static, ctx: AppContext) {
                                     payload.to_vec(),
                                     dest,
                                 ));
-                            }
+                            },
                             _ => {
                                 // Failed to read first packet — proceed without sniffing.
-                            }
+                            },
                         }
                     }
 
                     let host = if let Some(ref si) = sniff_info {
-                        si.domain.clone().unwrap_or_else(|| destination.address.to_string())
+                        si.domain
+                            .clone()
+                            .unwrap_or_else(|| destination.address.to_string())
                     } else {
                         destination.address.to_string()
                     };
                     let dest_ip = destination.address.to_string();
                     let dest_port = destination.port.to_string();
 
-                    let rule_match = match ctx.rules.match_conn(&destination, network, sniff_info.as_ref()) {
+                    let rule_match = match ctx.rules.match_conn(
+                        &destination,
+                        network,
+                        sniff_info.as_ref(),
+                    ) {
                         Some(m) => m,
                         None => {
-                            log::warn!("No rule for {destination} ({network}), dropping");
+                            log::warn!(
+                                "No rule for {destination} ({network}), dropping"
+                            );
                             return;
                         },
                     };
@@ -1073,7 +1182,7 @@ async fn run_inbound(mut inbound: impl Inbound + 'static, ctx: AppContext) {
                         None => {
                             log::warn!("No outbound tag '{tag}'");
                             return;
-                        }
+                        },
                     };
 
                     let conn_id = Uuid::new_v4().to_string();
@@ -1099,7 +1208,11 @@ async fn run_inbound(mut inbound: impl Inbound + 'static, ctx: AppContext) {
                         rule: rule_match.description.clone(),
                     };
                     ctx.stats
-                        .add_connection(conn_id.clone(), Arc::clone(&counters), info)
+                        .add_connection(
+                            conn_id.clone(),
+                            Arc::clone(&counters),
+                            info,
+                        )
                         .await;
 
                     let mut packet = packet;
@@ -1136,24 +1249,32 @@ async fn run_inbound(mut inbound: impl Inbound + 'static, ctx: AppContext) {
                         .map(crate::relay::udp_timeout_for_protocol)
                         .unwrap_or(crate::relay::DEFAULT_UDP_TIMEOUT);
                     bidirectional_packet_relay(
-                        &mut *packet, &mut counted_out, udp_timeout,
+                        &mut *packet,
+                        &mut counted_out,
+                        udp_timeout,
                     )
                     .await;
                     ctx.stats.remove_connection(&conn_id).await;
                     return;
-                }
+                },
             };
 
             // --- TCP path (after sniff) ---
             let host = if let Some(ref si) = sniff_info {
-                si.domain.clone().unwrap_or_else(|| destination.address.to_string())
+                si.domain
+                    .clone()
+                    .unwrap_or_else(|| destination.address.to_string())
             } else {
                 destination.address.to_string()
             };
             let dest_ip = destination.address.to_string();
             let dest_port = destination.port.to_string();
 
-            let rule_match = match ctx.rules.match_conn(&destination, network, sniff_info.as_ref()) {
+            let rule_match = match ctx.rules.match_conn(
+                &destination,
+                network,
+                sniff_info.as_ref(),
+            ) {
                 Some(m) => m,
                 None => {
                     log::warn!("No rule for {destination} ({network}), dropping");
@@ -1175,7 +1296,7 @@ async fn run_inbound(mut inbound: impl Inbound + 'static, ctx: AppContext) {
                 None => {
                     log::warn!("No outbound tag '{tag}'");
                     return;
-                }
+                },
             };
 
             let conn_id = Uuid::new_v4().to_string();
@@ -1217,22 +1338,34 @@ async fn run_inbound(mut inbound: impl Inbound + 'static, ctx: AppContext) {
                     // Retry through the "auto" (proxy) outbound.
                     #[cfg(target_os = "macos")]
                     {
-                        if tag == "direct" && network == crate::inbound::Network::Tcp {
-                            if let Some(auto_client) = ctx.registry.get("auto").cloned() {
-                                log::info!("macOS direct failed, falling back to auto: {destination}");
+                        if tag == "direct"
+                            && network == crate::inbound::Network::Tcp
+                        {
+                            if let Some(auto_client) =
+                                ctx.registry.get("auto").cloned()
+                            {
+                                log::info!(
+                                    "macOS direct failed, falling back to auto: {destination}"
+                                );
                                 let fallback_result = auto_client
                                     .dial(&destination)
                                     .await
                                     .map_err(|e| e.to_string());
                                 match fallback_result {
                                     Ok(o) => {
-                                        log::info!("Fallback to auto succeeded for {destination}");
+                                        log::info!(
+                                            "Fallback to auto succeeded for {destination}"
+                                        );
                                         o
                                     },
                                     Err(e2_msg) => {
-                                        log::error!("{msg}; fallback to auto also failed: {e2_msg}");
+                                        log::error!(
+                                            "{msg}; fallback to auto also failed: {e2_msg}"
+                                        );
                                         let _ = stream.shutdown().await;
-                                        ctx.stats.remove_connection(&conn_id).await;
+                                        ctx.stats
+                                            .remove_connection(&conn_id)
+                                            .await;
                                         return;
                                     },
                                 }
@@ -1268,7 +1401,9 @@ async fn run_inbound(mut inbound: impl Inbound + 'static, ctx: AppContext) {
 
             if let Some(ref si) = sniff_info {
                 if let Some(ref d) = si.domain {
-                    log::info!("Relaying tcp {destination} (sniffed: {d}) via {tag}");
+                    log::info!(
+                        "Relaying tcp {destination} (sniffed: {d}) via {tag}"
+                    );
                 } else {
                     log::info!("Relaying tcp {destination} via {tag}");
                 }
@@ -1283,7 +1418,10 @@ async fn run_inbound(mut inbound: impl Inbound + 'static, ctx: AppContext) {
             stream.finish().await;
             ctx.stats.remove_connection(&conn_id).await;
         });
-        conn_handles.lock().expect("conn_handles poisoned").push(handle);
+        conn_handles
+            .lock()
+            .expect("conn_handles poisoned")
+            .push(handle);
     }
 }
 

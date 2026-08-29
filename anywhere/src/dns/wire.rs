@@ -208,8 +208,10 @@ pub fn build_refused_response(query: &[u8]) -> Option<Vec<u8>> {
 /// bootstrap resolution of DoH hostnames via plain UDP.
 pub fn build_a_query(name: &str) -> Vec<u8> {
     let mut v = vec![0u8; 12];
-    v[2] = 0x01; v[3] = 0x00; // RD=1
-    v[4] = 0x00; v[5] = 0x01; // QDCOUNT = 1
+    v[2] = 0x01;
+    v[3] = 0x00; // RD=1
+    v[4] = 0x00;
+    v[5] = 0x01; // QDCOUNT = 1
     for label in name.split('.') {
         if label.is_empty() {
             continue;

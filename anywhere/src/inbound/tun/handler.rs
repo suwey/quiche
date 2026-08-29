@@ -19,8 +19,8 @@ use std::time::Instant;
 use async_trait::async_trait;
 use tokio::sync::Mutex;
 use tokio::sync::mpsc;
-use tun::AsyncDevice;
 use tokio_util::sync::CancellationToken;
+use tun::AsyncDevice;
 
 use crate::dns::DnsHijack;
 use crate::inbound::Address;
@@ -29,9 +29,7 @@ use crate::inbound::InboundConn;
 use crate::inbound::tun::nat::TCPNat;
 use crate::inbound::tun::packet::IpPacket;
 use crate::inbound::tun::packet::IpPacketMeta;
-use crate::inbound::tun::packet::{
-    self,
-};
+use crate::inbound::tun::packet::{self};
 use crate::inbound::tun::reverse_dns::ReverseDnsCache;
 use crate::relay::PacketRelay;
 
@@ -136,8 +134,7 @@ pub async fn run_tun_handler(
     tun: Arc<AsyncDevice>, tun_addr: IpAddr, nat: Arc<Mutex<TCPNat>>,
     listener_port: u16, conn_tx: mpsc::Sender<InboundConn>,
     dns_hijack: Option<Arc<DnsHijack>>,
-    reverse_dns: Option<Arc<ReverseDnsCache>>,
-    shutdown: CancellationToken,
+    reverse_dns: Option<Arc<ReverseDnsCache>>, shutdown: CancellationToken,
 ) {
     let writer = TunWriter::new(tun.clone());
 
@@ -199,40 +196,42 @@ pub async fn run_tun_handler(
                 .await;
             },
             IpPacket::Udp(meta) => {
-            if meta.dst_port == 53 {
-                log::debug!(
-                    "TUN DNS hijack: {src}:{sp} -> {dst}:{dp}",
-                    src = meta.src_ip, sp = meta.src_port,
-                    dst = meta.dst_ip, dp = meta.dst_port,
-                );
-                if let Some(ref dns) = dns_hijack {
-                    let l4_off = meta.l4_offset;
-                    let udp_hdr_end = l4_off + 8;
-                    if udp_hdr_end < meta.total_len {
-                        let payload =
-                            buf[udp_hdr_end..meta.total_len].to_vec();
-                        let dns = dns.clone();
-                        let dns_shutdown = dns.shutdown.clone();
-                        let src_ip = meta.src_ip;
-                        let src_port = meta.src_port;
-                        let dst_ip = meta.dst_ip;
-                        let dst_port = meta.dst_port;
-                        tokio::spawn(async move {
-                            // Exit promptly on shutdown so the cloned
-                            // `Arc<DnsHijack>` (and the `TunWriter` ->
-                            // `Arc<AsyncDevice>` it owns) is released before
-                            // the next `run()` recreates the TUN device.
-                            tokio::select! {
-                                _ = dns_shutdown.cancelled() => {},
-                                _ = dns.handle_query(
-                                    &payload, src_ip, src_port, dst_ip, dst_port,
-                                ) => {},
-                            }
-                        });
-                        continue;
+                if meta.dst_port == 53 {
+                    log::debug!(
+                        "TUN DNS hijack: {src}:{sp} -> {dst}:{dp}",
+                        src = meta.src_ip,
+                        sp = meta.src_port,
+                        dst = meta.dst_ip,
+                        dp = meta.dst_port,
+                    );
+                    if let Some(ref dns) = dns_hijack {
+                        let l4_off = meta.l4_offset;
+                        let udp_hdr_end = l4_off + 8;
+                        if udp_hdr_end < meta.total_len {
+                            let payload =
+                                buf[udp_hdr_end..meta.total_len].to_vec();
+                            let dns = dns.clone();
+                            let dns_shutdown = dns.shutdown.clone();
+                            let src_ip = meta.src_ip;
+                            let src_port = meta.src_port;
+                            let dst_ip = meta.dst_ip;
+                            let dst_port = meta.dst_port;
+                            tokio::spawn(async move {
+                                // Exit promptly on shutdown so the cloned
+                                // `Arc<DnsHijack>` (and the `TunWriter` ->
+                                // `Arc<AsyncDevice>` it owns) is released before
+                                // the next `run()` recreates the TUN device.
+                                tokio::select! {
+                                    _ = dns_shutdown.cancelled() => {},
+                                    _ = dns.handle_query(
+                                        &payload, src_ip, src_port, dst_ip, dst_port,
+                                    ) => {},
+                                }
+                            });
+                            continue;
+                        }
                     }
                 }
-            }
                 let dropped = handle_udp_packet(
                     &buf[..n],
                     &meta,
@@ -284,12 +283,24 @@ async fn handle_tcp_packet(
     let tcp_flags = if meta.l4_offset + 14 <= meta.total_len {
         let f = buf[meta.l4_offset + 13];
         let mut s = String::new();
-        if f & 0x01 != 0 { s.push_str("F"); }
-        if f & 0x02 != 0 { s.push_str("S"); }
-        if f & 0x04 != 0 { s.push_str("R"); }
-        if f & 0x08 != 0 { s.push_str("P"); }
-        if f & 0x10 != 0 { s.push_str("A"); }
-        if s.is_empty() { s.push_str("-"); }
+        if f & 0x01 != 0 {
+            s.push_str("F");
+        }
+        if f & 0x02 != 0 {
+            s.push_str("S");
+        }
+        if f & 0x04 != 0 {
+            s.push_str("R");
+        }
+        if f & 0x08 != 0 {
+            s.push_str("P");
+        }
+        if f & 0x10 != 0 {
+            s.push_str("A");
+        }
+        if s.is_empty() {
+            s.push_str("-");
+        }
         s
     } else {
         "?".to_string()
@@ -298,10 +309,12 @@ async fn handle_tcp_packet(
     // Check if this is a reverse-path packet (kernel sending data back
     // through TUN after NAT).
     let is_reverse = match (tun_addr, meta.src_ip) {
-        (IpAddr::V4(tun), IpAddr::V4(src)) =>
-            tun == &src && meta.src_port == listener_port,
-        (IpAddr::V6(tun), IpAddr::V6(src)) =>
-            tun == &src && meta.src_port == listener_port,
+        (IpAddr::V4(tun), IpAddr::V4(src)) => {
+            tun == &src && meta.src_port == listener_port
+        },
+        (IpAddr::V6(tun), IpAddr::V6(src)) => {
+            tun == &src && meta.src_port == listener_port
+        },
         _ => false,
     };
 
@@ -313,11 +326,16 @@ async fn handle_tcp_packet(
             drop(guard); // Release lock before I/O
 
             // Only log connection-level events (SYN/FIN/RST), not every ACK.
-            if tcp_flags.contains('S') || tcp_flags.contains('F') || tcp_flags.contains('R') {
+            if tcp_flags.contains('S')
+                || tcp_flags.contains('F')
+                || tcp_flags.contains('R')
+            {
                 log::debug!(
                     "TUN TCP REV [{tcp_flags}] {src}:{sp} -> {dst}:{dp} | nat_port={nat_port} -> client={client}",
-                    src = meta.src_ip, sp = meta.src_port,
-                    dst = meta.dst_ip, dp = meta.dst_port,
+                    src = meta.src_ip,
+                    sp = meta.src_port,
+                    dst = meta.dst_ip,
+                    dp = meta.dst_port,
                     client = session.client_addr,
                 );
             }
@@ -355,8 +373,10 @@ async fn handle_tcp_packet(
     if meta.dst_ip == *tun_addr && meta.dst_port != listener_port {
         log::debug!(
             "TUN TCP REINJECT [{tcp_flags}] {src}:{sp} -> {dst}:{dp} - dropped (local response)",
-            src = meta.src_ip, sp = meta.src_port,
-            dst = meta.dst_ip, dp = meta.dst_port,
+            src = meta.src_ip,
+            sp = meta.src_port,
+            dst = meta.dst_ip,
+            dp = meta.dst_port,
         );
         return;
     }
@@ -376,8 +396,10 @@ async fn handle_tcp_packet(
         }
         log::debug!(
             "TUN TCP STALE [{tcp_flags}] {src}:{sp} -> {dst}:{dp} - dropped (stale listener)",
-            src = meta.src_ip, sp = meta.src_port,
-            dst = meta.dst_ip, dp = meta.dst_port,
+            src = meta.src_ip,
+            sp = meta.src_port,
+            dst = meta.dst_ip,
+            dp = meta.dst_port,
         );
         return;
     }
@@ -388,11 +410,16 @@ async fn handle_tcp_packet(
     };
 
     // Only log connection-level events (SYN/FIN/RST), not every ACK.
-    if tcp_flags.contains('S') || tcp_flags.contains('F') || tcp_flags.contains('R') {
+    if tcp_flags.contains('S')
+        || tcp_flags.contains('F')
+        || tcp_flags.contains('R')
+    {
         log::debug!(
             "TUN TCP FWD [{tcp_flags}] {src}:{sp} -> {dst}:{dp} | nat_port={nat_port}",
-            src = meta.src_ip, sp = meta.src_port,
-            dst = meta.dst_ip, dp = meta.dst_port,
+            src = meta.src_ip,
+            sp = meta.src_port,
+            dst = meta.dst_ip,
+            dp = meta.dst_port,
         );
     }
 
@@ -534,7 +561,7 @@ async fn handle_udp_packet(
 
     let initial_destination = if let Some(ref rev) = *reverse_dns {
         match meta.dst_ip {
-            IpAddr::V4(v4) =>
+            IpAddr::V4(v4) => {
                 if let Some(domain) = rev.lookup_ipv4(v4).await {
                     Destination::with_resolved(
                         Address::Domain(domain),
@@ -552,8 +579,9 @@ async fn handle_udp_packet(
                         }
                     }
                     Destination::new(ip_to_address(meta.dst_ip), meta.dst_port)
-                },
-            IpAddr::V6(v6) =>
+                }
+            },
+            IpAddr::V6(v6) => {
                 if let Some(domain) = rev.lookup_ipv6(v6).await {
                     Destination::with_resolved(
                         Address::Domain(domain),
@@ -562,7 +590,8 @@ async fn handle_udp_packet(
                     )
                 } else {
                     Destination::new(ip_to_address(meta.dst_ip), meta.dst_port)
-                },
+                }
+            },
         }
     } else {
         Destination::new(ip_to_address(meta.dst_ip), meta.dst_port)
@@ -578,10 +607,13 @@ async fn handle_udp_packet(
 
     if conn_tx.try_send(conn).is_ok() {
         // Insert session entry only after conn_tx accepted it.
-        sessions.sessions.insert(key, UdpSession {
-            tx: packet_tx,
-            last_activity: Instant::now(),
-        });
+        sessions.sessions.insert(
+            key,
+            UdpSession {
+                tx: packet_tx,
+                last_activity: Instant::now(),
+            },
+        );
         false
     } else {
         // Channel full — system under load (fd exhaustion, outbound failures).
@@ -708,22 +740,24 @@ impl PacketRelay for TunUdpSessionRelay {
         &mut self, buf: &[u8], _dest: &Destination,
     ) -> std::io::Result<()> {
         let raw = match (self.resp_src_ip, self.resp_dst_ip) {
-            (IpAddr::V4(src), IpAddr::V4(dst)) =>
+            (IpAddr::V4(src), IpAddr::V4(dst)) => {
                 packet::build_udp_response_ipv4(
                     src,
                     self.resp_src_port,
                     dst,
                     self.resp_dst_port,
                     buf,
-                ),
-            (IpAddr::V6(src), IpAddr::V6(dst)) =>
+                )
+            },
+            (IpAddr::V6(src), IpAddr::V6(dst)) => {
                 packet::build_udp_response_ipv6(
                     src,
                     self.resp_src_port,
                     dst,
                     self.resp_dst_port,
                     buf,
-                ),
+                )
+            },
             _ => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
@@ -742,21 +776,32 @@ impl PacketRelay for TunUdpSessionRelay {
     async fn send_port_unreachable(&mut self) -> std::io::Result<()> {
         log::debug!(
             "TUN: injecting ICMP port-unreachable for udp/{} {}:{} -> {}:{}",
-            self.resp_src_port, self.resp_dst_ip, self.resp_dst_port,
-            self.resp_src_ip, self.resp_src_port,
+            self.resp_src_port,
+            self.resp_dst_ip,
+            self.resp_dst_port,
+            self.resp_src_ip,
+            self.resp_src_port,
         );
         // Build an ICMP port-unreachable sourced from the server (resp_src)
         // and addressed to the client (resp_dst), embedding the original
         // UDP 5-tuple so the client's QUIC stack aborts and falls back to TCP.
         let raw = match (self.resp_dst_ip, self.resp_src_ip) {
-            (IpAddr::V4(app), IpAddr::V4(srv)) =>
+            (IpAddr::V4(app), IpAddr::V4(srv)) => {
                 packet::build_icmp_port_unreachable_ipv4(
-                    app, self.resp_dst_port, srv, self.resp_src_port,
-                ),
-            (IpAddr::V6(app), IpAddr::V6(srv)) =>
+                    app,
+                    self.resp_dst_port,
+                    srv,
+                    self.resp_src_port,
+                )
+            },
+            (IpAddr::V6(app), IpAddr::V6(srv)) => {
                 packet::build_icmp_port_unreachable_ipv6(
-                    app, self.resp_dst_port, srv, self.resp_src_port,
-                ),
+                    app,
+                    self.resp_dst_port,
+                    srv,
+                    self.resp_src_port,
+                )
+            },
             _ => return Ok(()),
         };
         self.writer.write(&raw).await?;

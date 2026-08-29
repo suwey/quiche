@@ -14,9 +14,9 @@ use std::sync::Mutex;
 #[cfg(target_os = "linux")]
 use std::sync::atomic::Ordering;
 
+use tokio::sync::Notify;
 use tokio::sync::broadcast;
 use tokio::sync::mpsc;
-use tokio::sync::Notify;
 
 use crate::cache::{StatusEvent, StatusSink};
 use crate::command::StateEvent;
@@ -27,10 +27,10 @@ use crate::rules::Rules;
 use crate::ui::log::LogMsg;
 use crate::ui::state::AppStats;
 
-#[cfg(target_os = "linux")]
-use crate::inbound::tun::TunRouteManager;
 #[cfg(target_os = "macos")]
 use crate::inbound::tun::MacosTunManager;
+#[cfg(target_os = "linux")]
+use crate::inbound::tun::TunRouteManager;
 #[cfg(target_os = "windows")]
 use crate::inbound::tun::WindowsTunManager;
 
@@ -101,8 +101,8 @@ impl AppContext {
         logs_tx: broadcast::Sender<LogMsg>, start_cmd: Option<String>,
         outbound_tags: Vec<(String, String)>,
         urltest_states: HashMap<String, Arc<UrlTestState>>,
-        cache: Arc<crate::cache::CacheStore>,
-        cmd_tx: mpsc::Sender<UiCommand>, event_tx: broadcast::Sender<StateEvent>,
+        cache: Arc<crate::cache::CacheStore>, cmd_tx: mpsc::Sender<UiCommand>,
+        event_tx: broadcast::Sender<StateEvent>,
     ) -> Self {
         Self {
             registry,
@@ -185,7 +185,8 @@ impl AppContext {
         let mgr = self.tun_mgr.as_ref().ok_or("TUN manager not available")?;
         let mut mgr = mgr.lock().map_err(|e| e.to_string())?;
         let auto_hijack = mgr.auto_hijack;
-        mgr.enable_tun_capture(auto_hijack).map_err(|e| e.to_string())?;
+        mgr.enable_tun_capture(auto_hijack)
+            .map_err(|e| e.to_string())?;
         Ok(())
     }
 
@@ -234,17 +235,29 @@ impl AppContext {
 
     // Android + other platforms: TUN routing toggle not supported
     // (Android uses VpnService; toggle requires re-establish).
-    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "windows"
+    )))]
     pub fn tun_routing_enable(&self) -> Result<(), String> {
         Err("TUN routing toggle is not supported on this platform".into())
     }
 
-    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "windows"
+    )))]
     pub fn tun_routing_disable(&self) -> Result<(), String> {
         Err("TUN routing toggle is not supported on this platform".into())
     }
 
-    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "windows"
+    )))]
     pub fn tun_routing_enabled(&self) -> bool {
         false
     }

@@ -17,10 +17,10 @@ use tokio::sync::mpsc;
 use crate::config::OutboundConfig;
 use crate::inbound::Destination;
 use crate::outbound::OutboundClient;
+use crate::outbound::common::TlsStream;
 use crate::outbound::common::connect_tcp_bypass_sync;
 use crate::outbound::common::create_tls_stream;
 use crate::outbound::common::resolve_sni;
-use crate::outbound::common::TlsStream;
 use crate::protocol::anytls as proto;
 use crate::relay::PacketRelay;
 use crate::relay::StreamRelay;
@@ -146,11 +146,14 @@ impl SessionHandle {
         let received_any = Arc::new(AtomicBool::new(false));
         let error: Arc<StdMutex<Option<String>>> = Arc::new(StdMutex::new(None));
 
-        self.inner.streams.lock().unwrap().insert(sid, IoThread {
-            data_tx,
-            received_any: received_any.clone(),
-            error: error.clone(),
-        });
+        self.inner.streams.lock().unwrap().insert(
+            sid,
+            IoThread {
+                data_tx,
+                received_any: received_any.clone(),
+                error: error.clone(),
+            },
+        );
 
         self.inner.active_streams.fetch_add(1, SeqCst);
 
@@ -216,7 +219,7 @@ impl StreamHandle {
                 }
                 Ok(n)
             },
-            None =>
+            None => {
                 if let Some(msg) = self.error.lock().unwrap().take() {
                     Err(std::io::Error::new(
                         std::io::ErrorKind::ConnectionRefused,
@@ -224,7 +227,8 @@ impl StreamHandle {
                     ))
                 } else {
                     Ok(0)
-                },
+                }
+            },
         }
     }
 
@@ -328,6 +332,7 @@ impl SessionPool {
     /// Get a live session from the pool, or create one via `factory`.
     /// Max concurrent streams multiplexed onto one session before we open a
     /// fresh one. Bounds head-of-line blocking without defeating reuse.
+    /// NOTE: Hardcoded - not configurable via TOML.
     const MAX_STREAMS_PER_SESSION: u32 = 16;
 
     /// Get a live session from the pool, or create one via `factory`.
@@ -346,8 +351,8 @@ impl SessionPool {
         // Prefer the highest-Seq live session that still has headroom.
         let mut best: Option<usize> = None;
         for (i, entry) in entries.iter().enumerate() {
-            if entry.handle.inner.active_streams.load(SeqCst) >=
-                Self::MAX_STREAMS_PER_SESSION
+            if entry.handle.inner.active_streams.load(SeqCst)
+                >= Self::MAX_STREAMS_PER_SESSION
             {
                 continue;
             }
@@ -399,8 +404,8 @@ impl SessionPool {
                 continue;
             }
             if let Some(idle) = entry.idle_since {
-                if now.duration_since(idle) >= self.config.idle_timeout &&
-                    alive > self.config.min_idle
+                if now.duration_since(idle) >= self.config.idle_timeout
+                    && alive > self.config.min_idle
                 {
                     log::debug!(
                         "anytls pool: removing idle session ({:.0?} idle)",
@@ -444,8 +449,8 @@ impl SessionPool {
 
         // Mark any in-use sessions that became idle.
         for entry in entries.iter_mut() {
-            if entry.idle_since.is_none() &&
-                entry.handle.inner.active_streams.load(SeqCst) == 0
+            if entry.idle_since.is_none()
+                && entry.handle.inner.active_streams.load(SeqCst) == 0
             {
                 entry.idle_since = Some(std::time::Instant::now());
             }
@@ -613,7 +618,8 @@ fn handle_blocking_frame(
 }
 
 fn run_io_loop(
-    mut stream: TlsStream, inner: &SessionInner,
+    mut stream: TlsStream,
+    inner: &SessionInner,
     mut control_rx: mpsc::UnboundedReceiver<ControlFrame>,
     mut outbound_rx: mpsc::UnboundedReceiver<OutboundMsg>,
     padding_cache: Arc<StdMutex<PaddingCache>>,
@@ -735,8 +741,8 @@ fn run_io_loop(
                 );
             },
             Err(ref e)
-                if e.kind() == std::io::ErrorKind::WouldBlock ||
-                    e.kind() == std::io::ErrorKind::TimedOut =>
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
             {
                 // Do NOT send a heartbeat before the mandatory settings+
                 // first-SYN packet (#1) has gone out, or it would steal that
@@ -791,7 +797,7 @@ impl AnyTlsOutboundClient {
         let padding_cache = Arc::new(StdMutex::new(PaddingCache::from_default()));
 
         let fragment = if config.tls_fragment {
-            Some(FragmentConfig::default())
+            Some(config.tls_fragment_config.clone().unwrap_or_default())
         } else {
             None
         };
@@ -932,14 +938,15 @@ impl AnyTlsOutboundClient {
                     return;
                 },
             };
-            let mut stream = match create_tls_stream(tcp, &sni, fp, insecure, frag.as_ref()) {
-                Ok(s) => s,
-                Err(e) => {
-                    log::error!("anytls tls: {e}");
-                    inner_clone.closed.store(true, SeqCst);
-                    return;
-                },
-            };
+            let mut stream =
+                match create_tls_stream(tcp, &sni, fp, insecure, frag.as_ref()) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        log::error!("anytls tls: {e}");
+                        inner_clone.closed.store(true, SeqCst);
+                        return;
+                    },
+                };
             log::debug!("anytls TLS OK");
 
             // Auth
@@ -1021,7 +1028,6 @@ impl OutboundClient for AnyTlsOutboundClient {
         s.write(&req).await?;
         Ok(Box::new(UotPacketRelay::new(s)))
     }
-
 }
 
 impl Drop for AnyTlsOutboundClient {

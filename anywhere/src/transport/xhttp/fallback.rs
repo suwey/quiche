@@ -55,7 +55,7 @@ impl FallbackState {
                 self.h3_failed = true;
                 self.current = HttpVersionPref::Http2;
                 true
-            }
+            },
             _ => false,
         }
     }

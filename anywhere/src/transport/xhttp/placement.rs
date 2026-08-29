@@ -28,10 +28,7 @@ impl PlacementConfig {
     /// Returns `(url, extra_headers)` where `extra_headers` is a list of
     /// `(name, value)` pairs to add to the HTTP request.
     pub fn build_request_meta(
-        &self,
-        base_path: &str,
-        session_id: &str,
-        seq: Option<u64>,
+        &self, base_path: &str, session_id: &str, seq: Option<u64>,
     ) -> (String, Vec<(String, String)>) {
         let mut path = base_path.trim_end_matches('/').to_string();
         if path.is_empty() {
@@ -46,16 +43,19 @@ impl PlacementConfig {
             SessionPlacement::Path => {
                 path.push('/');
                 path.push_str(session_id);
-            }
+            },
             SessionPlacement::Query => {
-                query_parts.push(format!("{}={}", self.session_id_key, session_id));
-            }
+                query_parts
+                    .push(format!("{}={}", self.session_id_key, session_id));
+            },
             SessionPlacement::Header => {
-                headers.push((self.session_id_key.clone(), session_id.to_string()));
-            }
+                headers
+                    .push((self.session_id_key.clone(), session_id.to_string()));
+            },
             SessionPlacement::Cookie => {
-                cookie_parts.push(format!("{}={}", self.session_id_key, session_id));
-            }
+                cookie_parts
+                    .push(format!("{}={}", self.session_id_key, session_id));
+            },
         }
 
         // seq placement (only for packet-up / stream-up, not stream-one)
@@ -64,16 +64,16 @@ impl PlacementConfig {
                 SessionPlacement::Path => {
                     path.push('/');
                     path.push_str(&seq.to_string());
-                }
+                },
                 SessionPlacement::Query => {
                     query_parts.push(format!("{}={}", self.seq_key, seq));
-                }
+                },
                 SessionPlacement::Header => {
                     headers.push((self.seq_key.clone(), seq.to_string()));
-                }
+                },
                 SessionPlacement::Cookie => {
                     cookie_parts.push(format!("{}={}", self.seq_key, seq));
-                }
+                },
             }
         }
 
@@ -98,28 +98,26 @@ impl PlacementConfig {
 /// Looks in path, query, header, or cookie depending on `placement`.
 // M5: server-side
 pub fn extract_session_id(
-    path: &str,
-    query: &str,
-    headers: &http::HeaderMap,
-    placement: SessionPlacement,
-    key: &str,
+    path: &str, query: &str, headers: &http::HeaderMap,
+    placement: SessionPlacement, key: &str,
 ) -> Option<String> {
     match placement {
         SessionPlacement::Path => {
             // session_id is the last path segment
-            path.trim_end_matches('/').rsplit('/').next().map(|s| s.to_string())
-        }
-        SessionPlacement::Query => {
-            extract_query_value(query, key)
-        }
-        SessionPlacement::Header => {
-            headers.get(key).and_then(|v| v.to_str().ok()).map(|s| s.to_string())
-        }
-        SessionPlacement::Cookie => {
-            headers.get("cookie")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|c| extract_cookie_value(c, key))
-        }
+            path.trim_end_matches('/')
+                .rsplit('/')
+                .next()
+                .map(|s| s.to_string())
+        },
+        SessionPlacement::Query => extract_query_value(query, key),
+        SessionPlacement::Header => headers
+            .get(key)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string()),
+        SessionPlacement::Cookie => headers
+            .get("cookie")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|c| extract_cookie_value(c, key)),
     }
 }
 
@@ -194,7 +192,10 @@ mod tests {
         };
         let (url, headers) = cfg.build_request_meta("/xhttp", "abc123", None);
         assert_eq!(url, "/xhttp");
-        assert_eq!(headers, vec![("X-Session".to_string(), "abc123".to_string())]);
+        assert_eq!(
+            headers,
+            vec![("X-Session".to_string(), "abc123".to_string())]
+        );
     }
 
     #[test]
@@ -206,7 +207,10 @@ mod tests {
         };
         let (url, headers) = cfg.build_request_meta("/xhttp", "abc123", None);
         assert_eq!(url, "/xhttp");
-        assert_eq!(headers, vec![("Cookie".to_string(), "session=abc123".to_string())]);
+        assert_eq!(
+            headers,
+            vec![("Cookie".to_string(), "session=abc123".to_string())]
+        );
     }
 
     #[test]
@@ -232,7 +236,10 @@ mod tests {
         };
         let (url, headers) = cfg.build_request_meta("/xhttp", "abc123", Some(42));
         assert_eq!(url, "/xhttp");
-        assert_eq!(headers, vec![("Cookie".to_string(), "session=abc123; seq=42".to_string())]);
+        assert_eq!(
+            headers,
+            vec![("Cookie".to_string(), "session=abc123; seq=42".to_string())]
+        );
     }
 
     #[test]
@@ -245,14 +252,26 @@ mod tests {
     #[test]
     fn extract_session_id_from_path() {
         let headers = http::HeaderMap::new();
-        let id = extract_session_id("/xhttp/abc123", "", &headers, SessionPlacement::Path, "session");
+        let id = extract_session_id(
+            "/xhttp/abc123",
+            "",
+            &headers,
+            SessionPlacement::Path,
+            "session",
+        );
         assert_eq!(id, Some("abc123".to_string()));
     }
 
     #[test]
     fn extract_session_id_from_query() {
         let headers = http::HeaderMap::new();
-        let id = extract_session_id("/xhttp", "session=abc123", &headers, SessionPlacement::Query, "session");
+        let id = extract_session_id(
+            "/xhttp",
+            "session=abc123",
+            &headers,
+            SessionPlacement::Query,
+            "session",
+        );
         assert_eq!(id, Some("abc123".to_string()));
     }
 
@@ -260,7 +279,13 @@ mod tests {
     fn extract_session_id_from_header() {
         let mut headers = http::HeaderMap::new();
         headers.insert("session", "abc123".parse().unwrap());
-        let id = extract_session_id("/xhttp", "", &headers, SessionPlacement::Header, "session");
+        let id = extract_session_id(
+            "/xhttp",
+            "",
+            &headers,
+            SessionPlacement::Header,
+            "session",
+        );
         assert_eq!(id, Some("abc123".to_string()));
     }
 
@@ -268,7 +293,13 @@ mod tests {
     fn extract_session_id_from_cookie() {
         let mut headers = http::HeaderMap::new();
         headers.insert("cookie", "session=abc123; other=xyz".parse().unwrap());
-        let id = extract_session_id("/xhttp", "", &headers, SessionPlacement::Cookie, "session");
+        let id = extract_session_id(
+            "/xhttp",
+            "",
+            &headers,
+            SessionPlacement::Cookie,
+            "session",
+        );
         assert_eq!(id, Some("abc123".to_string()));
     }
 }

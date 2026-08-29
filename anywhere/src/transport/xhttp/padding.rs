@@ -56,9 +56,7 @@ impl XPaddingMiddleware {
     ///
     /// Padding placement is configured via `placement`, `key`, and `header`.
     pub fn apply_to_request_mut(
-        &self,
-        url: &mut String,
-        headers: &mut Vec<(String, String)>,
+        &self, url: &mut String, headers: &mut Vec<(String, String)>,
     ) {
         let padding = self.generate_padding();
         if padding.is_empty() {
@@ -78,22 +76,26 @@ impl XPaddingMiddleware {
             match self.config.placement {
                 XPaddingPlacement::Header => {
                     headers.push((self.config.header.clone(), padding));
-                }
+                },
                 XPaddingPlacement::Cookie => {
                     headers.push((
                         "Cookie".to_string(),
                         format!("{}={}", self.config.key, padding),
                     ));
-                }
+                },
                 XPaddingPlacement::Query => {
                     // ✅ Append padding directly to URL query string
                     let sep = if url.contains('?') { '&' } else { '?' };
-                    url.push_str(&format!("{}{}={}", sep, self.config.key, padding));
-                }
+                    url.push_str(&format!(
+                        "{}{}={}",
+                        sep, self.config.key, padding
+                    ));
+                },
                 XPaddingPlacement::QueryInHeader => {
-                    let header_value = format!("{}?{}={}", url, self.config.key, padding);
+                    let header_value =
+                        format!("{}?{}={}", url, self.config.key, padding);
                     headers.push((self.config.header.clone(), header_value));
-                }
+                },
             }
         }
     }
@@ -103,9 +105,7 @@ impl XPaddingMiddleware {
     /// Query placement is not effective in this mode (falls back to header).
     /// Prefer [`apply_to_request_mut`] when the URL can be mutated.
     pub fn apply_to_request(
-        &self,
-        url: &str,
-        headers: &mut Vec<(String, String)>,
+        &self, url: &str, headers: &mut Vec<(String, String)>,
     ) {
         let mut url_owned = url.to_string();
         self.apply_to_request_mut(&mut url_owned, headers);
@@ -149,7 +149,9 @@ impl XPaddingMiddleware {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::obfuscation::padding::{PaddingMethod, XPaddingConfig, XPaddingPlacement};
+    use crate::obfuscation::padding::{
+        PaddingMethod, XPaddingConfig, XPaddingPlacement,
+    };
     use crate::obfuscation::range::Range;
 
     #[test]
@@ -186,7 +188,10 @@ mod tests {
 
         let padding = headers.iter().find(|(k, _)| k == "X-Padding");
         assert!(padding.is_some(), "X-Padding header should be present");
-        assert!(!padding.unwrap().1.is_empty(), "Padding value should not be empty");
+        assert!(
+            !padding.unwrap().1.is_empty(),
+            "Padding value should not be empty"
+        );
     }
 
     #[test]

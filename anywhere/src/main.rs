@@ -2,8 +2,8 @@
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+use anywhere::runner::{RunOptions, run};
 use clap::Parser;
-use anywhere::runner::{run, RunOptions};
 
 // ---------------------------------------------------------------------------
 // CLI
@@ -90,7 +90,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 std::env::consts::OS
             )
         });
-        anywhere::subscription::run_subscription(sub_url, &ua, &args.sub_out).await?;
+        anywhere::subscription::run_subscription(sub_url, &ua, &args.sub_out)
+            .await?;
         return Ok(());
     }
 
@@ -105,10 +106,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     loop {
         run(opts.clone()).await?;
-        if !anywhere::runner::RESTART_REQUESTED.swap(
-            false,
-            std::sync::atomic::Ordering::SeqCst,
-        ) {
+        if !anywhere::runner::RESTART_REQUESTED
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
             break;
         }
         log::info!("In-process restart: re-running run()");

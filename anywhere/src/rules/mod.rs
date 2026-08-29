@@ -5,9 +5,9 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU8;
 use std::sync::atomic::Ordering;
 
+use crate::cache::{NoticeLevel, StatusEvent, StatusSink};
 use crate::config::OutboundConfig;
 use crate::config::RuleConfig;
-use crate::cache::{StatusEvent, StatusSink, NoticeLevel};
 use crate::inbound::Address;
 use crate::inbound::Destination;
 use crate::inbound::Network;
@@ -39,25 +39,25 @@ pub use geo::read_srs_bytes;
 ///
 /// When updating this list, all consumers are updated automatically.
 pub const PRIVATE_V4_CIDRS: &[&str] = &[
-    "10.0.0.0/8",           // RFC1918 private
-    "17.0.0.0/8",           // Apple internal
-    "100.64.0.0/10",        // CGNAT (RFC6598)
-    "127.0.0.0/8",          // Loopback
-    "169.254.0.0/16",       // Link-local
-    "172.16.0.0/12",        // RFC1918 private
-    "192.168.0.0/16",       // RFC1918 private
-    "224.0.0.0/4",          // Multicast
-    "0.0.0.0/8",            // Unspecified
-    "255.255.255.255/32",  // Broadcast
+    "10.0.0.0/8",         // RFC1918 private
+    "17.0.0.0/8",         // Apple internal
+    "100.64.0.0/10",      // CGNAT (RFC6598)
+    "127.0.0.0/8",        // Loopback
+    "169.254.0.0/16",     // Link-local
+    "172.16.0.0/12",      // RFC1918 private
+    "192.168.0.0/16",     // RFC1918 private
+    "224.0.0.0/4",        // Multicast
+    "0.0.0.0/8",          // Unspecified
+    "255.255.255.255/32", // Broadcast
 ];
 
 /// Private/internal IPv6 CIDR ranges.
 pub const PRIVATE_V6_CIDRS: &[&str] = &[
-    "::1/128",    // Loopback
-    "fc00::/7",   // Unique local (ULA)
-    "fe80::/10",  // Link-local
-    "ff00::/8",   // Multicast
-    "::/128",     // Unspecified
+    "::1/128",   // Loopback
+    "fc00::/7",  // Unique local (ULA)
+    "fe80::/10", // Link-local
+    "ff00::/8",  // Multicast
+    "::/128",    // Unspecified
 ];
 
 /// All private/internal CIDR ranges (v4 + v6) as a single combined slice.
@@ -185,10 +185,7 @@ impl Rule {
                     },
                 })
                 .collect();
-            parts.push(format!(
-                "protocol={}",
-                proto_strs.join("|")
-            ));
+            parts.push(format!("protocol={}", proto_strs.join("|")));
         }
 
         if parts.is_empty() {
@@ -364,9 +361,14 @@ impl Rules {
                         geo_sets.push(Arc::new(geo_set));
                     },
                     None => {
-                        let msg = format!("Geo rule set {url} failed to load — traffic will fall through to catch-all rule");
+                        let msg = format!(
+                            "Geo rule set {url} failed to load — traffic will fall through to catch-all rule"
+                        );
                         log::warn!("{msg}");
-                        sink.emit(StatusEvent::Notice { level: NoticeLevel::Warning, msg });
+                        sink.emit(StatusEvent::Notice {
+                            level: NoticeLevel::Warning,
+                            msg,
+                        });
                         continue;
                     },
                 }
@@ -573,10 +575,10 @@ impl Rules {
             return geo.matches(dest, network);
         }
 
-        let host_matchers_present = rule.domain.is_some() ||
-            rule.domain_suffix.is_some() ||
-            rule.domain_keyword.is_some() ||
-            rule.ip_cidr.is_some();
+        let host_matchers_present = rule.domain.is_some()
+            || rule.domain_suffix.is_some()
+            || rule.domain_keyword.is_some()
+            || rule.ip_cidr.is_some();
 
         if host_matchers_present && !Self::host_matches(&dest.address, rule) {
             return false;
@@ -686,7 +688,6 @@ fn parse_network(s: &str) -> Option<Network> {
     }
 }
 
-
 /// Builds a bitmask with the top `prefix` bits set for an IPv4 address.
 fn v4_prefix_mask(prefix: u8) -> u32 {
     if prefix == 0 {
@@ -734,7 +735,10 @@ mod tests {
                     domain_keyword: c.domain_keyword.clone(),
                     ip_cidr: c.ip_cidr.clone(),
                     port: c.port,
-                    port_range: c.port_range.as_deref().and_then(parse_port_range),
+                    port_range: c
+                        .port_range
+                        .as_deref()
+                        .and_then(parse_port_range),
                     network: c.network.as_deref().and_then(parse_network),
                     protocol: proto_matches,
                     outbound_tag: c.outbound.clone(),
@@ -1220,7 +1224,8 @@ mod tests {
 
     #[test]
     fn protocol_sniff_ssh_matches() {
-        let rules = Rules::from_config_sync(&[proto_rule("sniff:ssh", "ssh-proxy")]);
+        let rules =
+            Rules::from_config_sync(&[proto_rule("sniff:ssh", "ssh-proxy")]);
         let sniff = SniffInfo {
             domain: None,
             protocol: Some("ssh".into()),

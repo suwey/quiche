@@ -167,9 +167,7 @@ impl<T: Read + Write> WsConn<T> {
                 Ok(n) => {
                     self.recv_buf.extend_from_slice(&tmp[..n]);
                 },
-                Err(e)
-                    if e.kind() == ErrorKind::Interrupted =>
-                {
+                Err(e) if e.kind() == ErrorKind::Interrupted => {
                     continue;
                 },
                 Err(e) => return Err(e),
@@ -420,7 +418,9 @@ pub struct WsConnAsync<T: AsyncRead + AsyncWrite + Unpin> {
 impl<T: AsyncRead + AsyncWrite + Unpin> WsConnAsync<T> {
     /// Send a raw WebSocket frame with the given opcode.
     /// Client frames are always masked.
-    async fn send_frame(&mut self, opcode: u8, payload: &[u8]) -> std::io::Result<()> {
+    async fn send_frame(
+        &mut self, opcode: u8, payload: &[u8],
+    ) -> std::io::Result<()> {
         let frame = encode_frame(opcode, payload);
         self.inner.write_all(&frame).await?;
         self.inner.flush().await?;
@@ -691,17 +691,30 @@ impl<R: AsyncRead + Unpin> WsConnAsyncReader<R> {
             let masked = (b1 & 0x80) != 0;
             let mut payload_len = (b1 & 0x7F) as u64;
 
-            let ext_size: usize = if payload_len == 126 { 2 } else if payload_len == 127 { 8 } else { 0 };
+            let ext_size: usize = if payload_len == 126 {
+                2
+            } else if payload_len == 127 {
+                8
+            } else {
+                0
+            };
             let after_ext = 2 + ext_size;
             self.ensure_bytes(after_ext).await?;
 
             if payload_len == 126 {
-                payload_len = u16::from_be_bytes([self.recv_buf[2], self.recv_buf[3]]) as u64;
+                payload_len =
+                    u16::from_be_bytes([self.recv_buf[2], self.recv_buf[3]])
+                        as u64;
             } else if payload_len == 127 {
                 payload_len = u64::from_be_bytes([
-                    self.recv_buf[2], self.recv_buf[3], self.recv_buf[4],
-                    self.recv_buf[5], self.recv_buf[6], self.recv_buf[7],
-                    self.recv_buf[8], self.recv_buf[9],
+                    self.recv_buf[2],
+                    self.recv_buf[3],
+                    self.recv_buf[4],
+                    self.recv_buf[5],
+                    self.recv_buf[6],
+                    self.recv_buf[7],
+                    self.recv_buf[8],
+                    self.recv_buf[9],
                 ]);
             }
 
@@ -728,13 +741,13 @@ impl<R: AsyncRead + Unpin> WsConnAsyncReader<R> {
                         ));
                     }
                     return Ok(WsFrame::Binary(payload));
-                }
+                },
                 0x08 => {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::ConnectionAborted,
                         "received close frame",
                     ));
-                }
+                },
                 0x09 => return Ok(WsFrame::Ping(payload)),
                 0x0A => continue, // Pong: ignore
                 _ => {
@@ -742,7 +755,7 @@ impl<R: AsyncRead + Unpin> WsConnAsyncReader<R> {
                         std::io::ErrorKind::InvalidData,
                         format!("unknown WebSocket opcode {opcode:#x}"),
                     ));
-                }
+                },
             }
         }
     }
@@ -772,7 +785,9 @@ pub(crate) struct WsConnAsyncWriter<W: AsyncWrite + Unpin> {
 }
 
 impl<W: AsyncWrite + Unpin> WsConnAsyncWriter<W> {
-    async fn send_frame(&mut self, opcode: u8, payload: &[u8]) -> std::io::Result<()> {
+    async fn send_frame(
+        &mut self, opcode: u8, payload: &[u8],
+    ) -> std::io::Result<()> {
         let frame = encode_frame(opcode, payload);
         self.inner.write_all(&frame).await?;
         self.inner.flush().await?;
@@ -787,13 +802,17 @@ impl<W: AsyncWrite + Unpin> WsConnAsyncWriter<W> {
         self.send_frame(0x08, &[]).await
     }
 
-    pub(crate) async fn send_pong(&mut self, payload: &[u8]) -> std::io::Result<()> {
+    pub(crate) async fn send_pong(
+        &mut self, payload: &[u8],
+    ) -> std::io::Result<()> {
         self.send_frame(0x0A, payload).await
     }
 }
 
 /// Async line reader — reads one HTTP header line (terminated by \r\n).
-async fn read_line_async<T: AsyncRead + Unpin>(r: &mut T) -> std::io::Result<String> {
+async fn read_line_async<T: AsyncRead + Unpin>(
+    r: &mut T,
+) -> std::io::Result<String> {
     let mut line = Vec::new();
     let mut byte = [0u8; 1];
     loop {
@@ -812,7 +831,10 @@ async fn read_line_async<T: AsyncRead + Unpin>(r: &mut T) -> std::io::Result<Str
         }
     }
     String::from_utf8(line).map_err(|_| {
-        std::io::Error::new(std::io::ErrorKind::InvalidData, "non-utf8 HTTP header line")
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "non-utf8 HTTP header line",
+        )
     })
 }
 
@@ -1127,11 +1149,11 @@ mod tests {
 //   `WsConnAsync::recv_buf`, socket buffer is not consumed until a full
 //   frame is decoded
 
+use crate::transport::{DownlinkReader, TransportSession, UplinkWriter};
+use async_trait::async_trait;
 use std::collections::VecDeque;
 use std::io;
-use async_trait::async_trait;
 use tokio::sync::mpsc;
-use crate::transport::{TransportSession, UplinkWriter, DownlinkReader};
 
 /// Buffer size for the uplink/downlink channels.
 const WS_CHANNEL_SIZE: usize = 256;
@@ -1156,7 +1178,8 @@ pub struct WsTransportSession {
 impl WsTransportSession {
     pub(crate) fn new(ws: crate::outbound::vless::WsStreamAsync) -> Self {
         let (uplink_tx, uplink_rx) = mpsc::channel::<Vec<u8>>(WS_CHANNEL_SIZE);
-        let (downlink_tx, downlink_rx) = mpsc::channel::<Vec<u8>>(WS_CHANNEL_SIZE);
+        let (downlink_tx, downlink_rx) =
+            mpsc::channel::<Vec<u8>>(WS_CHANNEL_SIZE);
         let (pong_tx, pong_rx) = mpsc::channel::<Vec<u8>>(8);
 
         let (reader, writer) = ws.into_split();
@@ -1180,8 +1203,7 @@ impl WsTransportSession {
 /// Ping frames are forwarded to the write task via `pong_tx`.
 async fn ws_read_loop(
     mut reader: crate::outbound::vless::WsStreamAsyncReader,
-    downlink_tx: mpsc::Sender<Vec<u8>>,
-    pong_tx: mpsc::Sender<Vec<u8>>,
+    downlink_tx: mpsc::Sender<Vec<u8>>, pong_tx: mpsc::Sender<Vec<u8>>,
 ) {
     loop {
         match reader.recv().await {
@@ -1190,15 +1212,15 @@ async fn ws_read_loop(
                     // Downlink receiver dropped — no point continuing
                     break;
                 }
-            }
+            },
             Ok(crate::transport::ws::WsFrame::Ping(p)) => {
                 // Forward ping payload to write task for pong response
                 let _ = pong_tx.send(p).await;
-            }
+            },
             Err(e) => {
                 log::debug!("ws read task: recv error: {e}");
                 break;
-            }
+            },
         }
     }
     log::debug!("ws read task exited");
@@ -1211,8 +1233,7 @@ async fn ws_read_loop(
 /// Also handles pong responses for ping frames received by the read task.
 async fn ws_write_loop(
     mut writer: crate::outbound::vless::WsStreamAsyncWriter,
-    mut uplink_rx: mpsc::Receiver<Vec<u8>>,
-    mut pong_rx: mpsc::Receiver<Vec<u8>>,
+    mut uplink_rx: mpsc::Receiver<Vec<u8>>, mut pong_rx: mpsc::Receiver<Vec<u8>>,
 ) {
     loop {
         tokio::select! {
@@ -1308,11 +1329,11 @@ impl DownlinkReader for WsDownlinkReader {
                     self.recv_buf.extend(&data[n..]);
                 }
                 Ok(n)
-            }
+            },
             None => {
                 // Channel closed — background task exited (EOF or error)
                 Ok(0)
-            }
+            },
         }
     }
 }
@@ -1326,10 +1347,9 @@ impl TransportSession for WsTransportSession {
     }
 
     async fn downlink(&mut self) -> io::Result<Box<dyn DownlinkReader>> {
-        let rx = self
-            .downlink_rx
-            .take()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "downlink already taken"))?;
+        let rx = self.downlink_rx.take().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::Other, "downlink already taken")
+        })?;
         Ok(Box::new(WsDownlinkReader {
             rx,
             recv_buf: VecDeque::new(),
@@ -1367,9 +1387,11 @@ pub struct WsTransportFactory;
 #[async_trait]
 impl TransportFactory for WsTransportFactory {
     async fn create(
-        &self,
-        ctx: &TransportContext,
-    ) -> std::result::Result<Box<dyn crate::transport::TransportSession>, TransportError> {
+        &self, ctx: &TransportContext,
+    ) -> std::result::Result<
+        Box<dyn crate::transport::TransportSession>,
+        TransportError,
+    > {
         let addr_str = format!("{}:{}", ctx.server, ctx.port);
         let addr = crate::outbound::common::resolve_addr(&addr_str)
             .map_err(|e| TransportError::Connect(e))?;

@@ -24,7 +24,7 @@ pub fn serialize_socks_addr(dest: &Destination) -> Vec<u8> {
         Address::Ipv4(ip) => {
             buf.push(0x01);
             buf.extend_from_slice(ip);
-        }
+        },
         Address::Domain(domain) => {
             let bytes = domain.as_bytes();
             if bytes.len() > u8::MAX as usize {
@@ -37,11 +37,11 @@ pub fn serialize_socks_addr(dest: &Destination) -> Vec<u8> {
             buf.push(0x03);
             buf.push(bytes.len() as u8);
             buf.extend_from_slice(bytes);
-        }
+        },
         Address::Ipv6(ip) => {
             buf.push(0x04);
             buf.extend_from_slice(ip);
-        }
+        },
     }
     buf.extend_from_slice(&dest.port.to_be_bytes());
     buf
@@ -51,7 +51,9 @@ pub fn serialize_socks_addr(dest: &Destination) -> Vec<u8> {
 ///
 /// Returns the parsed [`Destination`] (with `resolved_ip = None`) and the
 /// total number of bytes consumed.
-pub fn deserialize_socks_addr(buf: &[u8]) -> Result<(Destination, usize), String> {
+pub fn deserialize_socks_addr(
+    buf: &[u8],
+) -> Result<(Destination, usize), String> {
     if buf.is_empty() {
         return Err("socks addr: buffer too short for ATYP".to_string());
     }
@@ -66,7 +68,7 @@ pub fn deserialize_socks_addr(buf: &[u8]) -> Result<(Destination, usize), String
             ip.copy_from_slice(&buf[1..5]);
             let port = u16::from_be_bytes([buf[5], buf[6]]);
             Ok((Destination::new(Address::Ipv4(ip), port), 7))
-        }
+        },
         0x03 => {
             // Domain: ATYP + 1 length + N + 2 port
             if buf.len() < 2 {
@@ -82,7 +84,7 @@ pub fn deserialize_socks_addr(buf: &[u8]) -> Result<(Destination, usize), String
                 .to_string();
             let port = u16::from_be_bytes([buf[2 + len], buf[2 + len + 1]]);
             Ok((Destination::new(Address::Domain(domain), port), total))
-        }
+        },
         0x04 => {
             // IPv6: ATYP + 16 IP + 2 port = 19
             if buf.len() < 19 {
@@ -92,7 +94,7 @@ pub fn deserialize_socks_addr(buf: &[u8]) -> Result<(Destination, usize), String
             ip.copy_from_slice(&buf[1..17]);
             let port = u16::from_be_bytes([buf[17], buf[18]]);
             Ok((Destination::new(Address::Ipv6(ip), port), 19))
-        }
+        },
         other => Err(format!("socks addr: unknown ATYP 0x{:02x}", other)),
     }
 }
@@ -115,12 +117,16 @@ mod tests {
     #[test]
     fn test_serialize_ipv4_exact() {
         let dest = Destination::new(Address::Ipv4([192, 168, 1, 1]), 443);
-        assert_eq!(serialize_socks_addr(&dest), vec![0x01, 192, 168, 1, 1, 0x01, 0xBB]);
+        assert_eq!(
+            serialize_socks_addr(&dest),
+            vec![0x01, 192, 168, 1, 1, 0x01, 0xBB]
+        );
     }
 
     #[test]
     fn test_serialize_domain_exact() {
-        let dest = Destination::new(Address::Domain("example.com".to_string()), 443);
+        let dest =
+            Destination::new(Address::Domain("example.com".to_string()), 443);
         let mut expected = vec![0x03, 11];
         expected.extend_from_slice(b"example.com");
         expected.extend_from_slice(&[0x01, 0xBB]);
@@ -130,8 +136,8 @@ mod tests {
     #[test]
     fn test_serialize_ipv6_exact() {
         let ip: [u8; 16] = [
-            0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+            0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x01,
         ];
         let dest = Destination::new(Address::Ipv6(ip), 443);
         let mut expected = vec![0x04];
@@ -143,10 +149,16 @@ mod tests {
     #[test]
     fn test_serialize_port_boundaries() {
         let zero = Destination::new(Address::Ipv4([0, 0, 0, 0]), 0);
-        assert_eq!(serialize_socks_addr(&zero), vec![0x01, 0, 0, 0, 0, 0x00, 0x00]);
+        assert_eq!(
+            serialize_socks_addr(&zero),
+            vec![0x01, 0, 0, 0, 0, 0x00, 0x00]
+        );
 
         let max = Destination::new(Address::Ipv4([255, 255, 255, 255]), 65535);
-        assert_eq!(serialize_socks_addr(&max), vec![0x01, 255, 255, 255, 255, 0xFF, 0xFF]);
+        assert_eq!(
+            serialize_socks_addr(&max),
+            vec![0x01, 255, 255, 255, 255, 0xFF, 0xFF]
+        );
     }
 
     // -- round-trip ----------------------------------------------------------
@@ -164,7 +176,10 @@ mod tests {
 
     #[test]
     fn test_roundtrip_domain() {
-        let dest = Destination::new(Address::Domain("sub.example.org".to_string()), 8443);
+        let dest = Destination::new(
+            Address::Domain("sub.example.org".to_string()),
+            8443,
+        );
         let bytes = serialize_socks_addr(&dest);
         let (parsed, n) = deserialize_socks_addr(&bytes).unwrap();
         assert_eq!(n, bytes.len());
@@ -176,8 +191,8 @@ mod tests {
     #[test]
     fn test_roundtrip_ipv6() {
         let ip: [u8; 16] = [
-            0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+            0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x01,
         ];
         let dest = Destination::new(Address::Ipv6(ip), 443);
         let bytes = serialize_socks_addr(&dest);
@@ -193,7 +208,8 @@ mod tests {
         // resolved_ip must always be None after deserialization even if the
         // input Destination carried one (serialize ignores it).
         let mut dest = Destination::new(Address::Ipv4([8, 8, 8, 8]), 53);
-        dest.resolved_ip = Some(std::net::IpAddr::V4(std::net::Ipv4Addr::new(8, 8, 8, 8)));
+        dest.resolved_ip =
+            Some(std::net::IpAddr::V4(std::net::Ipv4Addr::new(8, 8, 8, 8)));
         let bytes = serialize_socks_addr(&dest);
         let (parsed, _) = deserialize_socks_addr(&bytes).unwrap();
         assert!(parsed.resolved_ip.is_none());
@@ -210,9 +226,15 @@ mod tests {
         assert!(deserialize_socks_addr(&[0x01]).is_err());
         // domain: length byte present but body + port missing
         assert!(deserialize_socks_addr(&[0x03]).is_err());
-        assert!(deserialize_socks_addr(&[0x03, 11, b'h', b'e', b'l', b'l', b'o']).is_err());
+        assert!(
+            deserialize_socks_addr(&[0x03, 11, b'h', b'e', b'l', b'l', b'o'])
+                .is_err()
+        );
         // domain: body complete but port missing
-        assert!(deserialize_socks_addr(&[0x03, 5, b'h', b'e', b'l', b'l', b'o']).is_err());
+        assert!(
+            deserialize_socks_addr(&[0x03, 5, b'h', b'e', b'l', b'l', b'o'])
+                .is_err()
+        );
         // IPv6 truncated
         assert!(deserialize_socks_addr(&[0x04, 0, 0, 0]).is_err());
         // unknown ATYP
@@ -249,12 +271,21 @@ mod tests {
 
     #[test]
     fn test_socks_addr_len() {
-        assert_eq!(socks_addr_len(&Destination::new(Address::Ipv4([1, 2, 3, 4]), 80)), 7);
         assert_eq!(
-            socks_addr_len(&Destination::new(Address::Domain("a.com".to_string()), 80)),
+            socks_addr_len(&Destination::new(Address::Ipv4([1, 2, 3, 4]), 80)),
+            7
+        );
+        assert_eq!(
+            socks_addr_len(&Destination::new(
+                Address::Domain("a.com".to_string()),
+                80
+            )),
             1 + 1 + 5 + 2,
         );
-        assert_eq!(socks_addr_len(&Destination::new(Address::Ipv6([0u8; 16]), 80)), 19);
+        assert_eq!(
+            socks_addr_len(&Destination::new(Address::Ipv6([0u8; 16]), 80)),
+            19
+        );
     }
 
     #[test]

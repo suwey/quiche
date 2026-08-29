@@ -1,7 +1,9 @@
-//! UDP noise injection — sends dummy packets to mask real traffic patterns.
+//! UDP noise injection - sends dummy packets to mask real traffic patterns.
 //!
 //! Mirrors Xray's `finalmask noise` concept: periodically inject random
 //! UDP packets with configurable size, content, and timing.
+//!
+//! NOTE: Designed but not currently wired into any outbound path.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -68,7 +70,9 @@ impl NoiseInjector {
     ///
     /// Returns `Some(Vec<NoisePacket>)` if enough time has elapsed since
     /// the last injection for this destination, or `None` otherwise.
-    pub fn should_inject(&mut self, dest: SocketAddr) -> Option<Vec<NoisePacket>> {
+    pub fn should_inject(
+        &mut self, dest: SocketAddr,
+    ) -> Option<Vec<NoisePacket>> {
         if self.config.items.is_empty() {
             return None;
         }
@@ -156,8 +160,11 @@ mod tests {
     #[test]
     fn inject_on_first_check() {
         let mut inj = NoiseInjector::new(make_config());
-        let dest: SocketAddr = SocketAddrV4::new(Ipv4Addr::new(1, 2, 3, 4), 443).into();
-        let packets = inj.should_inject(dest).expect("should inject on first check");
+        let dest: SocketAddr =
+            SocketAddrV4::new(Ipv4Addr::new(1, 2, 3, 4), 443).into();
+        let packets = inj
+            .should_inject(dest)
+            .expect("should inject on first check");
         assert_eq!(packets.len(), 1);
         let p = &packets[0];
         assert!(p.data.len() >= 64 && p.data.len() <= 128);
@@ -167,7 +174,8 @@ mod tests {
     #[test]
     fn no_inject_when_empty() {
         let mut inj = NoiseInjector::empty();
-        let dest: SocketAddr = SocketAddrV4::new(Ipv4Addr::new(1, 2, 3, 4), 443).into();
+        let dest: SocketAddr =
+            SocketAddrV4::new(Ipv4Addr::new(1, 2, 3, 4), 443).into();
         assert!(inj.should_inject(dest).is_none());
         assert!(!inj.is_enabled());
     }
@@ -175,7 +183,8 @@ mod tests {
     #[test]
     fn inject_resets_after_interval() {
         let mut inj = NoiseInjector::new(make_config());
-        let dest: SocketAddr = SocketAddrV4::new(Ipv4Addr::new(1, 2, 3, 4), 443).into();
+        let dest: SocketAddr =
+            SocketAddrV4::new(Ipv4Addr::new(1, 2, 3, 4), 443).into();
 
         // First check: injects.
         let p1 = inj.should_inject(dest);
@@ -204,7 +213,8 @@ mod tests {
             ],
         };
         let mut inj = NoiseInjector::new(config);
-        let dest: SocketAddr = SocketAddrV4::new(Ipv4Addr::new(1, 2, 3, 4), 443).into();
+        let dest: SocketAddr =
+            SocketAddrV4::new(Ipv4Addr::new(1, 2, 3, 4), 443).into();
         let packets = inj.should_inject(dest).expect("should inject");
         assert_eq!(packets.len(), 2);
         assert_eq!(packets[0].data.len(), 32);
@@ -216,8 +226,10 @@ mod tests {
     #[test]
     fn per_destination_tracking() {
         let mut inj = NoiseInjector::new(make_config());
-        let dest1: SocketAddr = SocketAddrV4::new(Ipv4Addr::new(1, 1, 1, 1), 443).into();
-        let dest2: SocketAddr = SocketAddrV4::new(Ipv4Addr::new(2, 2, 2, 2), 443).into();
+        let dest1: SocketAddr =
+            SocketAddrV4::new(Ipv4Addr::new(1, 1, 1, 1), 443).into();
+        let dest2: SocketAddr =
+            SocketAddrV4::new(Ipv4Addr::new(2, 2, 2, 2), 443).into();
 
         // Both should inject independently on first check.
         assert!(inj.should_inject(dest1).is_some());

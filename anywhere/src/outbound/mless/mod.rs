@@ -8,6 +8,7 @@ use std::sync::Weak;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 use async_trait::async_trait;
+use tokio::sync::Notify;
 use tokio::sync::mpsc;
 
 use crate::config::OutboundConfig;
@@ -49,6 +50,10 @@ pub struct MlessOutboundClient {
     next: AtomicUsize,
     /// Pool size (cached for reconnection logic).
     pool_size: usize,
+    /// Maximum MLESS streams per physical connection (0 = unlimited).
+    max_streams: usize,
+    /// Notified when a stream permit is released.
+    capacity_notify: Arc<Notify>,
     uuid: [u8; 16],
     uuid_str: String,
     /// Pluggable connection manager (shared across all pool slots).
@@ -93,17 +98,35 @@ impl MlessOutboundClient {
             .and_then(|x| x.pool_size)
             .unwrap_or(5)
             .max(1);
+        let max_streams = cfg
+            .xmux
+            .as_ref()
+            .and_then(|x| x.max_concurrency.as_ref())
+            .map(|range| range.rand_usize())
+            .unwrap_or(0);
+        let capacity_notify = Arc::new(Notify::new());
 
         // Build connection manager from nested [transport] config
-        let transport = cfg.transport.as_ref().ok_or("mless: missing [transport] config")?;
-        let conn_mgr: Arc<dyn ConnectionManager> = match transport.type_.as_str() {
+        let transport = cfg
+            .transport
+            .as_ref()
+            .ok_or("mless: missing [transport] config")?;
+        let conn_mgr: Arc<dyn ConnectionManager> = match transport.type_.as_str()
+        {
             "ws" => {
                 use crate::connection::SingleConnectionManager;
-                use crate::transport::{TransportContext, ws::WsTransportFactory};
-                let ws = transport.ws.as_ref().ok_or("mless: missing [transport.ws] config")?;
+                use crate::transport::{
+                    TransportContext, ws::WsTransportFactory,
+                };
+                let ws = transport
+                    .ws
+                    .as_ref()
+                    .ok_or("mless: missing [transport.ws] config")?;
                 let path = ws.path.clone().unwrap_or_else(|| "/".to_string());
                 let mut headers = ws.headers.clone().unwrap_or_default();
-                headers.entry("Host".to_string()).or_insert_with(|| tls_server.clone());
+                headers
+                    .entry("Host".to_string())
+                    .or_insert_with(|| tls_server.clone());
                 let ctx = TransportContext {
                     server: addr.ip().to_string(),
                     port: addr.port(),
@@ -113,24 +136,39 @@ impl MlessOutboundClient {
                     path,
                     headers,
                     fragment: if cfg.tls_fragment {
-                        Some(crate::tlsfragment::FragmentConfig::default())
-                    } else { None },
+                        Some(cfg.tls_fragment_config.clone().unwrap_or_default())
+                    } else {
+                        None
+                    },
                 };
-                Arc::new(SingleConnectionManager::new(Box::new(WsTransportFactory), ctx))
-            }
+                Arc::new(SingleConnectionManager::new(
+                    Box::new(WsTransportFactory),
+                    ctx,
+                ))
+            },
             "xhttp" => {
                 use crate::transport::xhttp::config::XmuxConfig;
-                use crate::transport::xhttp::{config::HttpVersionPref, xmux::XmuxConnectionManager};
-                let xc = transport.xhttp.as_ref().ok_or("mless: missing [transport.xhttp] config")?;
+                use crate::transport::xhttp::{
+                    config::HttpVersionPref, xmux::XmuxConnectionManager,
+                };
+                let xc = transport
+                    .xhttp
+                    .as_ref()
+                    .ok_or("mless: missing [transport.xhttp] config")?;
                 let mut xhttp_config = xc.clone();
-                if xhttp_config.host.is_empty() { xhttp_config.host = tls_server.clone(); }
-                if xhttp_config.port == 0 { xhttp_config.port = addr.port(); }
+                if xhttp_config.host.is_empty() {
+                    xhttp_config.host = tls_server.clone();
+                }
+                if xhttp_config.port == 0 {
+                    xhttp_config.port = addr.port();
+                }
                 xhttp_config.insecure = cfg.insecure;
                 // mless requires a bidirectional streaming transport (uplink POST
                 // body + downlink response body). Force stream-one regardless of
                 // the user's mode setting, since packet-up/stream-up would break
                 // the mless frame io_loop.
-                xhttp_config.mode = crate::transport::xhttp::config::XhttpMode::StreamOne;
+                xhttp_config.mode =
+                    crate::transport::xhttp::config::XhttpMode::StreamOne;
                 // Hermes router intercepts UUID-like paths as logout
                 // (router.ts: uuidRegex.test(访问路径) -> 302 redirect).
                 // session_id is a UUID, so placing it in the path triggers
@@ -142,12 +180,26 @@ impl MlessOutboundClient {
                 let xmux_cfg = cfg.xmux.as_ref().unwrap_or(&default_xmux);
                 if xhttp_config.http_version == HttpVersionPref::Http3 {
                     use crate::transport::xhttp::h3::H3ConnectionManager;
-                    Arc::new(H3ConnectionManager::new(xhttp_config))
+                    Arc::new(
+                        H3ConnectionManager::from_config(xhttp_config, xmux_cfg)
+                            .await?,
+                    )
                 } else {
-                    Arc::new(XmuxConnectionManager::from_config(xhttp_config, xmux_cfg).await?)
+                    Arc::new(
+                        XmuxConnectionManager::from_config(
+                            xhttp_config,
+                            xmux_cfg,
+                        )
+                        .await?,
+                    )
                 }
-            }
-            other => return Err(format!("mless: unsupported transport type '{other}'").into()),
+            },
+            other => {
+                return Err(format!(
+                    "mless: unsupported transport type '{other}'"
+                )
+                .into());
+            },
         };
 
         // Build crypto factory
@@ -162,6 +214,8 @@ impl MlessOutboundClient {
                 conn_mgr.clone(),
                 crypto_factory.clone(),
                 &uuid_str,
+                max_streams,
+                capacity_notify.clone(),
             )
             .await?;
             if pool_size > 1 {
@@ -177,43 +231,54 @@ impl MlessOutboundClient {
             pool: tokio::sync::Mutex::new(slots),
             next: AtomicUsize::new(0),
             pool_size,
+            max_streams,
+            capacity_notify,
             uuid,
             uuid_str,
             conn_mgr,
             crypto_factory,
-            direct_fallback: DirectOutboundClient,
+            direct_fallback: DirectOutboundClient::default(),
         })
     }
 
-    /// Pick a healthy multiplexer from the pool, reconnecting if needed.
-    ///
-    /// Uses round-robin to distribute streams across pool slots. If the
-    /// selected slot is dead, attempts reconnection with exponential
-    /// backoff. Falls back to the next slot on failure.
-    async fn get_or_reconnect(&self) -> Arc<MlessMultiplexer> {
-        let idx = self.next.fetch_add(1, Ordering::Relaxed) % self.pool_size;
-
-        // Fast path: check if the selected slot is alive (no lock held).
-        {
-            let pool = self.pool.lock().await;
-            let slot = &pool[idx];
-            if !slot.mux.dead.load(Ordering::Relaxed) {
-                return slot.mux.clone();
+    async fn try_register_stream(
+        &self,
+    ) -> Option<(Arc<MlessMultiplexer>, u64, mpsc::UnboundedReceiver<Vec<u8>>)>
+    {
+        let start = self.next.fetch_add(1, Ordering::Relaxed) % self.pool_size;
+        let pool = self.pool.lock().await;
+        for offset in 0..pool.len() {
+            let slot = &pool[(start + offset) % pool.len()];
+            if slot.mux.dead.load(Ordering::Relaxed) {
+                continue;
             }
-            // Check if another slot is already reconnecting this one.
-            if slot
-                .mux
-                .reconnecting
-                .swap(true, Ordering::Acquire)
-            {
-                drop(pool);
-                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                let pool = self.pool.lock().await;
-                return pool[idx].mux.clone();
+            if let Some((stream_id, rx)) = slot.mux.try_register_stream() {
+                return Some((slot.mux.clone(), stream_id, rx));
             }
         }
+        None
+    }
 
-        // Slow path: reconnect the dead slot.
+    async fn claim_dead_slot(&self) -> (Option<usize>, bool) {
+        let pool = self.pool.lock().await;
+        let mut has_reconnecting = false;
+        for (idx, slot) in pool.iter().enumerate() {
+            if !slot.mux.dead.load(Ordering::Relaxed) {
+                continue;
+            }
+            if slot.mux.reconnecting.load(Ordering::Acquire) {
+                has_reconnecting = true;
+                continue;
+            }
+            if !slot.mux.reconnecting.swap(true, Ordering::Acquire) {
+                return (Some(idx), has_reconnecting);
+            }
+            has_reconnecting = true;
+        }
+        (None, has_reconnecting)
+    }
+
+    async fn reconnect_slot(&self, idx: usize) -> Option<Arc<MlessMultiplexer>> {
         let fails = {
             let pool = self.pool.lock().await;
             pool[idx].consecutive_fails.fetch_add(1, Ordering::Relaxed)
@@ -232,6 +297,8 @@ impl MlessOutboundClient {
             self.conn_mgr.clone(),
             self.crypto_factory.clone(),
             &self.uuid_str,
+            self.max_streams,
+            self.capacity_notify.clone(),
         )
         .await;
 
@@ -240,32 +307,53 @@ impl MlessOutboundClient {
         let new_mux = result.ok();
 
         let mut pool = self.pool.lock().await;
-        pool[idx]
-            .mux
-            .reconnecting
-            .store(false, Ordering::Release);
+        pool[idx].mux.reconnecting.store(false, Ordering::Release);
 
-        match new_mux {
-            Some(new_mux) => {
-                pool[idx].consecutive_fails.store(0, Ordering::Relaxed);
-                pool[idx].mux = new_mux.clone();
-                drop(pool);
-                log::info!(
-                    "{}: pool slot {} reconnected",
-                    self.log_tag(),
-                    idx
-                );
-                new_mux
+        if let Some(new_mux) = new_mux {
+            pool[idx].consecutive_fails.store(0, Ordering::Relaxed);
+            pool[idx].mux = new_mux.clone();
+            drop(pool);
+            log::info!("{}: pool slot {} reconnected", self.log_tag(), idx);
+            Some(new_mux)
+        } else {
+            log::warn!("{}: pool slot {} reconnect failed", self.log_tag(), idx);
+            None
+        }
+    }
+
+    async fn open_stream(
+        &self,
+    ) -> Result<
+        (Arc<MlessMultiplexer>, u64, mpsc::UnboundedReceiver<Vec<u8>>),
+        Box<dyn std::error::Error>,
+    > {
+        loop {
+            if let Some(stream) = self.try_register_stream().await {
+                return Ok(stream);
             }
-            None => {
-                log::warn!(
-                    "{}: pool slot {} reconnect failed",
-                    self.log_tag(),
-                    idx
-                );
-                // Return the (still dead) mux; caller will check `dead` flag.
-                pool[idx].mux.clone()
+
+            let (claimed_slot, has_reconnecting) = self.claim_dead_slot().await;
+            if let Some(idx) = claimed_slot {
+                let mux = self
+                    .reconnect_slot(idx)
+                    .await
+                    .ok_or("mless: connection unavailable")?;
+                if let Some((stream_id, rx)) = mux.try_register_stream() {
+                    return Ok((mux, stream_id, rx));
+                }
+                continue;
             }
+            if has_reconnecting {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                continue;
+            }
+
+            let notified = self.capacity_notify.notified();
+            tokio::pin!(notified);
+            if let Some(stream) = self.try_register_stream().await {
+                return Ok(stream);
+            }
+            notified.await;
         }
     }
 
@@ -282,12 +370,8 @@ impl OutboundClient for MlessOutboundClient {
     async fn dial(
         &self, dest: &Destination,
     ) -> Result<Box<dyn StreamRelay>, Box<dyn std::error::Error>> {
-        let mux = self.get_or_reconnect().await;
-        if mux.dead.load(std::sync::atomic::Ordering::Relaxed) {
-            return Err("mless: connection unavailable".into());
-        }
+        let (mux, stream_id, rx) = self.open_stream().await?;
         let vless_header = build_vless_header(&self.uuid, dest, false);
-        let (stream_id, rx) = mux.register_stream();
         log::debug!(
             "{}: dial tcp {dest} -> stream#{}",
             self.log_tag(),
@@ -323,12 +407,8 @@ impl OutboundClient for MlessOutboundClient {
         // - Anything else:  reject (consistent with prior behavior).
         match dest.port {
             53 => {
-                let mux = self.get_or_reconnect().await;
-                if mux.dead.load(std::sync::atomic::Ordering::Relaxed) {
-                    return Err("mless: connection unavailable".into());
-                }
+                let (mux, stream_id, rx) = self.open_stream().await?;
                 let header = build_vless_header(&self.uuid, dest, true);
-                let (stream_id, rx) = mux.register_stream();
                 log::debug!(
                     "{}: dial udp {dest} -> stream#{}",
                     self.log_tag(),
@@ -462,7 +542,7 @@ impl StreamRelay for MlessStreamRelay {
                         if self.ever_received { 300 } else { 30 },
                     );
                     if let Some(mux) = self.multiplexer.upgrade() {
-                        mux.close_stream(self.stream_id).await;
+                        mux.close_stream(self.stream_id);
                     }
                     return Ok(0);
                 },
@@ -505,9 +585,17 @@ impl StreamRelay for MlessStreamRelay {
 
     async fn shutdown(&mut self) -> std::io::Result<()> {
         if let Some(mux) = self.multiplexer.upgrade() {
-            mux.close_stream(self.stream_id).await;
+            mux.close_stream(self.stream_id);
         }
         Ok(())
+    }
+}
+
+impl Drop for MlessStreamRelay {
+    fn drop(&mut self) {
+        if let Some(mux) = self.multiplexer.upgrade() {
+            mux.close_stream(self.stream_id);
+        }
     }
 }
 

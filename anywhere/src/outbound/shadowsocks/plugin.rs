@@ -39,10 +39,11 @@ const CHUNK_SIZE: usize = 1 << 14;
 /// Cipher suite list from the sing-box `makeClientHelloMsg`. The preceding
 /// length prefix is `0x00 0x38` (56 bytes).
 const CIPHER_SUITES: [u8; 56] = [
-    0xc0, 0x2c, 0xc0, 0x30, 0x00, 0x9f, 0xcc, 0xa9, 0xcc, 0xa8, 0xcc, 0xaa, 0xc0, 0x2b, 0xc0, 0x2f,
-    0x00, 0x9e, 0xc0, 0x24, 0xc0, 0x28, 0x00, 0x6b, 0xc0, 0x23, 0xc0, 0x27, 0x00, 0x67, 0xc0, 0x0a,
-    0xc0, 0x14, 0x00, 0x39, 0xc0, 0x09, 0xc0, 0x13, 0x00, 0x33, 0x00, 0x9d, 0x00, 0x9c, 0x00, 0x3d,
-    0x00, 0x3c, 0x00, 0x35, 0x00, 0x2f, 0x00, 0xff,
+    0xc0, 0x2c, 0xc0, 0x30, 0x00, 0x9f, 0xcc, 0xa9, 0xcc, 0xa8, 0xcc, 0xaa, 0xc0,
+    0x2b, 0xc0, 0x2f, 0x00, 0x9e, 0xc0, 0x24, 0xc0, 0x28, 0x00, 0x6b, 0xc0, 0x23,
+    0xc0, 0x27, 0x00, 0x67, 0xc0, 0x0a, 0xc0, 0x14, 0x00, 0x39, 0xc0, 0x09, 0xc0,
+    0x13, 0x00, 0x33, 0x00, 0x9d, 0x00, 0x9c, 0x00, 0x3d, 0x00, 0x3c, 0x00, 0x35,
+    0x00, 0x2f, 0x00, 0xff,
 ];
 
 /// Parsed obfs-local plugin configuration.
@@ -62,9 +63,13 @@ impl ObfsPlugin {
     ///   (hostname), `path` (ignored for HTTP).
     /// - `server_port` is the Shadowsocks server port, used for the HTTP
     ///   `Host` header.
-    pub fn parse(plugin: &str, opts: &str, server_port: u16) -> Result<Self, String> {
+    pub fn parse(
+        plugin: &str, opts: &str, server_port: u16,
+    ) -> Result<Self, String> {
         if plugin != "obfs-local" {
-            return Err(format!("unsupported plugin: {plugin} (expected obfs-local)"));
+            return Err(format!(
+                "unsupported plugin: {plugin} (expected obfs-local)"
+            ));
         }
 
         let mut mode = String::from("http");
@@ -83,7 +88,7 @@ impl ObfsPlugin {
                 "obfs-host" => host = val.trim().to_string(),
                 // `path` and any unknown keys are silently ignored, matching
                 // the sing-box option parser.
-                _ => {}
+                _ => {},
             }
         }
 
@@ -93,7 +98,9 @@ impl ObfsPlugin {
                 port: server_port.to_string(),
             }),
             "tls" => Ok(ObfsPlugin::Tls { host }),
-            other => Err(format!("unknown obfs mode: {other} (expected http or tls)")),
+            other => {
+                Err(format!("unknown obfs mode: {other} (expected http or tls)"))
+            },
         }
     }
 
@@ -102,8 +109,10 @@ impl ObfsPlugin {
         match self {
             ObfsPlugin::Http { host, port } => {
                 ObfsConn::Http(ObfsHttp::new(conn, host.clone(), port.clone()))
-            }
-            ObfsPlugin::Tls { host } => ObfsConn::Tls(ObfsTls::new(conn, host.clone())),
+            },
+            ObfsPlugin::Tls { host } => {
+                ObfsConn::Tls(ObfsTls::new(conn, host.clone()))
+            },
         }
     }
 }
@@ -117,9 +126,7 @@ pub enum ObfsConn {
 
 impl AsyncRead for ObfsConn {
     fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
+        self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         match self.get_mut() {
             ObfsConn::Http(c) => Pin::new(c).poll_read(cx, buf),
@@ -130,9 +137,7 @@ impl AsyncRead for ObfsConn {
 
 impl AsyncWrite for ObfsConn {
     fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
+        self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         match self.get_mut() {
             ObfsConn::Http(c) => Pin::new(c).poll_write(cx, buf),
@@ -140,14 +145,18 @@ impl AsyncWrite for ObfsConn {
         }
     }
 
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    fn poll_flush(
+        self: Pin<&mut Self>, cx: &mut Context<'_>,
+    ) -> Poll<io::Result<()>> {
         match self.get_mut() {
             ObfsConn::Http(c) => Pin::new(c).poll_flush(cx),
             ObfsConn::Tls(c) => Pin::new(c).poll_flush(cx),
         }
     }
 
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    fn poll_shutdown(
+        self: Pin<&mut Self>, cx: &mut Context<'_>,
+    ) -> Poll<io::Result<()>> {
         match self.get_mut() {
             ObfsConn::Http(c) => Pin::new(c).poll_shutdown(cx),
             ObfsConn::Tls(c) => Pin::new(c).poll_shutdown(cx),
@@ -197,9 +206,7 @@ impl ObfsHttp {
 
 impl AsyncRead for ObfsHttp {
     fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
+        self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let this = self.get_mut();
         loop {
@@ -231,15 +238,19 @@ impl AsyncRead for ObfsHttp {
                 }
                 let idx = match find_crlf_crlf(&scratch[..n]) {
                     Some(i) => {
-                        log::trace!("obfs http: found CRLFCRLF at offset {}, payload after = {} bytes", i, n - i - 4);
+                        log::trace!(
+                            "obfs http: found CRLFCRLF at offset {}, payload after = {} bytes",
+                            i,
+                            n - i - 4
+                        );
                         i
-                    }
+                    },
                     None => {
                         return Poll::Ready(Err(io::Error::new(
                             io::ErrorKind::UnexpectedEof,
                             "obfs http: incomplete response header",
                         )));
-                    }
+                    },
                 };
                 this.first_response = false;
                 let payload = &scratch[idx + 4..n];
@@ -265,9 +276,7 @@ impl AsyncRead for ObfsHttp {
 
 impl AsyncWrite for ObfsHttp {
     fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
+        self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
         // Continue a partially-drained framed write first.
@@ -310,12 +319,16 @@ impl AsyncWrite for ObfsHttp {
         Pin::new(&mut this.conn).poll_write(cx, buf)
     }
 
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    fn poll_flush(
+        self: Pin<&mut Self>, cx: &mut Context<'_>,
+    ) -> Poll<io::Result<()>> {
         let this = self.get_mut();
         Pin::new(&mut this.conn).poll_flush(cx)
     }
 
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    fn poll_shutdown(
+        self: Pin<&mut Self>, cx: &mut Context<'_>,
+    ) -> Poll<io::Result<()>> {
         let this = self.get_mut();
         Pin::new(&mut this.conn).poll_shutdown(cx)
     }
@@ -376,9 +389,7 @@ impl ObfsTls {
 
 impl AsyncRead for ObfsTls {
     fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
+        self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let this = self.get_mut();
         loop {
@@ -390,7 +401,7 @@ impl AsyncRead for ObfsTls {
                     this.first_response = false;
                     this.len_have = 0;
                     this.read_phase = TlsReadPhase::Discard;
-                }
+                },
                 TlsReadPhase::Discard => {
                     if this.discard_left == 0 {
                         this.read_phase = TlsReadPhase::Length;
@@ -405,7 +416,7 @@ impl AsyncRead for ObfsTls {
                         return Poll::Ready(Ok(())); // EOF
                     }
                     this.discard_left -= n;
-                }
+                },
                 TlsReadPhase::Length => {
                     if this.len_have >= 2 {
                         this.remain = u16::from_be_bytes(this.len_buf) as usize;
@@ -424,7 +435,7 @@ impl AsyncRead for ObfsTls {
                     this.len_buf[this.len_have..this.len_have + n]
                         .copy_from_slice(&scratch[..n]);
                     this.len_have += n;
-                }
+                },
                 TlsReadPhase::Payload => {
                     if this.remain == 0 {
                         this.read_phase = TlsReadPhase::Start;
@@ -461,7 +472,7 @@ impl AsyncRead for ObfsTls {
                         this.remain -= n;
                         return Poll::Ready(Ok(()));
                     }
-                }
+                },
             }
         }
     }
@@ -469,9 +480,7 @@ impl AsyncRead for ObfsTls {
 
 impl AsyncWrite for ObfsTls {
     fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
+        self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
         if !this.write_buf.is_empty() {
@@ -502,12 +511,16 @@ impl AsyncWrite for ObfsTls {
         Poll::Ready(Ok(report))
     }
 
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    fn poll_flush(
+        self: Pin<&mut Self>, cx: &mut Context<'_>,
+    ) -> Poll<io::Result<()>> {
         let this = self.get_mut();
         Pin::new(&mut this.conn).poll_flush(cx)
     }
 
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    fn poll_shutdown(
+        self: Pin<&mut Self>, cx: &mut Context<'_>,
+    ) -> Poll<io::Result<()>> {
         let this = self.get_mut();
         Pin::new(&mut this.conn).poll_shutdown(cx)
     }
@@ -520,13 +533,13 @@ impl AsyncWrite for ObfsTls {
 /// Drain `write_buf` from `write_pos` to the inner stream, returning `Pending`
 /// when the stream is not ready. Only reports success once every byte is sent.
 fn drain_write(
-    conn: &mut TcpStream,
-    write_buf: &[u8],
-    write_pos: &mut usize,
+    conn: &mut TcpStream, write_buf: &[u8], write_pos: &mut usize,
     cx: &mut Context<'_>,
 ) -> Poll<io::Result<()>> {
     while *write_pos < write_buf.len() {
-        let n = ready!(Pin::new(&mut *conn).poll_write(cx, &write_buf[*write_pos..]))?;
+        let n = ready!(
+            Pin::new(&mut *conn).poll_write(cx, &write_buf[*write_pos..])
+        )?;
         if n == 0 {
             return Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::WriteZero,
@@ -561,7 +574,9 @@ fn build_http_request(host: &str, port: &str, data: &[u8]) -> Vec<u8> {
     out.extend_from_slice(b"Upgrade: websocket\r\n");
     out.extend_from_slice(b"Connection: Upgrade\r\n");
     out.extend_from_slice(format!("Sec-WebSocket-Key: {key}\r\n").as_bytes());
-    out.extend_from_slice(format!("Content-Length: {}\r\n", data.len()).as_bytes());
+    out.extend_from_slice(
+        format!("Content-Length: {}\r\n", data.len()).as_bytes(),
+    );
     out.extend_from_slice(b"\r\n");
     out.extend_from_slice(data);
     out
@@ -659,14 +674,15 @@ fn make_client_hello(data: &[u8], server: &str) -> Vec<u8> {
 
     // supported_groups (0x000a).
     out.extend_from_slice(&[
-        0x00, 0x0a, 0x00, 0x0a, 0x00, 0x08, 0x00, 0x1d, 0x00, 0x17, 0x00, 0x19, 0x00, 0x18,
+        0x00, 0x0a, 0x00, 0x0a, 0x00, 0x08, 0x00, 0x1d, 0x00, 0x17, 0x00, 0x19,
+        0x00, 0x18,
     ]);
 
     // signature_algorithms (0x000d).
     out.extend_from_slice(&[
-        0x00, 0x0d, 0x00, 0x20, 0x00, 0x1e, 0x06, 0x01, 0x06, 0x02, 0x06, 0x03, 0x05, 0x01, 0x05,
-        0x02, 0x05, 0x03, 0x04, 0x01, 0x04, 0x02, 0x04, 0x03, 0x03, 0x01, 0x03, 0x02, 0x03, 0x03,
-        0x02, 0x01, 0x02, 0x02, 0x02, 0x03,
+        0x00, 0x0d, 0x00, 0x20, 0x00, 0x1e, 0x06, 0x01, 0x06, 0x02, 0x06, 0x03,
+        0x05, 0x01, 0x05, 0x02, 0x05, 0x03, 0x04, 0x01, 0x04, 0x02, 0x04, 0x03,
+        0x03, 0x01, 0x03, 0x02, 0x03, 0x03, 0x02, 0x01, 0x02, 0x02, 0x02, 0x03,
     ]);
 
     // encrypt_then_mac (0x0016).
@@ -703,15 +719,19 @@ mod tests {
             ObfsPlugin::Http { host, port } => {
                 assert_eq!(host, "aws.amazon.com");
                 assert_eq!(port, "8388");
-            }
+            },
             _ => panic!("expected Http variant"),
         }
     }
 
     #[test]
     fn parse_tls() {
-        let p =
-            ObfsPlugin::parse("obfs-local", "obfs=tls;obfs-host=example.com", 443).unwrap();
+        let p = ObfsPlugin::parse(
+            "obfs-local",
+            "obfs=tls;obfs-host=example.com",
+            443,
+        )
+        .unwrap();
         match p {
             ObfsPlugin::Tls { host } => assert_eq!(host, "example.com"),
             _ => panic!("expected Tls variant"),
@@ -720,7 +740,9 @@ mod tests {
 
     #[test]
     fn parse_unknown_mode() {
-        assert!(ObfsPlugin::parse("obfs-local", "obfs=foo;obfs-host=x", 80).is_err());
+        assert!(
+            ObfsPlugin::parse("obfs-local", "obfs=foo;obfs-host=x", 80).is_err()
+        );
     }
 
     #[test]
@@ -746,7 +768,7 @@ mod tests {
             ObfsPlugin::Http { host, port } => {
                 assert_eq!(host, "h.com");
                 assert_eq!(port, "8388");
-            }
+            },
             _ => panic!("expected Http variant"),
         }
     }
@@ -850,8 +872,11 @@ mod tests {
         });
 
         let client = TcpStream::connect(addr).await.unwrap();
-        let mut obfs =
-            ObfsHttp::new(client, "aws.amazon.com".to_string(), "8388".to_string());
+        let mut obfs = ObfsHttp::new(
+            client,
+            "aws.amazon.com".to_string(),
+            "8388".to_string(),
+        );
         obfs.write_all(b"hello world").await.unwrap();
         obfs.shutdown().await.unwrap();
 
@@ -932,7 +957,8 @@ mod tests {
         // The payload is embedded in the session-ticket extension (offset 138).
         let st = 138;
         assert_eq!(&received[st..st + 2], &[0x00, 0x23]);
-        let st_len = u16::from_be_bytes([received[st + 2], received[st + 3]]) as usize;
+        let st_len =
+            u16::from_be_bytes([received[st + 2], received[st + 3]]) as usize;
         assert_eq!(st_len, b"test data".len());
         assert_eq!(&received[st + 4..st + 4 + st_len], b"test data");
     }

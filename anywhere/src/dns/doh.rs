@@ -17,10 +17,10 @@ use tokio::sync::Mutex;
 
 use tokio::time::timeout;
 
-use crate::inbound::Destination;
-use crate::outbound::common::bind_udp_bypass;
 use crate::dns::upstream::Upstream;
 use crate::dns::wire::{build_a_query, first_a_record};
+use crate::inbound::Destination;
+use crate::outbound::common::bind_udp_bypass;
 
 /// Per-query upstream timeout. Shared with the DnsHijack resolver.
 pub const QUERY_TIMEOUT: Duration = Duration::from_secs(15);
@@ -40,9 +40,9 @@ const BOOTSTRAP_TTL: Duration = Duration::from_secs(60);
 // ---------------------------------------------------------------------------
 
 use once_cell::sync::Lazy;
+use tokio_rustls::TlsConnector;
 use tokio_rustls::rustls::ClientConfig;
 use tokio_rustls::rustls::pki_types::ServerName;
-use tokio_rustls::TlsConnector;
 
 static DOH_TLS_CONFIG: Lazy<Arc<ClientConfig>> = Lazy::new(|| {
     // rustls 0.23 requires an explicit CryptoProvider. reqwest uses ring,
@@ -119,41 +119,43 @@ impl DohClient {
     /// `None` on any transport/TLS/HTTP failure.
     pub async fn resolve(&self, query: &[u8], up: &Upstream) -> Option<Vec<u8>> {
         let (host, path, port) = match up {
-            Upstream::Doh { host, path, port } => (host.as_str(), path.as_str(), *port),
+            Upstream::Doh { host, path, port } => {
+                (host.as_str(), path.as_str(), *port)
+            },
             _ => return None,
         };
 
-        let ip = match timeout(
-            Duration::from_secs(8),
-            self.bootstrap_resolve(host),
-        ).await {
-            Ok(Some(ip)) => ip,
-            Ok(None) => {
-                log::warn!("DoH: bootstrap resolve for '{host}' failed");
-                return None;
-            }
-            Err(_) => {
-                log::warn!("DoH: bootstrap resolve for '{host}' timed out");
-                return None;
-            }
-        };
+        let ip =
+            match timeout(Duration::from_secs(8), self.bootstrap_resolve(host))
+                .await
+            {
+                Ok(Some(ip)) => ip,
+                Ok(None) => {
+                    log::warn!("DoH: bootstrap resolve for '{host}' failed");
+                    return None;
+                },
+                Err(_) => {
+                    log::warn!("DoH: bootstrap resolve for '{host}' timed out");
+                    return None;
+                },
+            };
         // Acquire a (possibly reused, multiplexed) h2 sender. Concurrent
         // queries to the same upstream share one TCP+TLS+h2 connection.
-        let mut send_req = match timeout(
-            CONNECT_TIMEOUT,
-            self.get_send(ip, port, host),
-        ).await {
-            Ok(Some(s)) => s,
-            Ok(None) => return None,
-            Err(_) => {
-                log::warn!("DoH: connect to {host} ({ip}) timed out");
-                return None;
-            }
-        };
+        let mut send_req =
+            match timeout(CONNECT_TIMEOUT, self.get_send(ip, port, host)).await {
+                Ok(Some(s)) => s,
+                Ok(None) => return None,
+                Err(_) => {
+                    log::warn!("DoH: connect to {host} ({ip}) timed out");
+                    return None;
+                },
+            };
         match timeout(
             QUERY_TIMEOUT,
             doh_h2_exchange(&mut send_req, host, path, query),
-        ).await {
+        )
+        .await
+        {
             Ok(Some(r)) => Some(r),
             Ok(None) => {
                 // Exchange failed (HTTP error, send failure, etc.).
@@ -164,12 +166,12 @@ impl DohClient {
                 // to plain UDP) on the next query.
                 self.evict(ip, port, host).await;
                 None
-            }
+            },
             Err(_) => {
                 log::warn!("DoH: query to {host} timed out");
                 self.evict(ip, port, host).await;
                 None
-            }
+            },
         }
     }
 
@@ -223,8 +225,10 @@ impl DohClient {
 
         {
             let cache = self.hosts.lock().await;
-            if let Some((ip, _)) =
-                cache.get(host).copied().filter(|&(_, exp)| exp > Instant::now())
+            if let Some((ip, _)) = cache
+                .get(host)
+                .copied()
+                .filter(|&(_, exp)| exp > Instant::now())
             {
                 return Some(ip);
             }
@@ -242,10 +246,10 @@ impl DohClient {
                 .await
                 .and_then(|resp| first_a_record(&resp))
             {
-                self.hosts
-                    .lock()
-                    .await
-                    .insert(host.to_string(), (ip, Instant::now() + BOOTSTRAP_TTL));
+                self.hosts.lock().await.insert(
+                    host.to_string(),
+                    (ip, Instant::now() + BOOTSTRAP_TTL),
+                );
                 return Some(ip);
             }
         }
@@ -296,7 +300,7 @@ impl DohClient {
             Err(e) => {
                 log::warn!("DoH: TCP connect to {ip}:{port} failed: {e}");
                 return None;
-            }
+            },
         };
         let _ = tcp.set_nodelay(true);
 
@@ -306,24 +310,26 @@ impl DohClient {
             Err(e) => {
                 log::warn!("DoH: invalid server name '{host}': {e}");
                 return None;
-            }
+            },
         };
         let tls = match timeout(
             Duration::from_secs(5),
             DOH_TLS_CONNECTOR.connect(server_name, tcp),
-        ).await {
+        )
+        .await
+        {
             Ok(Ok(s)) => s,
             Ok(Err(e)) => {
                 log::warn!("DoH: TLS handshake with {host} ({ip}) failed: {e}");
                 return None;
-            }
+            },
             Err(_) => {
                 log::warn!(
                     "DoH: TLS handshake with {host} ({ip}) timed out (5s) — \
                      check bypass routing (table 100)"
                 );
                 return None;
-            }
+            },
         };
         // Confirm ALPN negotiated h2.
         let (_, session) = tls.get_ref();
@@ -337,16 +343,16 @@ impl DohClient {
         //    Wrap the TLS stream in TokioIo for hyper's Read/Write traits.
         let io = TokioIo::new(tls);
         let exec = hyper_util::rt::TokioExecutor::new();
-        let (send_req, conn) = match hyper::client::conn::http2::handshake(
-            exec,
-            io,
-        ).await {
-            Ok(c) => c,
-            Err(e) => {
-                log::warn!("DoH: hyper h2 handshake with {host} ({ip}) failed: {e}");
-                return None;
-            }
-        };
+        let (send_req, conn) =
+            match hyper::client::conn::http2::handshake(exec, io).await {
+                Ok(c) => c,
+                Err(e) => {
+                    log::warn!(
+                        "DoH: hyper h2 handshake with {host} ({ip}) failed: {e}"
+                    );
+                    return None;
+                },
+            };
         // Drive the Connection future in the background. It stays alive as
         // long as the pooled canonical `SendRequest` (and any in-flight
         // clones) hold a reference; once all are dropped h2 sends
@@ -364,8 +370,7 @@ impl DohClient {
 /// Drive a single DoH POST over an established (and pooled) hyper h2
 /// `SendRequest`.
 async fn doh_h2_exchange(
-    send_req: &mut H2SendRequest,
-    host: &str, path: &str, query: &[u8],
+    send_req: &mut H2SendRequest, host: &str, path: &str, query: &[u8],
 ) -> Option<Vec<u8>> {
     // Wait until the connection can open a new stream.
     if send_req.ready().await.is_err() {
@@ -388,7 +393,7 @@ async fn doh_h2_exchange(
         Err(e) => {
             log::warn!("DoH: send_request to {host} failed: {e}");
             return None;
-        }
+        },
     };
 
     if resp.status() != http::StatusCode::OK {
@@ -403,7 +408,7 @@ async fn doh_h2_exchange(
         Err(e) => {
             log::warn!("DoH: body read from {host} failed: {e}");
             return None;
-        }
+        },
     };
     if bytes.is_empty() {
         None

@@ -16,19 +16,19 @@
 
 use std::io;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use parking_lot::Mutex;
 
+use crate::connection::pool::{PoolLifecycle, PoolLimits};
 use crate::connection::{ConnError, ConnectionManager};
 use crate::transport::TransportSession;
 
-use super::config::XhttpConfig;
-use super::h2::HttpSendRequest;
-use super::fallback::FallbackState;
 use super::XhttpSession;
+use super::config::XhttpConfig;
+use super::fallback::FallbackState;
+use super::h2::HttpSendRequest;
 
 // ---------------------------------------------------------------------------
 // PoolEntry — one pooled connection
@@ -40,36 +40,15 @@ use super::XhttpSession;
 /// remaining reuse budget, and expiration time.
 pub(crate) struct PoolEntry {
     send_req: HttpSendRequest,
-    /// Current number of active concurrent streams.
-    running: AtomicU32,
-    /// Remaining reuse budget. `u32::MAX` = unlimited.
-    left_usage: AtomicU32,
-    /// When this connection expires (None = no expiry).
-    unreusable_at: Option<Instant>,
-    /// Creation time (for diagnostics / keep-alive tracking).
-    #[allow(dead_code)]
-    created_at: Instant,
+    /// Protocol-agnostic lifecycle state (counters + TTL).
+    lifecycle: PoolLifecycle,
 }
 
 impl PoolEntry {
     /// Whether this entry can still be reused for a new stream.
-    fn is_reusable(&self, max_concurrency: i32) -> bool {
-        // Check reuse budget
-        if self.left_usage.load(Ordering::Relaxed) == 0 {
+    fn is_reusable(&self, limits: &PoolLimits) -> bool {
+        if !self.lifecycle.is_available(limits) {
             return false;
-        }
-        // Check expiry
-        if let Some(t) = self.unreusable_at {
-            if Instant::now() >= t {
-                return false;
-            }
-        }
-        // Check concurrency limit (0 = unlimited)
-        if max_concurrency > 0 {
-            let running = self.running.load(Ordering::Relaxed) as i32;
-            if running >= max_concurrency {
-                return false;
-            }
         }
         // Check if connection is dead
         match &self.send_req {
@@ -88,9 +67,9 @@ impl PoolEntry {
 /// Reads `XmuxConfig` parameters from `XhttpConfig` to enforce:
 /// - `max_concurrency`: max streams per connection
 /// - `max_connections`: max pooled connections
-/// - `c_max_reuse_times`: max reuses per connection
-/// - `h_max_reusable_secs`: connection TTL
-/// - `h_keep_alive_period`: periodic HEAD keep-alive
+/// - `max_reuses`: max reuses per connection
+/// - `max_reusable_secs`: connection TTL
+/// - `keep_alive_period`: periodic HEAD keep-alive
 ///
 /// When all limits are 0/None (default), behavior matches the old
 /// single-connection-pool pattern.
@@ -101,16 +80,12 @@ pub struct XmuxConnectionManager {
     pub(crate) connections: Mutex<Vec<PoolEntry>>,
     /// Set to `true` by `shutdown()` to mark the manager as permanently closed.
     shutdown: Mutex<bool>,
-    /// Max concurrent streams per H2 connection (0 = unlimited).
-    max_concurrency: i32,
     /// Max pooled H2 connections (0 = unlimited).
-    max_connections: i32,
-    /// Max reuse times per connection (u32::MAX = unlimited).
-    c_max_reuse: u32,
-    /// Connection TTL in seconds (None = no expiry).
-    h_max_reusable_secs: Option<u64>,
+    max_connections: usize,
+    /// Pool lifecycle limits (concurrency, reuse, requests, TTL).
+    limits: PoolLimits,
     /// Keep-alive period in seconds (0 = disabled).
-    h_keep_alive_period: u64,
+    keep_alive_period: u64,
     /// HTTP version fallback state (H3 -> H2).
     fallback: Mutex<FallbackState>,
 }
@@ -119,28 +94,38 @@ impl XmuxConnectionManager {
     /// Create a new manager. Does not connect yet.
     ///
     /// `xmux` is the connection-pool tuning config from `[outbounds.xmux]`.
-    pub fn new(config: Arc<XhttpConfig>, xmux: &crate::transport::xhttp::config::XmuxConfig, addr: std::net::SocketAddr) -> Self {
-        // Read xmux config parameters
-        let max_concurrency = xmux
-            .max_concurrency
-            .as_ref()
-            .map(|r| r.rand_usize() as i32)
-            .unwrap_or(0);
+    pub fn new(
+        config: Arc<XhttpConfig>,
+        xmux: &crate::transport::xhttp::config::XmuxConfig,
+        addr: std::net::SocketAddr,
+    ) -> Self {
+        let limits = PoolLimits {
+            max_concurrency: xmux
+                .max_concurrency
+                .as_ref()
+                .map(|r| r.rand_usize())
+                .unwrap_or(0),
+            max_reuses: xmux
+                .max_reuses
+                .as_ref()
+                .map(|r| r.rand_usize() as u32)
+                .unwrap_or(u32::MAX),
+            max_requests: xmux
+                .max_requests
+                .as_ref()
+                .map(|r| r.rand_usize() as u32)
+                .unwrap_or(u32::MAX),
+            ttl: xmux
+                .max_reusable_secs
+                .as_ref()
+                .map(|r| Duration::from_secs(r.rand_u64())),
+        };
         let max_connections = xmux
             .max_connections
             .as_ref()
-            .map(|r| r.rand_usize() as i32)
+            .map(|r| r.rand_usize())
             .unwrap_or(0);
-        let c_max_reuse = xmux
-            .c_max_reuse_times
-            .as_ref()
-            .map(|r| r.rand_usize() as u32)
-            .unwrap_or(u32::MAX);
-        let h_max_reusable_secs = xmux
-            .h_max_reusable_secs
-            .as_ref()
-            .map(|r| r.rand_usize() as u64);
-        let h_keep_alive_period = xmux.h_keep_alive_period;
+        let keep_alive_period = xmux.keep_alive_period;
         let http_version = super::config::resolve_http_version(&config);
 
         Self {
@@ -148,34 +133,33 @@ impl XmuxConnectionManager {
             addr,
             connections: Mutex::new(Vec::new()),
             shutdown: Mutex::new(false),
-            max_concurrency,
             max_connections,
-            c_max_reuse,
-            h_max_reusable_secs,
-            h_keep_alive_period,
+            limits,
+            keep_alive_period,
             fallback: Mutex::new(FallbackState::new(http_version)),
         }
     }
 
     /// Create a manager that resolves the address on first connect.
-    pub async fn from_config(config: Arc<XhttpConfig>, xmux: &crate::transport::xhttp::config::XmuxConfig) -> io::Result<Self> {
+    pub async fn from_config(
+        config: Arc<XhttpConfig>,
+        xmux: &crate::transport::xhttp::config::XmuxConfig,
+    ) -> io::Result<Self> {
         let addr_str = format!("{}:{}", config.host, config.port);
         let addr = tokio::net::lookup_host(&addr_str)
             .await?
             .next()
             .ok_or_else(|| {
-                io::Error::new(io::ErrorKind::AddrNotAvailable, "DNS resolution failed")
+                io::Error::new(
+                    io::ErrorKind::AddrNotAvailable,
+                    "DNS resolution failed",
+                )
             })?;
         Ok(Self::new(config, xmux, addr))
     }
 
-    /// Resolve the effective `max_concurrency` value.
-    fn effective_max_concurrency(&self) -> i32 {
-        self.max_concurrency
-    }
-
     /// Resolve the effective `max_connections` value.
-    fn effective_max_connections(&self) -> i32 {
+    fn effective_max_connections(&self) -> usize {
         self.max_connections
     }
 
@@ -210,8 +194,6 @@ impl XmuxConnectionManager {
         // connections use H2.
         let _ = effective_version; // Used for logging/future H3 pool support
 
-        let max_conc = self.effective_max_concurrency();
-
         // Phase 1: Try to find a reusable connection from the pool (no await)
         let reusable = {
             let mut pool = self.connections.lock();
@@ -226,26 +208,15 @@ impl XmuxConnectionManager {
                 if dead {
                     return false;
                 }
-                // Check reuse budget
-                if entry.left_usage.load(Ordering::Relaxed) == 0 {
-                    return false;
-                }
-                // Check expiry
-                if let Some(t) = entry.unreusable_at {
-                    if Instant::now() >= t {
-                        return false;
-                    }
-                }
-                true
+                !entry.lifecycle.is_expired() && entry.lifecycle.has_budget()
             });
 
             // 2. Find a reusable entry with available concurrency
             let mut found: Option<HttpSendRequest> = None;
             for entry in pool.iter_mut() {
-                if entry.is_reusable(max_conc) {
+                if entry.is_reusable(&self.limits) {
                     // Found a reusable connection
-                    entry.running.fetch_add(1, Ordering::Relaxed);
-                    entry.left_usage.fetch_sub(1, Ordering::Relaxed);
+                    entry.lifecycle.acquire_slot();
 
                     // Clone the H2 SendRequest
                     if let HttpSendRequest::H2(h2_sr) = &entry.send_req {
@@ -283,21 +254,21 @@ impl XmuxConnectionManager {
             .await
             .map_err(|e| ConnError::CreateFailed(e.to_string()))?;
 
-            // Store in pool (only H2 — H1 can't be cloned for reuse)
-            let now = Instant::now();
-            let unreusable_at = self.h_max_reusable_secs.map(|secs| now + Duration::from_secs(secs));
-            let left_usage = if matches!(send_req, HttpSendRequest::H2(_)) {
-                self.c_max_reuse
+            // Store in pool (only H2 - H1 can't be cloned for reuse)
+            let limits = if matches!(send_req, HttpSendRequest::H2(_)) {
+                self.limits.clone()
             } else {
-                1 // H1: single use, not pooled
+                PoolLimits {
+                    max_reuses: 1,
+                    ..Default::default()
+                } // H1: single use
             };
+            let lifecycle = PoolLifecycle::new(&limits);
+            lifecycle.acquire_slot(); // The creator holds the first slot
 
             let entry = PoolEntry {
                 send_req: send_req.clone_for_pool(),
-                running: AtomicU32::new(1),
-                left_usage: AtomicU32::new(left_usage.saturating_sub(1)),
-                unreusable_at,
-                created_at: now,
+                lifecycle,
             };
 
             let mut pool = self.connections.lock();
@@ -332,9 +303,8 @@ impl XmuxConnectionManager {
         // running > 0 (the pool is best-effort).
         let pool = self.connections.lock();
         for entry in pool.iter() {
-            let current = entry.running.load(Ordering::Relaxed);
-            if current > 0 {
-                entry.running.fetch_sub(1, Ordering::Relaxed);
+            if entry.lifecycle.running_count() > 0 {
+                entry.lifecycle.release_slot();
                 break;
             }
         }
@@ -347,10 +317,7 @@ impl XmuxConnectionManager {
     pub fn inject_connection(&self, send_req: super::h2::H2SendRequest) {
         let entry = PoolEntry {
             send_req: HttpSendRequest::H2(send_req),
-            running: AtomicU32::new(0),
-            left_usage: AtomicU32::new(u32::MAX),
-            unreusable_at: None,
-            created_at: Instant::now(),
+            lifecycle: PoolLifecycle::new(&PoolLimits::default()),
         };
         self.connections.lock().push(entry);
     }
@@ -361,11 +328,12 @@ impl XmuxConnectionManager {
     /// idle timeouts. The task runs until `shutdown()` is called.
     #[allow(dead_code)]
     fn spawn_keep_alive(&self) {
-        if self.h_keep_alive_period == 0 {
+        if self.keep_alive_period == 0 {
             return;
         }
 
-        let pool_ref: Arc<Mutex<Vec<PoolEntry>>> = Arc::new(Mutex::new(Vec::new()));
+        let pool_ref: Arc<Mutex<Vec<PoolEntry>>> =
+            Arc::new(Mutex::new(Vec::new()));
         // We can't directly share `self` across tasks. Instead, we'll
         // use a weak reference pattern. For now, this is a stub —
         // the keep-alive task needs the pool to be in an Arc.
@@ -414,20 +382,25 @@ impl HttpSendRequestClone for HttpSendRequest {
                 // be immediately consumed. In practice, H1 connections
                 // are not stored in the pool (left_usage = 1, used once).
                 panic!("H1 SendRequest cannot be cloned for pool storage");
-            }
+            },
         }
     }
 }
 
 #[async_trait]
 impl ConnectionManager for XmuxConnectionManager {
-    async fn acquire_uplink(&self) -> Result<Box<dyn TransportSession>, ConnError> {
+    async fn acquire_uplink(
+        &self,
+    ) -> Result<Box<dyn TransportSession>, ConnError> {
         let send_req = self.get_or_connect().await?;
-        let session = XhttpSession::from_send_request(self.config.clone(), send_req);
+        let session =
+            XhttpSession::from_send_request(self.config.clone(), send_req);
         Ok(Box::new(session))
     }
 
-    async fn acquire_downlink(&self) -> Result<Box<dyn TransportSession>, ConnError> {
+    async fn acquire_downlink(
+        &self,
+    ) -> Result<Box<dyn TransportSession>, ConnError> {
         // For stream-one: uplink and downlink share the same session.
         // For asymmetric mode (M6): this would create a separate downlink session.
         self.acquire_uplink().await
@@ -467,29 +440,38 @@ impl ConnectionManager for XmuxConnectionManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::obfuscation::range::Range;
     use crate::transport::xhttp::config::{XhttpConfig, XmuxConfig};
     use crate::transport::xhttp::h2::H2SendRequest;
-    use crate::obfuscation::range::Range;
+    use http_body_util::{BodyExt, Full};
+    use hyper::Request;
     use hyper::body::Incoming;
     use hyper::server::conn::http2;
     use hyper::service::service_fn;
-    use hyper::Request;
     use hyper_util::rt::{TokioExecutor, TokioIo};
-    use http_body_util::{BodyExt, Full};
+    use std::sync::atomic::Ordering;
 
     async fn start_echo_server() -> std::net::SocketAddr {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener =
+            tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             loop {
-                let Ok((tcp, _)) = listener.accept().await else { break };
+                let Ok((tcp, _)) = listener.accept().await else {
+                    break;
+                };
                 let io = TokioIo::new(tcp);
                 let exec = TokioExecutor::new();
                 let _ = http2::Builder::new(exec)
                     .serve_connection(
                         io,
                         service_fn(|req: Request<Incoming>| async move {
-                            let bytes = req.into_body().collect().await.unwrap().to_bytes();
+                            let bytes = req
+                                .into_body()
+                                .collect()
+                                .await
+                                .unwrap()
+                                .to_bytes();
                             Ok::<_, std::convert::Infallible>(
                                 hyper::Response::builder()
                                     .status(200)
@@ -508,8 +490,12 @@ mod tests {
         let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
         let io = TokioIo::new(tcp);
         let exec = TokioExecutor::new();
-        let (send_req, conn) = hyper::client::conn::http2::handshake(exec, io).await.unwrap();
-        tokio::spawn(async move { let _ = conn.await; });
+        let (send_req, conn) = hyper::client::conn::http2::handshake(exec, io)
+            .await
+            .unwrap();
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
         send_req
     }
 
@@ -636,7 +622,7 @@ mod tests {
         assert_eq!(pool.len(), 3, "pool should have 3 entries");
         for (i, entry) in pool.iter().enumerate() {
             assert_eq!(
-                entry.running.load(Ordering::Relaxed),
+                entry.lifecycle.running_count(),
                 1,
                 "entry {} should have running=1",
                 i
@@ -651,10 +637,17 @@ mod tests {
         let result = mgr.acquire_uplink().await;
         // The 4th acquire tries to create a temp connection via TLS, which fails.
         // That's fine — the pool itself stays at 3.
-        assert!(result.is_err(), "4th acquire should fail (no reusable, at max_connections)");
+        assert!(
+            result.is_err(),
+            "4th acquire should fail (no reusable, at max_connections)"
+        );
 
         let pool = mgr.connections.lock();
-        assert_eq!(pool.len(), 3, "pool should still have 3 entries after failed 4th acquire");
+        assert_eq!(
+            pool.len(),
+            3,
+            "pool should still have 3 entries after failed 4th acquire"
+        );
     }
 
     #[tokio::test]
@@ -681,10 +674,17 @@ mod tests {
         // so it's not reusable.
         let pool = mgr.connections.lock();
         assert_eq!(pool.len(), 1);
-        let running = pool[0].running.load(Ordering::Relaxed);
+        let running = pool[0].lifecycle.running_count();
         assert_eq!(running, 1, "expected running=1, got {}", running);
         // Verify the entry is not reusable with max_concurrency=1
-        assert!(!pool[0].is_reusable(1), "entry should not be reusable at max concurrency");
+        let test_limits = PoolLimits {
+            max_concurrency: 1,
+            ..Default::default()
+        };
+        assert!(
+            !pool[0].is_reusable(&test_limits),
+            "entry should not be reusable at max concurrency"
+        );
         drop(pool);
 
         // Inject a second connection for the second acquire
@@ -696,18 +696,26 @@ mod tests {
 
         let pool = mgr.connections.lock();
         assert_eq!(pool.len(), 2, "expected 2 pool entries");
-        assert_eq!(pool[0].running.load(Ordering::Relaxed), 1, "entry 0 running should be 1");
-        assert_eq!(pool[1].running.load(Ordering::Relaxed), 1, "entry 1 running should be 1");
+        assert_eq!(
+            pool[0].lifecycle.running_count(),
+            1,
+            "entry 0 running should be 1"
+        );
+        assert_eq!(
+            pool[1].lifecycle.running_count(),
+            1,
+            "entry 1 running should be 1"
+        );
     }
 
     #[tokio::test]
-    async fn xmux_c_max_reuse_times() {
+    async fn xmux_max_reuses() {
         let addr = start_echo_server().await;
         let send_req = connect_plain_h2(addr).await;
 
-        // Test with c_max_reuse_times=2 and unlimited concurrency
+        // Test with max_reuses=2 and unlimited concurrency
         let xmux_cfg = XmuxConfig {
-            c_max_reuse_times: Some(Range::new(2, 2)),
+            max_reuses: Some(Range::new(2, 2)),
             ..Default::default()
         };
         let config = Arc::new(XhttpConfig {
@@ -721,7 +729,7 @@ mod tests {
         // Manually set left_usage to 2 (matching the config)
         {
             let pool = mgr.connections.lock();
-            pool[0].left_usage.store(2, Ordering::Relaxed);
+            pool[0].lifecycle.left_usage.store(2, Ordering::Relaxed);
         }
 
         // First acquire: left_usage 2 -> 1
@@ -729,20 +737,31 @@ mod tests {
         {
             let pool = mgr.connections.lock();
             assert_eq!(pool.len(), 1);
-            assert_eq!(pool[0].left_usage.load(Ordering::Relaxed), 1, "left_usage should be 1 after first acquire");
+            assert_eq!(
+                pool[0].lifecycle.left_usage.load(Ordering::Relaxed),
+                1,
+                "left_usage should be 1 after first acquire"
+            );
         }
 
         // Second acquire: left_usage 1 -> 0
         let _s2 = mgr.acquire_uplink().await.unwrap();
         {
             let pool = mgr.connections.lock();
-            assert_eq!(pool[0].left_usage.load(Ordering::Relaxed), 0, "left_usage should be 0 after second acquire");
+            assert_eq!(
+                pool[0].lifecycle.left_usage.load(Ordering::Relaxed),
+                0,
+                "left_usage should be 0 after second acquire"
+            );
         }
 
         // Third acquire: connection is exhausted (left_usage=0), should be cleaned up
         // and a new connection created via h2::connect. This will fail with TLS error.
         let result = mgr.acquire_uplink().await;
-        assert!(result.is_err(), "third acquire should fail (can't create new TLS connection in test)");
+        assert!(
+            result.is_err(),
+            "third acquire should fail (can't create new TLS connection in test)"
+        );
 
         // Verify the exhausted entry was cleaned up
         let pool = mgr.connections.lock();
@@ -750,12 +769,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn xmux_h_max_reusable_secs() {
+    async fn xmux_max_reusable_secs() {
         let addr = start_echo_server().await;
         let send_req = connect_plain_h2(addr).await;
 
         let xmux_cfg = XmuxConfig {
-            h_max_reusable_secs: Some(Range::new(0, 0)), // Expires immediately
+            max_reusable_secs: Some(Range::new(0, 0)), // Expires immediately
             ..Default::default()
         };
         let config = Arc::new(XhttpConfig {
@@ -769,14 +788,17 @@ mod tests {
         // Manually set the unreusable_at to the past
         {
             let mut pool = mgr.connections.lock();
-            pool[0].unreusable_at = Some(Instant::now()); // Expired
+            pool[0].lifecycle.unreusable_at = Some(std::time::Instant::now()); // Expired
         }
 
         // Next acquire should find the entry expired and clean it up.
         // Since no reusable connection exists, it tries to create a new one
         // via h2::connect, which will fail with TLS error.
         let result = mgr.acquire_uplink().await;
-        assert!(result.is_err(), "acquire should fail (no reusable, can't create new TLS connection)");
+        assert!(
+            result.is_err(),
+            "acquire should fail (no reusable, can't create new TLS connection)"
+        );
 
         // Verify the expired entry was cleaned up
         let pool = mgr.connections.lock();
@@ -805,7 +827,7 @@ mod tests {
         let pool = mgr.connections.lock();
         assert_eq!(pool.len(), 1, "default config should use single connection");
         assert_eq!(
-            pool[0].running.load(Ordering::Relaxed),
+            pool[0].lifecycle.running_count(),
             3,
             "should have 3 active streams"
         );
@@ -826,7 +848,7 @@ mod tests {
         let _session = mgr.acquire_uplink().await.unwrap();
 
         let pool = mgr.connections.lock();
-        assert_eq!(pool[0].running.load(Ordering::Relaxed), 1);
+        assert_eq!(pool[0].lifecycle.running_count(), 1);
         drop(pool);
 
         // Release: drop the session, then call release_handle to decrement running.
@@ -836,7 +858,7 @@ mod tests {
 
         let pool = mgr.connections.lock();
         assert_eq!(
-            pool[0].running.load(Ordering::Relaxed),
+            pool[0].lifecycle.running_count(),
             0,
             "running should be 0 after release"
         );

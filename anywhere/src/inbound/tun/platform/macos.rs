@@ -4,7 +4,18 @@
 //! Unlike Linux's rtnetlink approach, macOS keeps it simple with shell commands.
 
 use std::net::IpAddr;
+use std::net::SocketAddr;
 use std::process::Command;
+use std::process::Stdio;
+use std::time::Duration;
+use std::time::Instant;
+use tokio::io::AsyncBufReadExt;
+
+const ROUTE_ECHO_SUPPRESSION: Duration = Duration::from_secs(10);
+static RECENT_ROUTE_COMMAND_PIDS: std::sync::Mutex<Vec<(u32, Instant)>> =
+    std::sync::Mutex::new(Vec::new());
+static NETWORK_DIAGNOSTICS_LAST: std::sync::Mutex<Option<Instant>> =
+    std::sync::Mutex::new(None);
 
 /// Route manager for macOS TUN interface.
 ///
@@ -23,6 +34,8 @@ pub struct MacosTunManager {
     routes_installed: bool,
     /// Original default gateway (if captured).
     original_gateway: Option<IpAddr>,
+    /// Original physical interface (en0/en1/…, if captured).
+    physical_iface: Option<String>,
     /// Whether DNS hijacking is active (copied from config at startup).
     auto_hijack: bool,
     /// Whether fake-ip mode is enabled (only set system DNS when fakeip is on).
@@ -31,14 +44,12 @@ pub struct MacosTunManager {
     original_dns: Option<Vec<String>>,
     /// Network service name (e.g. "Wi-Fi") for DNS restore.
     network_service: Option<String>,
+    /// Whether system DNS was modified and still needs restoration.
+    system_dns_modified: bool,
 }
 
 impl MacosTunManager {
-    pub fn new(
-        iface_name: String,
-        tun_addr: IpAddr,
-        auto_hijack: bool,
-    ) -> Self {
+    pub fn new(iface_name: String, tun_addr: IpAddr, auto_hijack: bool) -> Self {
         Self {
             iface_name,
             tun_addr,
@@ -46,10 +57,12 @@ impl MacosTunManager {
             pf_rules_installed: false,
             routes_installed: false,
             original_gateway: None,
+            physical_iface: None,
             auto_hijack,
             fakeip_enabled: false,
             original_dns: None,
             network_service: None,
+            system_dns_modified: false,
         }
     }
 
@@ -81,12 +94,11 @@ impl MacosTunManager {
     /// default 0.0.0.0/0 route, so all traffic goes through TUN without
     /// touching the original default route.
     pub fn setup_routing(
-        &mut self,
-        auto_hijack: bool,
-        _bypass_ips: &[String],
+        &mut self, auto_hijack: bool, _bypass_ips: &[String],
     ) -> Result<(), String> {
         // Save original default gateway for reference.
         self.original_gateway = get_default_gateway();
+        self.physical_iface = default_physical_iface();
 
         // Find the actual TUN interface name for -ifscope.
         let tun_iface = find_tun_interface_name();
@@ -99,30 +111,14 @@ impl MacosTunManager {
         // the host route makes the gateway (10.0.0.1) resolve to utun4,
         // so IP_BOUND_IF=en0 ignores split routes (output=utun4).
         let tun_addr_str = self.tun_addr.to_string();
-        run_route_cmd(&[
-            "-n", "add",
-            "-net", "0.0.0.0/1",
-            &tun_addr_str,
-        ])?;
+        run_route_cmd(&["-n", "add", "-net", "0.0.0.0/1", &tun_addr_str])?;
 
-        run_route_cmd(&[
-            "-n", "add",
-            "-net", "128.0.0.0/1",
-            &tun_addr_str,
-        ])?;
+        run_route_cmd(&["-n", "add", "-net", "128.0.0.0/1", &tun_addr_str])?;
 
         // IPv6 split routes (if applicable).
         if let IpAddr::V6(_) = self.tun_addr {
-            run_route_cmd(&[
-                "-n", "add",
-                "-net", "::/1",
-                &tun_addr_str,
-            ])?;
-            run_route_cmd(&[
-                "-n", "add",
-                "-net", "8000::/1",
-                &tun_addr_str,
-            ])?;
+            run_route_cmd(&["-n", "add", "-net", "::/1", &tun_addr_str])?;
+            run_route_cmd(&["-n", "add", "-net", "8000::/1", &tun_addr_str])?;
         }
 
         // Bypass routes for private networks so LAN traffic doesn't
@@ -142,16 +138,21 @@ impl MacosTunManager {
             // Use the original gateway as the next-hop for private subnets.
             if let Some(gw) = self.original_gateway {
                 let _ = run_route_cmd(&[
-                    "-n", "add",
-                    "-net", subnet,
+                    "-n",
+                    "add",
+                    "-net",
+                    subnet,
                     &gw.to_string(),
                 ]);
             } else {
-                // No gateway found — add direct interface route via default route.
+                // No gateway found - add direct interface route via default route.
                 let _ = run_route_cmd(&[
-                    "-n", "add",
-                    "-net", subnet,
-                    "-interface", "en0",
+                    "-n",
+                    "add",
+                    "-net",
+                    subnet,
+                    "-interface",
+                    self.physical_iface.as_deref().unwrap_or("en0"),
                 ]);
             }
         }
@@ -162,19 +163,41 @@ impl MacosTunManager {
         // (split routes' gateway resolves via en0, not utun).
         // The host route (/32) is more specific than the /8 bypass route.
         let _ = run_route_cmd(&[
-            "-n", "add",
-            "-host", &self.tun_addr.to_string(),
-            "-interface", &tun_iface,
+            "-n",
+            "add",
+            "-host",
+            &self.tun_addr.to_string(),
+            "-interface",
+            &tun_iface,
         ]);
         log::info!("Added host route {} via {}", self.tun_addr, tun_iface);
         // Add default routes scoped to en0 for IP_BOUND_IF.
         // macOS IP_BOUND_IF may require scoped routes to find a path.
         if let Some(gw) = self.original_gateway {
             let gw_s = gw.to_string();
-            let _ = run_route_cmd(&["-n", "add", "-net", "0.0.0.0/1", "-ifscope", "en0", &gw_s]);
-            let _ = run_route_cmd(&["-n", "add", "-net", "128.0.0.0/1", "-ifscope", "en0", &gw_s]);
-            log::info!("Added en0-scoped default routes via {gw_s}");
+            let iface = self.physical_iface.as_deref().unwrap_or("en0");
+            let _ = run_route_cmd(&[
+                "-n",
+                "add",
+                "-net",
+                "0.0.0.0/1",
+                "-ifscope",
+                iface,
+                &gw_s,
+            ]);
+            let _ = run_route_cmd(&[
+                "-n",
+                "add",
+                "-net",
+                "128.0.0.0/1",
+                "-ifscope",
+                iface,
+                &gw_s,
+            ]);
+            log::info!("Added {iface}-scoped default routes via {gw_s}");
         }
+
+        crate::outbound::common::refresh_macos_physical_iface_cache();
 
         self.routes_installed = true;
         log::info!(
@@ -183,10 +206,8 @@ impl MacosTunManager {
             self.original_gateway
         );
 
-        // Install pf route-to bypass rules so direct outbound traffic
-        // bypasses TUN. Direct outbound sockets bind to en0 source IP;
-        // pf matches `from <en0_ip>` and redirects to original gateway.
-        // IP_BOUND_IF does NOT work (gateway unreachable → ENETUNREACH).
+        // Install the minimal PF rules required by TUN mode.
+        // Direct outbound traffic uses IP_BOUND_IF with scoped routes.
         self.setup_bypass_pf()?;
 
         // DNS hijacking: set system DNS to a public IP so mDNSResponder
@@ -243,11 +264,16 @@ impl MacosTunManager {
 
         // Save original DNS servers.
         let original = run_networksetup_cmd(&["-getdnsservers", &service]);
-        let original_dns: Vec<String> = if original.contains("There aren't any DNS Servers set") {
-            Vec::new()
-        } else {
-            original.lines().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()
-        };
+        let original_dns: Vec<String> =
+            if original.contains("There aren't any DNS Servers set") {
+                Vec::new()
+            } else {
+                original
+                    .lines()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            };
         self.original_dns = Some(original_dns.clone());
         self.network_service = Some(service.clone());
 
@@ -256,22 +282,43 @@ impl MacosTunManager {
         // Using 223.5.5.5 and 114.114.114.114 (Alibaba DNS) as they are
         // fast public resolvers in China. The actual resolution is handled
         // by anywhere's DNS engine (direct upstream), not these IPs directly.
-        let _ = Command::new("networksetup")
+        let set_dns_result = Command::new("networksetup")
             .args(["-setdnsservers", &service, "223.5.5.5", "114.114.114.114"])
             .output();
-        log::info!("DNS hijack: system DNS set to 223.5.5.5, 114.114.114.114 (was {:?})", original_dns);
+        let set_dns_success = set_dns_result
+            .as_ref()
+            .is_ok_and(|output| output.status.success());
+        if set_dns_success {
+            self.system_dns_modified = true;
+        } else {
+            log::warn!("DNS hijack: failed to set system DNS servers");
+        }
+        log::info!(
+            "DNS hijack: system DNS set to 223.5.5.5, 114.114.114.114 (was {:?})",
+            original_dns
+        );
 
         // Flush DNS cache so mDNSResponder picks up the new servers.
         let _ = Command::new("dscacheutil").arg("-flushcache").output();
-        let _ = Command::new("killall").arg("-HUP").arg("mDNSResponder").output();
+        let _ = Command::new("killall")
+            .arg("-HUP")
+            .arg("mDNSResponder")
+            .output();
 
         Ok(())
     }
 
     /// Restore original system DNS servers.
     fn restore_system_dns(&mut self) {
-        let Some(ref service) = self.network_service else { return };
-        let Some(ref original) = self.original_dns else { return };
+        if !self.system_dns_modified {
+            return;
+        }
+        let Some(ref service) = self.network_service else {
+            return;
+        };
+        let Some(ref original) = self.original_dns else {
+            return;
+        };
 
         if original.is_empty() {
             // Clear DNS (back to DHCP-assigned): pass no server args.
@@ -281,15 +328,17 @@ impl MacosTunManager {
         } else {
             let mut args = vec!["-setdnsservers".to_string(), service.clone()];
             args.extend(original.iter().cloned());
-            let _ = Command::new("networksetup")
-                .args(&args)
-                .output();
+            let _ = Command::new("networksetup").args(&args).output();
         }
         log::info!("DNS hijack: system DNS restored to {:?}", original);
+        self.system_dns_modified = false;
 
         // Flush DNS cache.
         let _ = Command::new("dscacheutil").arg("-flushcache").output();
-        let _ = Command::new("killall").arg("-HUP").arg("mDNSResponder").output();
+        let _ = Command::new("killall")
+            .arg("-HUP")
+            .arg("mDNSResponder")
+            .output();
     }
 
     /// Find the primary network service name by looking up the default
@@ -320,12 +369,15 @@ impl MacosTunManager {
                 let line = line.trim();
                 if let Some(rest) = line.strip_prefix("Hardware Port:") {
                     last_port = Some(rest.trim().to_string());
-                } else if line.strip_prefix("Device:").map(|s| s.trim()) == Some(iface) {
+                } else if line.strip_prefix("Device:").map(|s| s.trim())
+                    == Some(iface)
+                {
                     if let Some(port) = &last_port {
                         // Verify this service has a real IPv4 address.
                         let info = run_networksetup_cmd(&["-getinfo", port]);
                         let has_ipv4 = info.lines().any(|l| {
-                            l.trim().starts_with("IP address") && !l.contains("none")
+                            l.trim().starts_with("IP address")
+                                && !l.contains("none")
                         });
                         if has_ipv4 {
                             return Some(port.clone());
@@ -339,41 +391,41 @@ impl MacosTunManager {
         log::debug!("DNS hijack: falling back to service iteration");
         run_networksetup_cmd(&["-listallnetworkservices"])
             .lines()
-            .filter(|l| !l.is_empty() && !l.starts_with('*') && !l.starts_with("An asterisk"))
+            .filter(|l| {
+                !l.is_empty()
+                    && !l.starts_with('*')
+                    && !l.starts_with("An asterisk")
+            })
             .find(|l| {
                 let info = run_networksetup_cmd(&["-getinfo", l]);
                 info.lines().any(|line| {
-                    line.trim().starts_with("IP address") && !line.contains("none")
+                    line.trim().starts_with("IP address")
+                        && !line.contains("none")
                 })
             })
             .map(|s| s.trim().to_string())
     }
 
-    /// Install pf `route-to` rules to bypass TUN for direct outbound traffic.
+    /// Install the minimal PF rules required by TUN mode.
     ///
-    /// On macOS, split routes (0.0.0.0/1 + 128.0.0.0/1) capture ALL traffic.
-    /// IP_BOUND_IF doesn't work because the route gateway (TUN address) is
-    /// unreachable via the bound physical interface → ENETUNREACH.
+    /// Direct outbound traffic uses IP_BOUND_IF with scoped physical routes.
+    /// PF `route-to` is deliberately avoided because it can black-hole after
+    /// macOS Deep Idle reinitializes the physical interface.
     ///
-    /// Solution: pf `route-to` operates at the packet level AFTER route
-    /// lookup. Direct outbound sockets bind to the en0 source IP; pf
-    /// matches `from <en0_ip>` and redirects the packet to the original
-    /// gateway via en0, bypassing TUN entirely.
     fn setup_bypass_pf(&mut self) -> Result<(), String> {
-
         let en0_ip = match get_en0_ipv4() {
             Some(ip) => ip,
             None => {
                 log::warn!("No en0 IPv4 found; skipping pf bypass");
                 return Ok(());
-            }
+            },
         };
         let gw_str = match &self.original_gateway {
             Some(gw) => gw.to_string(),
             None => {
                 log::warn!("No default gateway found; skipping pf bypass");
                 return Ok(());
-            }
+            },
         };
 
         let iface = default_physical_iface().unwrap_or_else(|| "en0".to_string());
@@ -390,10 +442,13 @@ impl MacosTunManager {
         // to avoid a duplicate ifconfig fork.
         let tun_iface = find_tun_interface_name();
         log::info!("TUN interface detected: {tun_iface}");
-        log::info!("setup_bypass_pf: tun_iface={tun_iface}, en0_ip={en0_ip}, gw={gw_str}, iface={iface}");
+        log::info!(
+            "setup_bypass_pf: tun_iface={tun_iface}, en0_ip={en0_ip}, gw={gw_str}, iface={iface}"
+        );
 
-        // With IP_BOUND_IF + host route, no pf route-to/nat rules needed.
-        // pf is only used for DNS hijack (rdr) and lo0 protection.
+        // Keep PF free of route-to rules. Direct sockets use IP_BOUND_IF and
+        // scoped physical routes instead; route-to can black-hole after deep
+        // idle when macOS reinitializes the physical interface.
         let nat_rule = "";
         let filter_rules = format!(
             "pass out quick on lo0 inet proto {{ tcp udp }} keep state\n",
@@ -402,7 +457,9 @@ impl MacosTunManager {
         // Insert nat rule before filtering section, filter rules after load anchor.
         let mut combined = String::new();
         for line in existing_pf.lines() {
-            if line == "anchor \"com.apple/*\"" && !existing_pf.contains("anywhere_nat") {
+            if line == "anchor \"com.apple/*\""
+                && !existing_pf.contains("anywhere_nat")
+            {
                 combined.push_str("# anywhere nat rule (translation)\n");
                 combined.push_str(&nat_rule);
             }
@@ -416,8 +473,11 @@ impl MacosTunManager {
             }
         }
 
-        std::fs::write("/tmp/anywhere_bypass.pf", &format!("{nat_rule}{filter_rules}"))
-            .map_err(|e| format!("Failed to write bypass rules: {e}"))?;
+        std::fs::write(
+            "/tmp/anywhere_bypass.pf",
+            &format!("{nat_rule}{filter_rules}"),
+        )
+        .map_err(|e| format!("Failed to write bypass rules: {e}"))?;
 
         // Write the combined pf.conf and load it.
         std::fs::write("/tmp/anywhere_combined.pf", &combined)
@@ -434,7 +494,7 @@ impl MacosTunManager {
 
         self.pf_bypass_installed = true;
         log::info!(
-            "macOS pf bypass installed: nat on {tun_iface} + route-to {iface} via {gw_str} (en0_ip={en0_ip})"
+            "macOS PF bypass installed: lo0 state rules only (tun_iface={tun_iface})"
         );
         Ok(())
     }
@@ -539,22 +599,64 @@ impl MacosTunManager {
             let tun_addr_str = self.tun_addr.to_string();
 
             // Delete split routes.
-            let _ = run_route_cmd(&["-n", "delete", "-net", "0.0.0.0/1", &tun_addr_str]);
-            let _ = run_route_cmd(&["-n", "delete", "-net", "128.0.0.0/1", &tun_addr_str]);
+            let _ = run_route_cmd(&[
+                "-n",
+                "delete",
+                "-net",
+                "0.0.0.0/1",
+                &tun_addr_str,
+            ]);
+            let _ = run_route_cmd(&[
+                "-n",
+                "delete",
+                "-net",
+                "128.0.0.0/1",
+                &tun_addr_str,
+            ]);
 
             if let IpAddr::V6(_) = self.tun_addr {
-                let _ = run_route_cmd(&["-n", "delete", "-net", "::/1", &tun_addr_str]);
-                let _ = run_route_cmd(&["-n", "delete", "-net", "8000::/1", &tun_addr_str]);
+                let _ = run_route_cmd(&[
+                    "-n",
+                    "delete",
+                    "-net",
+                    "::/1",
+                    &tun_addr_str,
+                ]);
+                let _ = run_route_cmd(&[
+                    "-n",
+                    "delete",
+                    "-net",
+                    "8000::/1",
+                    &tun_addr_str,
+                ]);
             }
 
             // Delete host route for TUN address.
             let _ = run_route_cmd(&["-n", "delete", "-host", &tun_addr_str]);
 
-            // Delete en0-scoped default routes (added for IP_BOUND_IF).
+            // Delete physical-interface-scoped default routes (added for
+            // IP_BOUND_IF).
             if let Some(gw) = &self.original_gateway {
                 let gw_s = gw.to_string();
-                let _ = run_route_cmd(&["-n", "delete", "-net", "0.0.0.0/1", "-ifscope", "en0", &gw_s]);
-                let _ = run_route_cmd(&["-n", "delete", "-net", "128.0.0.0/1", "-ifscope", "en0", &gw_s]);
+                let iface = self.physical_iface.as_deref().unwrap_or("en0");
+                let _ = run_route_cmd(&[
+                    "-n",
+                    "delete",
+                    "-net",
+                    "0.0.0.0/1",
+                    "-ifscope",
+                    iface,
+                    &gw_s,
+                ]);
+                let _ = run_route_cmd(&[
+                    "-n",
+                    "delete",
+                    "-net",
+                    "128.0.0.0/1",
+                    "-ifscope",
+                    iface,
+                    &gw_s,
+                ]);
             }
 
             // Delete bypass routes (only the ones we actually install).
@@ -598,6 +700,144 @@ impl MacosTunManager {
     pub fn is_routing_enabled(&self) -> bool {
         self.routes_installed
     }
+
+    /// Reinstall missing TUN routes after a wake and replace old physical
+    /// bypass routes when the default gateway or interface changes.
+    ///
+    /// Returns false while the physical network has not become ready yet.
+    fn reconcile_routes(&mut self) -> bool {
+        let Some(gateway) = get_default_gateway() else {
+            return false;
+        };
+        let Some(iface) = default_physical_iface() else {
+            return false;
+        };
+        if !physical_iface_is_ready(&iface, gateway.is_ipv4()) {
+            log::debug!("macOS physical interface {iface} is not ready");
+            return false;
+        }
+
+        let network_changed = self.original_gateway != Some(gateway)
+            || self.physical_iface.as_deref() != Some(iface.as_str());
+        if network_changed {
+            log::info!(
+                "macOS physical network changed: gateway {:?} -> {gateway}, iface {:?} -> {iface}",
+                self.original_gateway,
+                self.physical_iface
+            );
+            self.remove_physical_bypass_routes();
+        }
+
+        self.original_gateway = Some(gateway);
+        self.physical_iface = Some(iface.clone());
+
+        let tun_iface = find_tun_interface_name();
+        let tun_addr = self.tun_addr.to_string();
+        let gateway_s = gateway.to_string();
+
+        if replace_route(&["-net", "0.0.0.0/1", &tun_addr]).is_err() {
+            return false;
+        }
+        if replace_route(&["-net", "128.0.0.0/1", &tun_addr]).is_err() {
+            return false;
+        }
+
+        if let IpAddr::V6(_) = self.tun_addr {
+            if replace_route(&["-net", "::/1", &tun_addr]).is_err() {
+                return false;
+            }
+            if replace_route(&["-net", "8000::/1", &tun_addr]).is_err() {
+                return false;
+            }
+        }
+
+        if network_changed {
+            for subnet in &[
+                "172.16.0.0/12",
+                "192.168.0.0/16",
+                "169.254.0.0/16",
+                "224.0.0.0/4",
+            ] {
+                if run_route_cmd(&["-n", "add", "-net", subnet, &gateway_s])
+                    .is_err()
+                {
+                    return false;
+                }
+            }
+        }
+
+        if replace_route(&["-host", &tun_addr, "-interface", &tun_iface]).is_err()
+        {
+            return false;
+        }
+        if recreate_scoped_route(&[
+            "-net",
+            "0.0.0.0/1",
+            "-ifscope",
+            &iface,
+            &gateway_s,
+        ])
+        .is_err()
+        {
+            return false;
+        }
+        if recreate_scoped_route(&[
+            "-net",
+            "128.0.0.0/1",
+            "-ifscope",
+            &iface,
+            &gateway_s,
+        ])
+        .is_err()
+        {
+            return false;
+        }
+
+        self.routes_installed = true;
+        crate::outbound::common::refresh_macos_physical_iface_cache();
+        if network_changed {
+            log::info!(
+                "macOS TUN routes reconciled for gateway {gateway_s} via {iface}"
+            );
+        } else {
+            log::info!("macOS TUN routes reconciled after route/interface event");
+        }
+        true
+    }
+
+    fn remove_physical_bypass_routes(&self) {
+        for subnet in &[
+            "172.16.0.0/12",
+            "192.168.0.0/16",
+            "169.254.0.0/16",
+            "224.0.0.0/4",
+        ] {
+            let _ = run_route_cmd(&["-n", "delete", "-net", subnet]);
+        }
+
+        if let Some(gateway) = self.original_gateway {
+            let gateway_s = gateway.to_string();
+            let iface = self.physical_iface.as_deref().unwrap_or("en0");
+            let _ = run_route_cmd(&[
+                "-n",
+                "delete",
+                "-net",
+                "0.0.0.0/1",
+                "-ifscope",
+                iface,
+                &gateway_s,
+            ]);
+            let _ = run_route_cmd(&[
+                "-n",
+                "delete",
+                "-net",
+                "128.0.0.0/1",
+                "-ifscope",
+                iface,
+                &gateway_s,
+            ]);
+        }
+    }
 }
 
 impl Drop for MacosTunManager {
@@ -606,12 +846,346 @@ impl Drop for MacosTunManager {
     }
 }
 
+/// Watch for route loss after sleep and gateway/interface changes while TUN
+/// routing is enabled.
+pub async fn run_route_watcher(
+    manager: std::sync::Arc<std::sync::Mutex<MacosTunManager>>,
+    shutdown: tokio_util::sync::CancellationToken,
+) {
+    let mut restart_delay = Duration::from_secs(1);
+    loop {
+        let mut monitor = match tokio::process::Command::new("route")
+            .args(["-n", "monitor"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(monitor) => monitor,
+            Err(e) => {
+                log::warn!(
+                    "macOS route watcher: failed to start route monitor: {e}"
+                );
+                if shutdown.is_cancelled() {
+                    return;
+                }
+                tokio::time::sleep(restart_delay).await;
+                restart_delay = (restart_delay * 2).min(Duration::from_secs(30));
+                continue;
+            },
+        };
+
+        let stdout = match monitor.stdout.take() {
+            Some(stdout) => stdout,
+            None => {
+                log::warn!("macOS route watcher: route monitor has no stdout");
+                let _ = monitor.kill().await;
+                if shutdown.is_cancelled() {
+                    return;
+                }
+                tokio::time::sleep(restart_delay).await;
+                continue;
+            },
+        };
+
+        let mut lines = tokio::io::BufReader::new(stdout).lines();
+        let mut last_reconcile = Instant::now();
+        let mut gateway_probe_interval =
+            tokio::time::interval(Duration::from_secs(5));
+        gateway_probe_interval
+            .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        log::info!("macOS route watcher: route monitor started");
+
+        loop {
+            tokio::select! {
+                _ = shutdown.cancelled() => {
+                    let _ = monitor.kill().await;
+                    return;
+                },
+                line = lines.next_line() => {
+                    let line = match line {
+                        Ok(Some(line)) => line,
+                        Err(e) => {
+                            log::warn!("macOS route watcher: read failed: {e}");
+                            break;
+                        },
+                        Ok(None) => {
+                            log::warn!("macOS route watcher: route monitor exited");
+                            break;
+                        },
+                    };
+
+                    if !route_event_requires_reconciliation(&line) {
+                        continue;
+                    }
+                    if route_event_is_from_own_command(&line) {
+                        continue;
+                    }
+                    if last_reconcile.elapsed() < Duration::from_secs(5) {
+                        continue;
+                    }
+
+                    log::debug!("macOS route watcher: {line}");
+                    last_reconcile = Instant::now();
+                    reconcile_routes_with_retries(&manager, &shutdown).await;
+                },
+                _ = gateway_probe_interval.tick() => {
+                    let (gateway, routes_installed) = {
+                        let Ok(manager) = manager.lock() else {
+                            continue;
+                        };
+                        (manager.original_gateway, manager.routes_installed)
+                    };
+                    if !routes_installed {
+                        continue;
+                    }
+                    let Some(gateway) = gateway else {
+                        continue;
+                    };
+                    if physical_gateway_probe(gateway).await {
+                        continue;
+                    }
+
+                    log::warn!("macOS physical gateway probe failed: {gateway}");
+                    last_reconcile = Instant::now();
+                    reconcile_routes_with_retries(&manager, &shutdown).await;
+                },
+            }
+        }
+
+        let _ = monitor.wait().await;
+        if shutdown.is_cancelled() {
+            return;
+        }
+
+        tokio::time::sleep(restart_delay).await;
+        restart_delay = (restart_delay * 2).min(Duration::from_secs(30));
+    }
+}
+
+async fn physical_gateway_probe(gateway: IpAddr) -> bool {
+    if gateway.is_ipv6() {
+        return true;
+    }
+
+    let bind_addr = SocketAddr::new(IpAddr::from([0, 0, 0, 0]), 0);
+    let probe_addr = SocketAddr::new(gateway, 9);
+    let socket = match crate::outbound::common::bind_udp_bypass(bind_addr).await {
+        Ok(socket) => socket,
+        Err(e) => {
+            log::debug!("macOS gateway probe bind failed: {e}");
+            return false;
+        },
+    };
+    if let Err(e) = socket.connect(probe_addr).await {
+        log::debug!("macOS gateway probe connect failed: {e}");
+        return false;
+    }
+    match socket.send(&[0]).await {
+        Ok(_) => true,
+        Err(e) => {
+            log::debug!("macOS gateway probe send failed: {e}");
+            false
+        },
+    }
+}
+
+async fn reconcile_routes_with_retries(
+    manager: &std::sync::Arc<std::sync::Mutex<MacosTunManager>>,
+    shutdown: &tokio_util::sync::CancellationToken,
+) {
+    let mut retry_delay = Duration::from_millis(250);
+    for _ in 0..20 {
+        tokio::time::sleep(retry_delay).await;
+        if shutdown.is_cancelled() {
+            return;
+        }
+        retry_delay = (retry_delay * 2).min(Duration::from_secs(1));
+
+        let reconciled = match manager.lock() {
+            Ok(mut manager) => manager.reconcile_routes(),
+            Err(_) => false,
+        };
+        if reconciled {
+            return;
+        }
+        log::warn!("macOS physical network not ready after wake; retrying");
+    }
+}
+
+fn route_event_requires_reconciliation(line: &str) -> bool {
+    line.starts_with("RTM_DELETE:")
+        || line.starts_with("RTM_CHANGE:")
+        || line.starts_with("RTM_IFINFO:")
+        || line.starts_with("RTM_IFANNOUNCE:")
+        || line.starts_with("RTM_NEWADDR:")
+        || line.starts_with("RTM_DELADDR:")
+}
+
+fn replace_route(route_args: &[&str]) -> Result<(), String> {
+    let mut change_args = vec!["-n", "change"];
+    change_args.extend_from_slice(route_args);
+    if let Err(e) = run_route_cmd(&change_args) {
+        log::debug!("route change failed, adding instead: {e}");
+        let mut add_args = vec!["-n", "add"];
+        add_args.extend_from_slice(route_args);
+        return run_route_cmd(&add_args);
+    }
+    Ok(())
+}
+
+fn recreate_scoped_route(route_args: &[&str]) -> Result<(), String> {
+    let mut delete_args = vec!["-n", "delete"];
+    delete_args.extend_from_slice(route_args);
+    let _ = run_route_cmd(&delete_args);
+
+    let mut add_args = vec!["-n", "add"];
+    add_args.extend_from_slice(route_args);
+    run_route_cmd(&add_args)
+}
+
+fn route_event_pid(line: &str) -> Option<u32> {
+    let pid_section = line.split("pid:").nth(1)?;
+    let pid = pid_section.split(',').next()?.trim();
+    pid.parse().ok()
+}
+
+fn record_route_command_pid(pid: u32) {
+    if let Ok(mut recent_pids) = RECENT_ROUTE_COMMAND_PIDS.lock() {
+        recent_pids.retain(|(_, recorded_at)| {
+            recorded_at.elapsed() < ROUTE_ECHO_SUPPRESSION
+        });
+        recent_pids.push((pid, Instant::now()));
+    }
+}
+
+fn route_event_is_from_own_command(line: &str) -> bool {
+    let Some(pid) = route_event_pid(line) else {
+        return false;
+    };
+
+    let Ok(mut recent_pids) = RECENT_ROUTE_COMMAND_PIDS.lock() else {
+        return false;
+    };
+    recent_pids.retain(|(_, recorded_at)| {
+        recorded_at.elapsed() < ROUTE_ECHO_SUPPRESSION
+    });
+    recent_pids.iter().any(|(recent_pid, _)| *recent_pid == pid)
+}
+
+pub fn log_network_diagnostics(destination: IpAddr) {
+    let Ok(mut last_diagnostics) = NETWORK_DIAGNOSTICS_LAST.lock() else {
+        return;
+    };
+    let now = Instant::now();
+    if last_diagnostics
+        .is_some_and(|last| now.duration_since(last) < Duration::from_secs(10))
+    {
+        return;
+    }
+    *last_diagnostics = Some(now);
+
+    let default_route = run_diagnostic_cmd("route", &["-n", "get", "default"]);
+    log::warn!("macOS network diagnostics: default route\n{default_route}");
+
+    let gateway = default_route
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("gateway:"))
+        .map(str::trim);
+    let iface = default_route
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("interface:"))
+        .map(str::trim);
+
+    if let Some(iface) = iface {
+        let interface = run_diagnostic_cmd("ifconfig", &[iface]);
+        log::warn!("macOS network diagnostics: ifconfig {iface}\n{interface}");
+
+        let destination_str = destination.to_string();
+        let scoped_route = run_diagnostic_cmd(
+            "route",
+            &["-n", "get", "-ifscope", iface, &destination_str],
+        );
+        log::warn!(
+            "macOS network diagnostics: {iface}-scoped route to {destination}\n{scoped_route}"
+        );
+    }
+
+    let destination_str = destination.to_string();
+    let destination_route =
+        run_diagnostic_cmd("route", &["-n", "get", &destination_str]);
+    log::warn!(
+        "macOS network diagnostics: route to {destination}\n{destination_route}"
+    );
+
+    let routing_table = run_diagnostic_cmd("netstat", &["-rn", "-f", "inet"]);
+    log::warn!("macOS network diagnostics: IPv4 routes\n{routing_table}");
+
+    if let Some(gateway) = gateway {
+        let arp = run_diagnostic_cmd("arp", &["-n", gateway]);
+        log::warn!("macOS network diagnostics: ARP {gateway}\n{arp}");
+        let ping =
+            run_diagnostic_cmd("ping", &["-c", "1", "-W", "1000", gateway]);
+        log::warn!("macOS network diagnostics: ping {gateway}\n{ping}");
+    }
+}
+
+fn run_diagnostic_cmd(command: &str, args: &[&str]) -> String {
+    match Command::new(command).args(args).output() {
+        Ok(output) => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            format!("{stdout}{stderr}").trim().to_string()
+        },
+        Err(e) => format!("failed to run {command}: {e}"),
+    }
+}
+
+fn physical_iface_is_ready(iface: &str, require_ipv4: bool) -> bool {
+    let output = Command::new("ifconfig").arg(iface).output();
+    let stdout = match output {
+        Ok(output) => String::from_utf8_lossy(&output.stdout).into_owned(),
+        Err(_) => return false,
+    };
+    interface_output_is_ready(&stdout, require_ipv4)
+}
+
+fn interface_output_is_ready(stdout: &str, require_ipv4: bool) -> bool {
+    let Some(status_line) = stdout.lines().next() else {
+        return false;
+    };
+    let Some(flags_section) = status_line.split("flags=").nth(1) else {
+        return false;
+    };
+    let Some(flags) = flags_section
+        .split('<')
+        .nth(1)
+        .and_then(|section| section.split('>').next())
+    else {
+        return false;
+    };
+    let flags: Vec<&str> = flags.split(',').map(str::trim).collect();
+    let is_up = flags.contains(&"UP");
+    let is_running = flags.contains(&"RUNNING");
+    let status = stdout.lines().find_map(|line| {
+        let line = line.trim_start();
+        line.strip_prefix("status:").map(str::trim)
+    });
+    let status_is_ready = match status {
+        Some("active") | Some("associated") => true,
+        Some(_) => false,
+        None => true,
+    };
+    let has_ipv4 = stdout
+        .lines()
+        .any(|line| line.trim_start().starts_with("inet "));
+
+    is_up && is_running && status_is_ready && (!require_ipv4 || has_ipv4)
+}
+
 /// Find the TUN interface name by listing all interfaces and picking
 /// the highest-numbered utun (most recently created).
 fn find_tun_interface_name() -> String {
-    let output = Command::new("ifconfig")
-        .arg("-l")
-        .output();
+    let output = Command::new("ifconfig").arg("-l").output();
     if let Ok(o) = output {
         let s = String::from_utf8_lossy(&o.stdout);
         let mut utun_ifaces: Vec<&str> = s
@@ -646,6 +1220,68 @@ fn get_default_gateway() -> Option<IpAddr> {
     None
 }
 
+#[cfg(test)]
+mod tests {
+    use super::interface_output_is_ready;
+    use super::route_event_pid;
+    use super::route_event_requires_reconciliation;
+
+    #[test]
+    fn route_and_interface_changes_trigger_reconciliation() {
+        assert!(route_event_requires_reconciliation(
+            "RTM_DELETE: Delete Route: len 128, pid: 0, seq 0, errno 0, flags:<DONE>"
+        ));
+        assert!(route_event_requires_reconciliation(
+            "RTM_CHANGE: Change Route: len 128, pid: 0, seq 0, errno 0, flags:<DONE>"
+        ));
+        assert!(route_event_requires_reconciliation(
+            "RTM_IFINFO: Interface Status Changed: len 168, if# 6, flags:<UP,RUNNING>"
+        ));
+        assert!(route_event_requires_reconciliation(
+            "RTM_IFANNOUNCE: Interface announce: len 96, if# 6, what: 0"
+        ));
+        assert!(route_event_requires_reconciliation(
+            "RTM_NEWADDR: Interface address added: len 0"
+        ));
+        assert!(route_event_requires_reconciliation(
+            "RTM_DELADDR: Interface address deleted: len 0"
+        ));
+        assert!(!route_event_requires_reconciliation(
+            "RTM_MISS: Lookup failed on this address: len 120, pid: 0, seq 0"
+        ));
+        assert!(!route_event_requires_reconciliation(
+            "got message of size 120"
+        ));
+    }
+
+    #[test]
+    fn route_event_pid_is_parsed() {
+        assert_eq!(
+            route_event_pid(
+                "RTM_CHANGE: Change Route: len 132, pid: 86790, seq 1, errno 0"
+            ),
+            Some(86790)
+        );
+        assert_eq!(route_event_pid("RTM_CHANGE: no pid"), None);
+    }
+
+    #[test]
+    fn physical_interface_requires_up_running_and_ipv4_when_required() {
+        let ready = "en0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500\n\
+             \tinet 192.168.50.30 netmask 0xffffff00 broadcast 192.168.50.255\n";
+        let not_up = "en0: flags=863<BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500\n\
+             \tinet 192.168.50.30 netmask 0xffffff00 broadcast 192.168.50.255\n";
+        let no_ipv4 = "en0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500\n";
+
+        assert!(interface_output_is_ready(ready, true));
+        assert!(!interface_output_is_ready(not_up, false));
+        assert!(interface_output_is_ready(no_ipv4, false));
+        assert!(!interface_output_is_ready(no_ipv4, true));
+        let not_associated = "en0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLE,MULTICAST>\n\tstatus: associating\n\tinet 192.168.50.30\n";
+        assert!(!interface_output_is_ready(not_associated, true));
+    }
+}
+
 /// Run a `route` command, returning an error on non-zero exit.
 ///
 /// Uses `status()` (not `output()`) so macOS uses `posix_spawn` instead of
@@ -654,7 +1290,11 @@ fn get_default_gateway() -> Option<IpAddr> {
 /// command take 0.5-2s instead of ~1ms.
 fn run_route_cmd(args: &[&str]) -> Result<(), String> {
     log::debug!("route {}", args.join(" "));
-    let status = Command::new("route").args(args).status().map_err(|e| e.to_string())?;
+    let mut command = Command::new("route");
+    command.args(args);
+    let mut child = command.spawn().map_err(|e| e.to_string())?;
+    record_route_command_pid(child.id());
+    let status = child.wait().map_err(|e| e.to_string())?;
     if !status.success() {
         // "route delete" may fail if route doesn't exist; log but don't error.
         if args.iter().any(|&a| a == "delete") {
@@ -675,7 +1315,10 @@ fn run_route_cmd(args: &[&str]) -> Result<(), String> {
 /// `fork()+exec()`. See [`run_route_cmd`] for rationale.
 fn run_pfctl_cmd(args: &[&str]) -> Result<(), String> {
     log::debug!("pfctl {}", args.join(" "));
-    let status = Command::new("pfctl").args(args).status().map_err(|e| e.to_string())?;
+    let status = Command::new("pfctl")
+        .args(args)
+        .status()
+        .map_err(|e| e.to_string())?;
     if !status.success() {
         return Err(format!(
             "pfctl {} failed (exit {})",
@@ -695,17 +1338,14 @@ fn run_networksetup_cmd(args: &[&str]) -> String {
         Err(e) => {
             log::warn!("networksetup {} failed: {e}", args.join(" "));
             String::new()
-        }
+        },
     }
 }
 
 /// Get the IPv4 address of the primary physical interface (en0/en1/...).
 fn get_en0_ipv4() -> Option<String> {
     let iface = default_physical_iface()?;
-    let output = Command::new("ifconfig")
-        .args([&iface])
-        .output()
-        .ok()?;
+    let output = Command::new("ifconfig").args([&iface]).output().ok()?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     for line in stdout.lines() {
         let line = line.trim();
@@ -736,5 +1376,3 @@ fn default_physical_iface() -> Option<String> {
     }
     None
 }
-
-

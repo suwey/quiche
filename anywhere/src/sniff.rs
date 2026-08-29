@@ -55,8 +55,11 @@ pub fn looks_sniffable(payload: &[u8]) -> bool {
         return true;
     }
     // BT: starts with 0x13 + "BitTorrent protocol"
-    if payload.len() >= 1 && payload[0] == 0x13 && payload.len() >= 20
-        && &payload[1..20] == b"BitTorrent protoco" {
+    if payload.len() >= 1
+        && payload[0] == 0x13
+        && payload.len() >= 20
+        && &payload[1..20] == b"BitTorrent protoco"
+    {
         return true;
     }
     // RDP: X.224 Connection Request — starts with TPKT header 0x03 0x00
@@ -153,9 +156,9 @@ pub fn sniff_tls(payload: &[u8]) -> Option<SniffResult> {
     // [6..9]  handshake length (3 bytes BE)
     // [9..11] client version (2 bytes)
     // [11..43] random (32 bytes)
-    let mut pos = 9;  // start after record header(5) + handshake type(1) + length(3)
-    pos += 2;         // skip client version
-    pos += 32;        // skip random
+    let mut pos = 9; // start after record header(5) + handshake type(1) + length(3)
+    pos += 2; // skip client version
+    pos += 32; // skip random
     if pos >= payload.len() {
         return None;
     }
@@ -191,7 +194,8 @@ pub fn sniff_tls(payload: &[u8]) -> Option<SniffResult> {
     // Walk extensions
     while pos + 4 <= ext_end {
         let ext_type = u16::from_be_bytes([payload[pos], payload[pos + 1]]);
-        let ext_len = u16::from_be_bytes([payload[pos + 2], payload[pos + 3]]) as usize;
+        let ext_len =
+            u16::from_be_bytes([payload[pos + 2], payload[pos + 3]]) as usize;
         pos += 4;
 
         if pos + ext_len > ext_end {
@@ -266,11 +270,16 @@ pub fn sniff_http(payload: &[u8]) -> Option<SniffResult> {
 
     // Quick check: does it look like an HTTP request?
     let methods: &[&[u8]] = &[
-        b"GET ", b"POST ", b"PUT ", b"DELETE ", b"HEAD ", b"OPTIONS ", b"PATCH ", b"CONNECT ",
+        b"GET ",
+        b"POST ",
+        b"PUT ",
+        b"DELETE ",
+        b"HEAD ",
+        b"OPTIONS ",
+        b"PATCH ",
+        b"CONNECT ",
     ];
-    let is_http = methods
-        .iter()
-        .any(|m| payload.starts_with(m));
+    let is_http = methods.iter().any(|m| payload.starts_with(m));
     if !is_http {
         return None;
     }
@@ -303,7 +312,9 @@ fn find_host_header(text: &str) -> Option<String> {
     // Search line by line for "Host:" prefix (case-insensitive).
     // The request line comes first, then headers separated by \r\n.
     for line in text.split("\r\n") {
-        if line.eq_ignore_ascii_case("host:") || line.to_ascii_lowercase().starts_with("host:") {
+        if line.eq_ignore_ascii_case("host:")
+            || line.to_ascii_lowercase().starts_with("host:")
+        {
             // Everything after "Host:" is the value.
             let colon = line.find(':')?;
             let value = line[colon + 1..].trim();
@@ -321,16 +332,14 @@ fn find_host_header(text: &str) -> Option<String> {
 
 /// QUIC v1 Initial Salt (RFC 9001).
 const QUIC_V1_INITIAL_SALT: [u8; 20] = [
-    0x38, 0x76, 0x2c, 0xf7, 0xf5, 0x59, 0x34, 0xb3,
-    0x4d, 0x17, 0x9a, 0xe6, 0xa4, 0xc8, 0x0c, 0xad,
-    0xcc, 0xbb, 0x7f, 0x0a,
+    0x38, 0x76, 0x2c, 0xf7, 0xf5, 0x59, 0x34, 0xb3, 0x4d, 0x17, 0x9a, 0xe6, 0xa4,
+    0xc8, 0x0c, 0xad, 0xcc, 0xbb, 0x7f, 0x0a,
 ];
 
 /// QUIC v2 Initial Salt (RFC 9369).
 const QUIC_V2_INITIAL_SALT: [u8; 20] = [
-    0x0d, 0xed, 0xe3, 0xde, 0xf7, 0x00, 0xa6, 0xdb,
-    0x81, 0x93, 0x81, 0xbe, 0x6e, 0x26, 0x9d, 0xcb,
-    0xf9, 0xbd, 0x2e, 0xd9,
+    0x0d, 0xed, 0xe3, 0xde, 0xf7, 0x00, 0xa6, 0xdb, 0x81, 0x93, 0x81, 0xbe, 0x6e,
+    0x26, 0x9d, 0xcb, 0xf9, 0xbd, 0x2e, 0xd9,
 ];
 
 /// Extract SNI from a QUIC Initial packet.
@@ -356,9 +365,8 @@ fn parse_quic_long_header(payload: &[u8]) -> Option<Vec<u8>> {
     }
 
     // Version (4 bytes, BE)
-    let version = u32::from_be_bytes([
-        payload[1], payload[2], payload[3], payload[4],
-    ]);
+    let version =
+        u32::from_be_bytes([payload[1], payload[2], payload[3], payload[4]]);
 
     // QUIC v1 = 0x00000001, v2 = 0x6b3343cf
     // Negotiation (0x00000000) and unknown versions are skipped.
@@ -398,42 +406,64 @@ fn decrypt_quic_initial(payload: &[u8], dcid: &[u8]) -> Option<Vec<u8>> {
     use hkdf::Hkdf;
     use sha2::Sha256;
 
-    let salt = if u32::from_be_bytes([
-        payload[1], payload[2], payload[3], payload[4],
-    ]) == 0x00000001
-    {
-        &QUIC_V1_INITIAL_SALT[..]
-    } else {
-        &QUIC_V2_INITIAL_SALT[..]
-    };
+    let salt =
+        if u32::from_be_bytes([payload[1], payload[2], payload[3], payload[4]])
+            == 0x00000001
+        {
+            &QUIC_V1_INITIAL_SALT[..]
+        } else {
+            &QUIC_V2_INITIAL_SALT[..]
+        };
 
     // initial_secret = HKDF-Extract(initial_salt, client_dcid)
     let initial_secret = Hkdf::<Sha256>::new(Some(salt), dcid);
 
     // client_initial_secret = HKDF-Expand-Label(initial_secret, "client in", "", 32)
-    let client_secret = hkdf_expand_label(&initial_secret, b"client in", &[], 32)?;
+    let client_secret =
+        hkdf_expand_label(&initial_secret, b"client in", &[], 32)?;
 
     // key = HKDF-Expand-Label(client_secret, "quic key", "", 16)
-    let key = hkdf_expand_label(&Hkdf::<Sha256>::from_prk(&client_secret).ok()?, b"quic key", &[], 16)?;
+    let key = hkdf_expand_label(
+        &Hkdf::<Sha256>::from_prk(&client_secret).ok()?,
+        b"quic key",
+        &[],
+        16,
+    )?;
     // iv = HKDF-Expand-Label(client_secret, "quic iv", "", 12)
-    let iv = hkdf_expand_label(&Hkdf::<Sha256>::from_prk(&client_secret).ok()?, b"quic iv", &[], 12)?;
+    let iv = hkdf_expand_label(
+        &Hkdf::<Sha256>::from_prk(&client_secret).ok()?,
+        b"quic iv",
+        &[],
+        12,
+    )?;
     // hp = HKDF-Expand-Label(client_secret, "quic hp", "", 16)
-    let hp = hkdf_expand_label(&Hkdf::<Sha256>::from_prk(&client_secret).ok()?, b"quic hp", &[], 16)?;
+    let hp = hkdf_expand_label(
+        &Hkdf::<Sha256>::from_prk(&client_secret).ok()?,
+        b"quic hp",
+        &[],
+        16,
+    )?;
 
     // Parse past DCID to find SCID, token, and ciphertext
     let dcid_len = payload[5] as usize;
     let mut pos = 6 + dcid_len;
 
     // SCID
-    if pos >= payload.len() { return None; }
+    if pos >= payload.len() {
+        return None;
+    }
     let scid_len = payload[pos] as usize;
     pos += 1 + scid_len;
-    if pos >= payload.len() { return None; }
+    if pos >= payload.len() {
+        return None;
+    }
 
     // Token length (varint)
     let (token_len, token_bytes) = read_varint(&payload[pos..])?;
     pos += token_bytes + token_len;
-    if pos >= payload.len() { return None; }
+    if pos >= payload.len() {
+        return None;
+    }
 
     // Payload length (varint) — length of the encrypted payload
     let (payload_len, payload_bytes) = read_varint(&payload[pos..])?;
@@ -520,19 +550,22 @@ fn decrypt_quic_initial(payload: &[u8], dcid: &[u8]) -> Option<Vec<u8>> {
 
     let cipher = Aes128Gcm::new_from_slice(&key).ok()?;
     let nonce: &aes_gcm::Nonce<_> = (&nonce).try_into().ok()?;
-    let plaintext = cipher.decrypt(
-        nonce,
-        aes_gcm::aead::Payload { msg: enc_data, aad: &aad_copy },
-    ).ok()?;
+    let plaintext = cipher
+        .decrypt(
+            nonce,
+            aes_gcm::aead::Payload {
+                msg: enc_data,
+                aad: &aad_copy,
+            },
+        )
+        .ok()?;
 
     Some(plaintext)
 }
 
 /// HKDF-Expand-Label as defined in RFC 8446 §7.1.
 fn hkdf_expand_label(
-    secret: &hkdf::Hkdf<sha2::Sha256>,
-    label: &[u8],
-    context: &[u8],
+    secret: &hkdf::Hkdf<sha2::Sha256>, label: &[u8], context: &[u8],
     length: usize,
 ) -> Option<Vec<u8>> {
     // HkdfLabel struct:
@@ -541,7 +574,8 @@ fn hkdf_expand_label(
     //   opaque context<0..255> = context;
     let full_label = [b"tls13 ", label].concat();
 
-    let mut info = Vec::with_capacity(2 + 1 + full_label.len() + 1 + context.len());
+    let mut info =
+        Vec::with_capacity(2 + 1 + full_label.len() + 1 + context.len());
     info.extend_from_slice(&(length as u16).to_be_bytes());
     info.push(full_label.len() as u8);
     info.extend_from_slice(&full_label);
@@ -556,10 +590,14 @@ fn hkdf_expand_label(
 /// Read a QUIC variable-length integer (RFC 9000 §16).
 /// Returns (value, bytes_consumed).
 fn read_varint(data: &[u8]) -> Option<(usize, usize)> {
-    if data.is_empty() { return None; }
+    if data.is_empty() {
+        return None;
+    }
     let prefix = (data[0] & 0xc0) >> 6;
     let len = 1usize << prefix;
-    if data.len() < len { return None; }
+    if data.len() < len {
+        return None;
+    }
     let mut val: usize = (data[0] & 0x3f) as usize;
     for i in 1..len {
         val = (val << 8) | data[i] as usize;
@@ -581,7 +619,9 @@ fn compute_hp_mask(hp: &[u8], sample: &[u8]) -> Option<Vec<u8>> {
 fn extract_sni_from_quic_payload(plaintext: &[u8]) -> Option<SniffResult> {
     let mut pos = 0;
     while pos < plaintext.len() {
-        if pos + 1 > plaintext.len() { break; }
+        if pos + 1 > plaintext.len() {
+            break;
+        }
         let frame_type = plaintext[pos];
 
         if frame_type == 0x06 {
@@ -592,7 +632,9 @@ fn extract_sni_from_quic_payload(plaintext: &[u8]) -> Option<SniffResult> {
             let (length, len_bytes) = read_varint(&plaintext[pos..])?;
             pos += len_bytes;
 
-            if pos + length > plaintext.len() { break; }
+            if pos + length > plaintext.len() {
+                break;
+            }
 
             // The CRYPTO frame data is a TLS handshake message.
             // It should be a ClientHello (type 0x01).
@@ -602,8 +644,10 @@ fn extract_sni_from_quic_payload(plaintext: &[u8]) -> Option<SniffResult> {
                 // Build a fake TLS record: type(1) + version(2) + length(2) + handshake
                 let mut fake_record = Vec::with_capacity(5 + tls_data.len());
                 fake_record.push(0x16); // Handshake
-                fake_record.push(0x03); fake_record.push(0x01); // TLS 1.0 version (arbitrary)
-                fake_record.extend_from_slice(&(tls_data.len() as u16).to_be_bytes());
+                fake_record.push(0x03);
+                fake_record.push(0x01); // TLS 1.0 version (arbitrary)
+                fake_record
+                    .extend_from_slice(&(tls_data.len() as u16).to_be_bytes());
                 fake_record.extend_from_slice(tls_data);
                 if let Some(result) = sniff_tls(&fake_record) {
                     return Some(SniffResult {
@@ -711,7 +755,10 @@ fn parse_dns_name(data: &[u8], pos: &mut usize) -> Option<String> {
 pub fn sniff_bittorrent(payload: &[u8]) -> Option<SniffResult> {
     // BT handshake: pstrlen(1) + pstr("BitTorrent protocol") + reserved(8) + info_hash(20) + peer_id(20)
     if payload.len() >= 20 && payload.starts_with(b"\x13BitTorrent protocol") {
-        return Some(SniffResult { domain: None, protocol: "bittorrent" });
+        return Some(SniffResult {
+            domain: None,
+            protocol: "bittorrent",
+        });
     }
     None
 }
@@ -719,7 +766,10 @@ pub fn sniff_bittorrent(payload: &[u8]) -> Option<SniffResult> {
 /// SSH: handshake starts with `SSH-`.
 pub fn sniff_ssh(payload: &[u8]) -> Option<SniffResult> {
     if payload.len() >= 4 && payload.starts_with(b"SSH-") {
-        return Some(SniffResult { domain: None, protocol: "ssh" });
+        return Some(SniffResult {
+            domain: None,
+            protocol: "ssh",
+        });
     }
     None
 }
@@ -731,7 +781,10 @@ pub fn sniff_rdp(payload: &[u8]) -> Option<SniffResult> {
     if payload.len() >= 4 && payload[0] == 3 && payload[1] == 0 {
         // X.224 Connection Request: length indicator + type=0xe0 (CR)
         if payload.len() >= 7 && payload[4] >= 2 && payload[5] == 0xe0 {
-            return Some(SniffResult { domain: None, protocol: "rdp" });
+            return Some(SniffResult {
+                domain: None,
+                protocol: "rdp",
+            });
         }
     }
     None
@@ -741,9 +794,13 @@ pub fn sniff_rdp(payload: &[u8]) -> Option<SniffResult> {
 /// STUN message header: type(2) + length(2) + cookie(4) + transaction_id(12)
 pub fn sniff_stun(payload: &[u8]) -> Option<SniffResult> {
     if payload.len() >= 8 {
-        let cookie = u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]);
+        let cookie =
+            u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]);
         if cookie == 0x2112a442 {
-            return Some(SniffResult { domain: None, protocol: "stun" });
+            return Some(SniffResult {
+                domain: None,
+                protocol: "stun",
+            });
         }
     }
     None
@@ -755,7 +812,10 @@ pub fn sniff_dtls(payload: &[u8]) -> Option<SniffResult> {
     if payload.len() >= 3 && payload[0] == 22 {
         let version = u16::from_be_bytes([payload[1], payload[2]]);
         if version == 0xfefd || version == 0xfefe {
-            return Some(SniffResult { domain: None, protocol: "dtls" });
+            return Some(SniffResult {
+                domain: None,
+                protocol: "dtls",
+            });
         }
     }
     None
@@ -768,7 +828,10 @@ pub fn sniff_ntp(payload: &[u8]) -> Option<SniffResult> {
         let version = (payload[0] >> 3) & 0x07;
         let mode = payload[0] & 0x07;
         if (version == 3 || version == 4) && (mode == 3 || mode == 4) {
-            return Some(SniffResult { domain: None, protocol: "ntp" });
+            return Some(SniffResult {
+                domain: None,
+                protocol: "ntp",
+            });
         }
     }
     None
@@ -857,12 +920,15 @@ mod tests {
 
     #[test]
     fn http_not_http() {
-        assert!(sniff_http(b"\x16\x03\x01\x00\x05\x01\x00\x00\x01\x00").is_none());
+        assert!(
+            sniff_http(b"\x16\x03\x01\x00\x05\x01\x00\x00\x01\x00").is_none()
+        );
     }
 
     #[test]
     fn http_connect_host() {
-        let payload = b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n";
+        let payload =
+            b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n";
         let result = sniff_http(payload).expect("should find host");
         assert_eq!(result.domain.as_deref(), Some("example.com"));
     }
@@ -887,7 +953,8 @@ mod tests {
 
     #[test]
     fn sniff_unknown_returns_none() {
-        let payload = b"\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f";
+        let payload =
+            b"\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f";
         assert!(sniff(payload).is_none());
     }
 
@@ -943,14 +1010,20 @@ mod tests {
     #[test]
     fn quic_not_long_header() {
         // Short header: high bit = 0
-        let pkt = [0x40, 0x00, 0x00, 0x00, 0x01, 0x08, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08];
+        let pkt = [
+            0x40, 0x00, 0x00, 0x00, 0x01, 0x08, 0x01, 0x02, 0x03, 0x04, 0x05,
+            0x06, 0x07, 0x08,
+        ];
         assert!(sniff_quic(&pkt).is_none());
     }
 
     #[test]
     fn quic_unknown_version_returns_none() {
         // Long header, version 0x00000000 (negotiation)
-        let pkt = [0xc0, 0x00, 0x00, 0x00, 0x00, 0x08, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08];
+        let pkt = [
+            0xc0, 0x00, 0x00, 0x00, 0x00, 0x08, 0x01, 0x02, 0x03, 0x04, 0x05,
+            0x06, 0x07, 0x08,
+        ];
         assert!(sniff_quic(&pkt).is_none());
     }
 
@@ -969,18 +1042,20 @@ mod tests {
         // MQTT CONNECT packet: type=1(CONNECT), flags=0, remaining length=...
         // First byte 0x10 was incorrectly matched by the old uTP heuristic.
         let pkt = [
-            0x10, 0x10,             // CONNECT, remaining length=16
-            0x00, 0x04,             // protocol name length = 4
+            0x10, 0x10, // CONNECT, remaining length=16
+            0x00, 0x04, // protocol name length = 4
             b'M', b'Q', b'T', b'T', // protocol name "MQTT"
-            0x04,                   // protocol level = 4 (MQTT 3.1.1)
-            0x02,                   // connect flags (clean session)
-            0x00, 0x3c,             // keep alive = 60
-            0x00, 0x04,             // client id length = 4
+            0x04, // protocol level = 4 (MQTT 3.1.1)
+            0x02, // connect flags (clean session)
+            0x00, 0x3c, // keep alive = 60
+            0x00, 0x04, // client id length = 4
             b't', b'e', b's', b't', // client id "test"
         ];
         // Must NOT be detected as bittorrent.
-        assert!(sniff_bittorrent(&pkt).is_none(),
-            "MQTT CONNECT must not be misidentified as BitTorrent");
+        assert!(
+            sniff_bittorrent(&pkt).is_none(),
+            "MQTT CONNECT must not be misidentified as BitTorrent"
+        );
     }
 
     #[test]
@@ -995,12 +1070,13 @@ mod tests {
     fn rdp_connection_request() {
         // TPKT header + X.224 CR
         let pkt = [
-            0x03, 0x00, 0x00, 0x13, // TPKT: version=3, reserved=0, length=19
-            0x0e,                   // X.224 length indicator
-            0xe0,                   // X.224 type = Connection Request
-            0x00, 0x00,             // dst-ref
-            0x00, 0x00,             // src-ref
-            0x00,                   // class-options
+            0x03, 0x00, 0x00,
+            0x13, // TPKT: version=3, reserved=0, length=19
+            0x0e, // X.224 length indicator
+            0xe0, // X.224 type = Connection Request
+            0x00, 0x00, // dst-ref
+            0x00, 0x00, // src-ref
+            0x00, // class-options
         ];
         let result = sniff_rdp(&pkt).expect("should detect RDP");
         assert_eq!(result.protocol, "rdp");
@@ -1011,10 +1087,11 @@ mod tests {
     fn stun_binding_request() {
         // STUN Binding Request: type=0x0001, length=0, cookie=0x2112A442
         let pkt = [
-            0x00, 0x01,             // type = Binding Request
-            0x00, 0x00,             // length = 0
+            0x00, 0x01, // type = Binding Request
+            0x00, 0x00, // length = 0
             0x21, 0x12, 0xa4, 0x42, // magic cookie
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // txn id
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, // txn id
         ];
         let result = sniff_stun(&pkt).expect("should detect STUN");
         assert_eq!(result.protocol, "stun");
@@ -1025,11 +1102,11 @@ mod tests {
     fn dtls_handshake() {
         // DTLS 1.2 handshake: type=22, version=0xfefd
         let pkt = [
-            0x16,                   // type = Handshake
-            0xfe, 0xfd,             // version = DTLS 1.0
-            0x00, 0x00,             // epoch
+            0x16, // type = Handshake
+            0xfe, 0xfd, // version = DTLS 1.0
+            0x00, 0x00, // epoch
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // seq
-            0x00, 0x00,             // length
+            0x00, 0x00, // length
         ];
         let result = sniff_dtls(&pkt).expect("should detect DTLS");
         assert_eq!(result.protocol, "dtls");
@@ -1049,15 +1126,15 @@ mod tests {
 
     #[test]
     fn server_first_ports() {
-        assert!(is_server_first(25));   // SMTP
-        assert!(is_server_first(465));  // SMTPS
-        assert!(is_server_first(587));  // SMTP submission
-        assert!(is_server_first(143));  // IMAP
-        assert!(is_server_first(993));  // IMAPS
-        assert!(is_server_first(110));  // POP3
-        assert!(is_server_first(995));  // POP3S
-        assert!(is_server_first(21));   // FTP
-        assert!(is_server_first(22));   // SSH
+        assert!(is_server_first(25)); // SMTP
+        assert!(is_server_first(465)); // SMTPS
+        assert!(is_server_first(587)); // SMTP submission
+        assert!(is_server_first(143)); // IMAP
+        assert!(is_server_first(993)); // IMAPS
+        assert!(is_server_first(110)); // POP3
+        assert!(is_server_first(995)); // POP3S
+        assert!(is_server_first(21)); // FTP
+        assert!(is_server_first(22)); // SSH
         assert!(!is_server_first(443));
         assert!(!is_server_first(80));
     }
@@ -1082,7 +1159,8 @@ mod tests {
         extensions.extend_from_slice(&u16::to_be_bytes(sni_ext_data_len as u16)); // SNI data length
         extensions.extend_from_slice(&u16::to_be_bytes(sni_list_len as u16)); // server_name_list length
         extensions.push(0x00); // name_type = host_name
-        extensions.extend_from_slice(&u16::to_be_bytes(domain_bytes.len() as u16)); // name length
+        extensions
+            .extend_from_slice(&u16::to_be_bytes(domain_bytes.len() as u16)); // name length
         extensions.extend_from_slice(domain_bytes); // name
 
         // Build ClientHello body (after handshake header)

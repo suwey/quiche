@@ -31,14 +31,14 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 #[cfg(test)]
 use tokio::net::TcpStream;
 
-use crate::inbound::Destination;
-use crate::relay::StreamRelay;
 use super::cipher::{
-    increase_nonce, CipherMethod, SsAead, HEADER_TYPE_CLIENT, HEADER_TYPE_SERVER,
-    MAX_PACKET_SIZE, MAX_PADDING_LENGTH, OVERHEAD, REQUEST_HEADER_FIXED_CHUNK_LENGTH,
-    TIMESTAMP_TOLERANCE_SECS,
+    CipherMethod, HEADER_TYPE_CLIENT, HEADER_TYPE_SERVER, MAX_PACKET_SIZE,
+    MAX_PADDING_LENGTH, OVERHEAD, REQUEST_HEADER_FIXED_CHUNK_LENGTH, SsAead,
+    TIMESTAMP_TOLERANCE_SECS, increase_nonce,
 };
 use super::socks::{serialize_socks_addr, socks_addr_len};
+use crate::inbound::Destination;
+use crate::relay::StreamRelay;
 
 /// Capacity of the request buffer, mirroring sing's `buf.BufferSize` (standard
 /// build). It bounds how much *early data* fits inside the variable-header
@@ -138,12 +138,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> SsTcpStream<S> {
         let used_before_var =
             ksl + eih.len() + REQUEST_HEADER_FIXED_CHUNK_LENGTH + OVERHEAD;
         let free = REQUEST_BUFFER_SIZE.saturating_sub(used_before_var);
-        let max_payload_len = free.saturating_sub(var_header_len_no_payload + OVERHEAD);
+        let max_payload_len =
+            free.saturating_sub(var_header_len_no_payload + OVERHEAD);
         let early_payload_len = payload.len().min(max_payload_len);
         let var_header_len = var_header_len_no_payload + early_payload_len;
 
         // 3. Fixed header plaintext: type || timestamp(u64 BE) || varHeaderLen(u16 BE).
-        let mut fixed_header = Vec::with_capacity(REQUEST_HEADER_FIXED_CHUNK_LENGTH);
+        let mut fixed_header =
+            Vec::with_capacity(REQUEST_HEADER_FIXED_CHUNK_LENGTH);
         fixed_header.push(HEADER_TYPE_CLIENT);
         fixed_header.extend_from_slice(&timestamp.to_be_bytes());
         fixed_header.extend_from_slice(&(var_header_len as u16).to_be_bytes());
@@ -177,18 +179,30 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> SsTcpStream<S> {
         out.extend_from_slice(&enc_var);
         self.conn.write_all(&out).await?;
 
-        log::trace!("ss: handshake write: addr={} ({} bytes), padding_len={}, early_payload_len={}, var_header_len={}",
-            String::from_utf8_lossy(&socks_addr), socks_addr.len(), padding_len, early_payload_len, var_header_len);
+        log::trace!(
+            "ss: handshake write: addr={} ({} bytes), padding_len={}, early_payload_len={}, var_header_len={}",
+            String::from_utf8_lossy(&socks_addr),
+            socks_addr.len(),
+            padding_len,
+            early_payload_len,
+            var_header_len
+        );
 
         // 8. Commit write state; `write_nonce` is already [2, 0, …].
         self.request_salt = Some(salt);
         self.write_aead = Some(aead);
         self.write_handshaked = true;
-        log::trace!("ss: handshake write ok (salt={}B eih={}B early={}B)", ksl, eih.len(), early_payload_len);
+        log::trace!(
+            "ss: handshake write ok (salt={}B eih={}B early={}B)",
+            ksl,
+            eih.len(),
+            early_payload_len
+        );
 
         // 9. Any payload that did not fit as early data -> data chunks.
         if early_payload_len < payload.len() {
-            self.write_data_chunks(&payload[early_payload_len..]).await?;
+            self.write_data_chunks(&payload[early_payload_len..])
+                .await?;
         }
         Ok(())
     }
@@ -215,7 +229,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> SsTcpStream<S> {
         let aead = self.method.create_aead(&session_key);
 
         // 2. Fixed response header (nonce 0): type || timestamp || requestSalt || maxPaddingLen.
-        let mut enc_hdr = vec![0u8; REQUEST_HEADER_FIXED_CHUNK_LENGTH + ksl + OVERHEAD];
+        let mut enc_hdr =
+            vec![0u8; REQUEST_HEADER_FIXED_CHUNK_LENGTH + ksl + OVERHEAD];
         self.conn.read_exact(&mut enc_hdr).await?;
         let hdr = aead
             .open(&self.read_nonce, &enc_hdr)
@@ -225,7 +240,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> SsTcpStream<S> {
         if hdr[0] != HEADER_TYPE_SERVER {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("bad response header type: expected {HEADER_TYPE_SERVER}, got {}", hdr[0]),
+                format!(
+                    "bad response header type: expected {HEADER_TYPE_SERVER}, got {}",
+                    hdr[0]
+                ),
             ));
         }
         let epoch = u64::from_be_bytes(hdr[1..9].try_into().unwrap());
@@ -237,7 +255,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> SsTcpStream<S> {
         if diff > TIMESTAMP_TOLERANCE_SECS {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("bad timestamp: diff {diff}s exceeds {TIMESTAMP_TOLERANCE_SECS}s"),
+                format!(
+                    "bad timestamp: diff {diff}s exceeds {TIMESTAMP_TOLERANCE_SECS}s"
+                ),
             ));
         }
         {
@@ -255,8 +275,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> SsTcpStream<S> {
         }
         let data_length =
             u16::from_be_bytes([hdr[9 + ksl], hdr[9 + ksl + 1]]) as usize;
-        log::trace!("ss: handshake read: type={}, timestamp_diff={}s, data_length={}",
-            hdr[0], diff, data_length);
+        log::trace!(
+            "ss: handshake read: type={}, timestamp_diff={}s, data_length={}",
+            hdr[0],
+            diff,
+            data_length
+        );
 
         // 3. First data chunk (nonce 1) — read and buffer for the caller.
         //    In SS2022, the server's first encrypted block after the header is
@@ -317,7 +341,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> SsTcpStream<S> {
 #[async_trait]
 impl<S: AsyncRead + AsyncWrite + Unpin + Send> StreamRelay for SsTcpStream<S> {
     async fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        log::trace!("ss: read called, buf_len={}, read_handshaked={}", buf.len(), self.read_handshaked);
+        log::trace!(
+            "ss: read called, buf_len={}, read_handshaked={}",
+            buf.len(),
+            self.read_handshaked
+        );
         if !self.read_handshaked {
             if let Err(e) = self.do_handshake_read().await {
                 log::error!("ss: handshake read failed: {e}");
@@ -329,8 +357,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> StreamRelay for SsTcpStream<S> {
         if self.read_buf_pos < self.read_buf.len() {
             let avail = self.read_buf.len() - self.read_buf_pos;
             let n = avail.min(buf.len());
-            buf[..n]
-                .copy_from_slice(&self.read_buf[self.read_buf_pos..self.read_buf_pos + n]);
+            buf[..n].copy_from_slice(
+                &self.read_buf[self.read_buf_pos..self.read_buf_pos + n],
+            );
             self.read_buf_pos += n;
             if self.read_buf_pos >= self.read_buf.len() {
                 self.read_buf.clear();
@@ -342,15 +371,20 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> StreamRelay for SsTcpStream<S> {
         // Read one chunk: encrypted length (2 + tag), then encrypted payload.
         let mut enc_len_buf = [0u8; 2 + OVERHEAD];
         match self.conn.read_exact(&mut enc_len_buf).await {
-            Ok(_) => { log::trace!("ss: read enc_len_buf ok, {} bytes", enc_len_buf.len()); }
+            Ok(_) => {
+                log::trace!(
+                    "ss: read enc_len_buf ok, {} bytes",
+                    enc_len_buf.len()
+                );
+            },
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
                 log::trace!("ss: read enc_len_buf EOF");
                 return Ok(0);
-            }
+            },
             Err(e) => {
                 log::error!("ss: chunk read_exact(len) failed: {e}");
                 return Err(e);
-            }
+            },
         }
         let len_plain = self
             .read_aead
@@ -370,12 +404,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> StreamRelay for SsTcpStream<S> {
 
         let mut enc_payload_buf = vec![0u8; len + OVERHEAD];
         match self.conn.read_exact(&mut enc_payload_buf).await {
-            Ok(_) => {}
+            Ok(_) => {},
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(0),
             Err(e) => {
                 log::error!("ss: chunk read_exact(payload) failed: {e}");
                 return Err(e);
-            }
+            },
         }
         let payload = self
             .read_aead
@@ -387,7 +421,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> StreamRelay for SsTcpStream<S> {
                 io::Error::new(io::ErrorKind::InvalidData, e)
             })?;
         increase_nonce(&mut self.read_nonce);
-        log::trace!("ss: read chunk: {} bytes, first 8 bytes: {:02x?}", payload.len(), &payload[..payload.len().min(8)]);
+        log::trace!(
+            "ss: read chunk: {} bytes, first 8 bytes: {:02x?}",
+            payload.len(),
+            &payload[..payload.len().min(8)]
+        );
 
         let n = payload.len().min(buf.len());
         buf[..n].copy_from_slice(&payload[..n]);
@@ -406,7 +444,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> StreamRelay for SsTcpStream<S> {
         if buf.is_empty() {
             return Ok(());
         }
-        log::trace!("ss: write called with {} bytes, handshaked={}", buf.len(), self.write_handshaked);
+        log::trace!(
+            "ss: write called with {} bytes, handshaked={}",
+            buf.len(),
+            self.write_handshaked
+        );
         if !self.write_handshaked {
             if let Err(e) = self.do_handshake_write(buf).await {
                 log::error!("ss: handshake write failed: {e}");
@@ -455,9 +497,8 @@ mod tests {
     async fn make_pair() -> (TcpStream, TcpStream) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let connect = tokio::spawn(async move {
-            TcpStream::connect(addr).await.unwrap()
-        });
+        let connect =
+            tokio::spawn(async move { TcpStream::connect(addr).await.unwrap() });
         let (server, _) = listener.accept().await.unwrap();
         let client = connect.await.unwrap();
         (client, server)
@@ -466,8 +507,7 @@ mod tests {
     /// Server-side: read the request header (salt, EIH, fixed header, variable
     /// header). Returns `(request_salt, dest, early_data, aead, next_nonce)`.
     async fn server_read_request_header(
-        conn: &mut TcpStream,
-        method: &CipherMethod,
+        conn: &mut TcpStream, method: &CipherMethod,
     ) -> (Vec<u8>, Destination, Vec<u8>, SsAead, [u8; 12]) {
         let ksl = method.key_salt_length();
         let mut salt = vec![0u8; ksl];
@@ -482,7 +522,8 @@ mod tests {
         let sk = method.session_key(&salt);
         let aead = method.create_aead(&sk);
 
-        let mut enc_fixed = vec![0u8; REQUEST_HEADER_FIXED_CHUNK_LENGTH + OVERHEAD];
+        let mut enc_fixed =
+            vec![0u8; REQUEST_HEADER_FIXED_CHUNK_LENGTH + OVERHEAD];
         conn.read_exact(&mut enc_fixed).await.unwrap();
         let fixed = aead.open(&[0u8; 12], &enc_fixed).unwrap();
         assert_eq!(fixed[0], HEADER_TYPE_CLIENT);
@@ -496,7 +537,8 @@ mod tests {
         increase_nonce(&mut nonce); // [2, 0, …]
 
         let (dest, consumed) = deserialize_socks_addr(&var).unwrap();
-        let padding_len = u16::from_be_bytes([var[consumed], var[consumed + 1]]) as usize;
+        let padding_len =
+            u16::from_be_bytes([var[consumed], var[consumed + 1]]) as usize;
         let early_start = consumed + 2 + padding_len;
         let early_data = var[early_start..].to_vec();
         (salt, dest, early_data, aead, nonce)
@@ -505,9 +547,7 @@ mod tests {
     /// Server-side: read data chunks until EOF. `nonce` continues from the
     /// request header (i.e. starts at `[2, 0, …]`).
     async fn server_read_chunks(
-        conn: &mut TcpStream,
-        aead: &SsAead,
-        nonce: &mut [u8; 12],
+        conn: &mut TcpStream, aead: &SsAead, nonce: &mut [u8; 12],
     ) -> Vec<u8> {
         let mut all = Vec::new();
         loop {
@@ -533,9 +573,7 @@ mod tests {
     /// Server-side: write the response (salt, fixed header, padding) then `data`
     /// as shadowio chunks. The response salt must echo the client's request salt.
     async fn server_write_response(
-        conn: &mut TcpStream,
-        method: &CipherMethod,
-        request_salt: &[u8],
+        conn: &mut TcpStream, method: &CipherMethod, request_salt: &[u8],
         data: &[u8],
     ) {
         let ksl = method.key_salt_length();
@@ -545,7 +583,10 @@ mod tests {
         let aead = method.create_aead(&sk);
         let mut nonce = [0u8; 12];
 
-        let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
 
         // In SS2022, the server's first encrypted block after the header IS
         // the payload (e.g. TLS ServerHello). The LENGTH field in the header
@@ -601,7 +642,11 @@ mod tests {
     #[tokio::test]
     async fn test_write_nonce_sequence() {
         let (client_conn, mut peer) = make_pair().await;
-        let mut s = SsTcpStream::new(client_conn, make_method("2022-blake3-aes-128-gcm"), test_dest());
+        let mut s = SsTcpStream::new(
+            client_conn,
+            make_method("2022-blake3-aes-128-gcm"),
+            test_dest(),
+        );
 
         // Drain the peer so the client's writes never block on a full buffer.
         let drain = tokio::spawn(async move {
@@ -609,7 +654,7 @@ mod tests {
             loop {
                 match peer.read(&mut buf).await {
                     Ok(0) | Err(_) => break,
-                    Ok(_) => {}
+                    Ok(_) => {},
                 }
             }
         });
@@ -710,7 +755,8 @@ mod tests {
         let (salt, parsed_dest, early, aead, mut nonce) =
             server_read_request_header(&mut server_conn, &method).await;
         assert_eq!(parsed_dest, dest, "{method_name}: dest mismatch");
-        let chunks = server_read_chunks(&mut server_conn, &aead, &mut nonce).await;
+        let chunks =
+            server_read_chunks(&mut server_conn, &aead, &mut nonce).await;
         let mut all = early;
         all.extend_from_slice(&chunks);
         assert_eq!(all, expected, "{method_name}: request payload mismatch");
@@ -769,7 +815,8 @@ mod tests {
             early.len(),
             payload.len()
         );
-        let chunks = server_read_chunks(&mut server_conn, &aead, &mut nonce).await;
+        let chunks =
+            server_read_chunks(&mut server_conn, &aead, &mut nonce).await;
         assert!(!chunks.is_empty(), "chunk data should be non-empty");
         let mut all = early;
         all.extend_from_slice(&chunks);
@@ -812,7 +859,13 @@ mod tests {
 
         let (salt, _dest, _early, _aead, _nonce) =
             server_read_request_header(&mut server_conn, &method).await;
-        server_write_response(&mut server_conn, &method, &salt, &chunk_for_server).await;
+        server_write_response(
+            &mut server_conn,
+            &method,
+            &salt,
+            &chunk_for_server,
+        )
+        .await;
         server_conn.shutdown().await.unwrap();
 
         let received = client_task.await.unwrap();

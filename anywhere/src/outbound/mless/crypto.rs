@@ -238,7 +238,8 @@ mod crypto_trait_tests {
 
     #[tokio::test]
     async fn obfuscation_impl_cryptolayer() {
-        let obf: &mut dyn CryptoLayer = &mut Obfuscation::new("00000000-0000-4000-8000-000000000000");
+        let obf: &mut dyn CryptoLayer =
+            &mut Obfuscation::new("00000000-0000-4000-8000-000000000000");
         let payload = b"test CryptoLayer trait";
 
         let ct = obf.encrypt(payload).await.unwrap();

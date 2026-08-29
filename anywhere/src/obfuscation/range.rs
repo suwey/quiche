@@ -214,7 +214,14 @@ mod tests {
                 1 => (100, 200),
                 _ => (1, 5),
             };
-            assert!(v >= lo && v <= hi, "seg {} got {} not in [{}, {}]", i, v, lo, hi);
+            assert!(
+                v >= lo && v <= hi,
+                "seg {} got {} not in [{}, {}]",
+                i,
+                v,
+                lo,
+                hi
+            );
         }
     }
 

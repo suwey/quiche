@@ -7,9 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use crate::dns::DNS_REDIRECT_PORT;
 
 use super::bypass_watcher::BypassWatcherHandle;
-use super::bypass_watcher::{
-    self,
-};
+use super::bypass_watcher::{self};
 use super::run_cmd;
 
 use rtnetlink::Handle;
@@ -40,7 +38,9 @@ const TUN_IIF_EXCEPTION_PRIO: u32 = 400;
 /// When `iface_name` is `None`, interface-specific iptables rules are skipped.
 fn teardown_routing(iface_name: Option<&str>) {
     // Policy routing rules & bypass.
-    if let Err(e) = run_ip(&["rule", "del", "priority", &TUN_CATCH_ALL_PRIO.to_string()]) {
+    if let Err(e) =
+        run_ip(&["rule", "del", "priority", &TUN_CATCH_ALL_PRIO.to_string()])
+    {
         log::debug!("teardown: del catch-all rule failed: {e}");
     }
     if let Err(e) = run_ip(&[
@@ -59,7 +59,9 @@ fn teardown_routing(iface_name: Option<&str>) {
     ]) {
         log::debug!("teardown: del fwmark rule failed: {e}");
     }
-    if let Err(e) = run_ip(&["route", "flush", "table", &TUN_ROUTING_TABLE.to_string()]) {
+    if let Err(e) =
+        run_ip(&["route", "flush", "table", &TUN_ROUTING_TABLE.to_string()])
+    {
         log::debug!("teardown: flush table 200 failed: {e}");
     }
 
@@ -72,67 +74,77 @@ fn teardown_routing(iface_name: Option<&str>) {
     // Interface-specific iptables (INPUT/FORWARD ACCEPT, POSTROUTING).
     if let Some(name) = iface_name {
         for chain in &["INPUT", "FORWARD"] {
-            if let Err(e) = run_cmd("iptables", &["-D", chain, "-i", name, "-j", "ACCEPT"]) {
-                log::debug!("teardown: iptables -D {chain} -i {name} ACCEPT failed: {e}");
+            if let Err(e) =
+                run_cmd("iptables", &["-D", chain, "-i", name, "-j", "ACCEPT"])
+            {
+                log::debug!(
+                    "teardown: iptables -D {chain} -i {name} ACCEPT failed: {e}"
+                );
             }
         }
-        if let Err(e) = run_cmd("iptables", &["-D", "FORWARD", "-o", name, "-j", "ACCEPT"]) {
-            log::debug!("teardown: iptables -D FORWARD -o {name} ACCEPT failed: {e}");
+        if let Err(e) =
+            run_cmd("iptables", &["-D", "FORWARD", "-o", name, "-j", "ACCEPT"])
+        {
+            log::debug!(
+                "teardown: iptables -D FORWARD -o {name} ACCEPT failed: {e}"
+            );
         }
-        if let Err(e) = run_cmd("iptables", &[
-            "-t",
-            "nat",
-            "-D",
-            "POSTROUTING",
-            "-o",
-            name,
-            "-j",
-            "ACCEPT",
-        ]) {
-            log::debug!("teardown: iptables -t nat -D POSTROUTING -o {name} ACCEPT failed: {e}");
+        if let Err(e) = run_cmd(
+            "iptables",
+            &["-t", "nat", "-D", "POSTROUTING", "-o", name, "-j", "ACCEPT"],
+        ) {
+            log::debug!(
+                "teardown: iptables -t nat -D POSTROUTING -o {name} ACCEPT failed: {e}"
+            );
         }
     }
 
     // DNS REDIRECT rules.
-    if let Err(e) = run_cmd("iptables", &[
-        "-t",
-        "nat",
-        "-D",
-        "OUTPUT",
-        "-p",
-        "udp",
-        "--dport",
-        "53",
-        "-m",
-        "mark",
-        "!",
-        "--mark",
-        &BYPASS_FWMARK.to_string(),
-        "-j",
-        "REDIRECT",
-        "--to-port",
-        &DNS_REDIRECT_PORT.to_string(),
-    ]) {
+    if let Err(e) = run_cmd(
+        "iptables",
+        &[
+            "-t",
+            "nat",
+            "-D",
+            "OUTPUT",
+            "-p",
+            "udp",
+            "--dport",
+            "53",
+            "-m",
+            "mark",
+            "!",
+            "--mark",
+            &BYPASS_FWMARK.to_string(),
+            "-j",
+            "REDIRECT",
+            "--to-port",
+            &DNS_REDIRECT_PORT.to_string(),
+        ],
+    ) {
         log::debug!("teardown: del DNS OUTPUT redirect failed: {e}");
     }
-    if let Err(e) = run_cmd("iptables", &[
-        "-t",
-        "nat",
-        "-D",
-        "PREROUTING",
-        "-p",
-        "udp",
-        "--dport",
-        "53",
-        "-m",
-        "addrtype",
-        "--dst-type",
-        "LOCAL",
-        "-j",
-        "REDIRECT",
-        "--to-port",
-        &DNS_REDIRECT_PORT.to_string(),
-    ]) {
+    if let Err(e) = run_cmd(
+        "iptables",
+        &[
+            "-t",
+            "nat",
+            "-D",
+            "PREROUTING",
+            "-p",
+            "udp",
+            "--dport",
+            "53",
+            "-m",
+            "addrtype",
+            "--dst-type",
+            "LOCAL",
+            "-j",
+            "REDIRECT",
+            "--to-port",
+            &DNS_REDIRECT_PORT.to_string(),
+        ],
+    ) {
         log::debug!("teardown: del DNS PREROUTING redirect failed: {e}");
     }
 }
@@ -284,52 +296,44 @@ impl TunRouteManager {
         // --- router hacks (only when auto_hijack is true) ---
         if auto_hijack {
             for chain in &["INPUT", "FORWARD"] {
-                if let Err(e) = run_cmd("iptables", &[
-                    "-I",
-                    chain,
-                    "1",
-                    "-i",
-                    &self.iface_name,
-                    "-j",
-                    "ACCEPT",
-                ]) {
+                if let Err(e) = run_cmd(
+                    "iptables",
+                    &["-I", chain, "1", "-i", &self.iface_name, "-j", "ACCEPT"],
+                ) {
                     log::error!(
                         "Failed to add iptables -I {chain} ACCEPT for TUN interface {}: {e}. TUN traffic may be dropped by firewall.",
                         self.iface_name
                     );
                 }
             }
-            if let Err(e) = run_cmd("iptables", &[
-                "-I",
-                "FORWARD",
-                "1",
-                "-o",
-                &self.iface_name,
-                "-j",
-                "ACCEPT",
-            ]) {
+            if let Err(e) = run_cmd(
+                "iptables",
+                &["-I", "FORWARD", "1", "-o", &self.iface_name, "-j", "ACCEPT"],
+            ) {
                 log::error!(
                     "Failed to add iptables -I FORWARD -o {} ACCEPT: {e}. TUN outbound traffic may be dropped by firewall.",
                     self.iface_name
                 );
             }
-            if let Err(e) = run_cmd("iptables", &[
-                "-t",
-                "nat",
-                "-I",
-                "POSTROUTING",
-                "1",
-                "-o",
-                &self.iface_name,
-                "-j",
-                "ACCEPT",
-            ]) {
+            if let Err(e) = run_cmd(
+                "iptables",
+                &[
+                    "-t",
+                    "nat",
+                    "-I",
+                    "POSTROUTING",
+                    "1",
+                    "-o",
+                    &self.iface_name,
+                    "-j",
+                    "ACCEPT",
+                ],
+            ) {
                 log::error!(
                     "Failed to add iptables -t nat -I POSTROUTING ACCEPT for TUN interface {}: {e}. TUN traffic may not reach external networks.",
                     self.iface_name
                 );
             }
-
 
             // --- Interface-based bypass routes ---
             // Spawn the BypassIfaceWatcher: it owns the lifecycle of all WAN
@@ -340,8 +344,8 @@ impl TunRouteManager {
             //
             // Storing the handle on `self` (rather than spawning detached)
             // ensures Drop can synchronously block on rule cleanup.
-            if !self.monitor_wan_ifaces.is_empty() ||
-                !self.bypass_lan_ifaces.is_empty()
+            if !self.monitor_wan_ifaces.is_empty()
+                || !self.bypass_lan_ifaces.is_empty()
             {
                 let watcher_handle = bypass_watcher::spawn(
                     self.handle.clone(),
@@ -368,7 +372,12 @@ impl TunRouteManager {
         }
 
         // Delete first to make this robust against partial previous toggles.
-        let _ = run_ip(&["rule", "del", "priority", &TUN_IIF_EXCEPTION_PRIO.to_string()]);
+        let _ = run_ip(&[
+            "rule",
+            "del",
+            "priority",
+            &TUN_IIF_EXCEPTION_PRIO.to_string(),
+        ]);
         run_ip(&[
             "rule",
             "add",
@@ -380,7 +389,8 @@ impl TunRouteManager {
             "main",
         ])?;
 
-        let _ = run_ip(&["rule", "del", "priority", &TUN_CATCH_ALL_PRIO.to_string()]);
+        let _ =
+            run_ip(&["rule", "del", "priority", &TUN_CATCH_ALL_PRIO.to_string()]);
         run_ip(&[
             "rule",
             "add",
@@ -393,33 +403,100 @@ impl TunRouteManager {
         ])?;
 
         if auto_hijack {
-            let _ = run_cmd("iptables", &[
-                "-t", "nat", "-D", "OUTPUT",
-                "-p", "udp", "--dport", "53",
-                "-m", "mark", "!", "--mark", &BYPASS_FWMARK.to_string(),
-                "-j", "REDIRECT", "--to-port", &DNS_REDIRECT_PORT.to_string(),
-            ]);
-            if let Err(e) = run_cmd("iptables", &[
-                "-t", "nat", "-I", "OUTPUT", "1",
-                "-p", "udp", "--dport", "53",
-                "-m", "mark", "!", "--mark", &BYPASS_FWMARK.to_string(),
-                "-j", "REDIRECT", "--to-port", &DNS_REDIRECT_PORT.to_string(),
-            ]) {
-                log::error!("Failed to redirect local DNS (53→{}): {e}", DNS_REDIRECT_PORT);
+            let _ = run_cmd(
+                "iptables",
+                &[
+                    "-t",
+                    "nat",
+                    "-D",
+                    "OUTPUT",
+                    "-p",
+                    "udp",
+                    "--dport",
+                    "53",
+                    "-m",
+                    "mark",
+                    "!",
+                    "--mark",
+                    &BYPASS_FWMARK.to_string(),
+                    "-j",
+                    "REDIRECT",
+                    "--to-port",
+                    &DNS_REDIRECT_PORT.to_string(),
+                ],
+            );
+            if let Err(e) = run_cmd(
+                "iptables",
+                &[
+                    "-t",
+                    "nat",
+                    "-I",
+                    "OUTPUT",
+                    "1",
+                    "-p",
+                    "udp",
+                    "--dport",
+                    "53",
+                    "-m",
+                    "mark",
+                    "!",
+                    "--mark",
+                    &BYPASS_FWMARK.to_string(),
+                    "-j",
+                    "REDIRECT",
+                    "--to-port",
+                    &DNS_REDIRECT_PORT.to_string(),
+                ],
+            ) {
+                log::error!(
+                    "Failed to redirect local DNS (53→{}): {e}",
+                    DNS_REDIRECT_PORT
+                );
             }
 
-            let _ = run_cmd("iptables", &[
-                "-t", "nat", "-D", "PREROUTING",
-                "-p", "udp", "--dport", "53",
-                "-m", "addrtype", "--dst-type", "LOCAL",
-                "-j", "REDIRECT", "--to-port", &DNS_REDIRECT_PORT.to_string(),
-            ]);
-            if let Err(e) = run_cmd("iptables", &[
-                "-t", "nat", "-I", "PREROUTING", "1",
-                "-p", "udp", "--dport", "53",
-                "-m", "addrtype", "--dst-type", "LOCAL",
-                "-j", "REDIRECT", "--to-port", &DNS_REDIRECT_PORT.to_string(),
-            ]) {
+            let _ = run_cmd(
+                "iptables",
+                &[
+                    "-t",
+                    "nat",
+                    "-D",
+                    "PREROUTING",
+                    "-p",
+                    "udp",
+                    "--dport",
+                    "53",
+                    "-m",
+                    "addrtype",
+                    "--dst-type",
+                    "LOCAL",
+                    "-j",
+                    "REDIRECT",
+                    "--to-port",
+                    &DNS_REDIRECT_PORT.to_string(),
+                ],
+            );
+            if let Err(e) = run_cmd(
+                "iptables",
+                &[
+                    "-t",
+                    "nat",
+                    "-I",
+                    "PREROUTING",
+                    "1",
+                    "-p",
+                    "udp",
+                    "--dport",
+                    "53",
+                    "-m",
+                    "addrtype",
+                    "--dst-type",
+                    "LOCAL",
+                    "-j",
+                    "REDIRECT",
+                    "--to-port",
+                    &DNS_REDIRECT_PORT.to_string(),
+                ],
+            ) {
                 log::error!(
                     "Failed to redirect LAN client DNS (53→{}): {e}",
                     DNS_REDIRECT_PORT
@@ -447,34 +524,78 @@ impl TunRouteManager {
             log::debug!("TUN capture already disabled, skipping");
             return;
         }
-        if let Err(e) = run_ip(&["rule", "del", "priority", &TUN_CATCH_ALL_PRIO.to_string()]) {
+        if let Err(e) =
+            run_ip(&["rule", "del", "priority", &TUN_CATCH_ALL_PRIO.to_string()])
+        {
             log::debug!("disable_tun_capture: del catch-all rule failed: {e}");
         }
-        if let Err(e) = run_ip(&["rule", "del", "priority", &TUN_IIF_EXCEPTION_PRIO.to_string()]) {
-            log::debug!("disable_tun_capture: del iif exception rule failed: {e}");
+        if let Err(e) = run_ip(&[
+            "rule",
+            "del",
+            "priority",
+            &TUN_IIF_EXCEPTION_PRIO.to_string(),
+        ]) {
+            log::debug!(
+                "disable_tun_capture: del iif exception rule failed: {e}"
+            );
         }
 
         // Remove DNS redirect so local processes can resolve directly.
-        if let Err(e) = run_cmd("iptables", &[
-            "-t", "nat", "-D", "OUTPUT",
-            "-p", "udp", "--dport", "53",
-            "-m", "mark", "!", "--mark", &BYPASS_FWMARK.to_string(),
-            "-j", "REDIRECT", "--to-port", &DNS_REDIRECT_PORT.to_string(),
-        ]) {
-            log::debug!("disable_tun_capture: del DNS OUTPUT redirect failed: {e}");
+        if let Err(e) = run_cmd(
+            "iptables",
+            &[
+                "-t",
+                "nat",
+                "-D",
+                "OUTPUT",
+                "-p",
+                "udp",
+                "--dport",
+                "53",
+                "-m",
+                "mark",
+                "!",
+                "--mark",
+                &BYPASS_FWMARK.to_string(),
+                "-j",
+                "REDIRECT",
+                "--to-port",
+                &DNS_REDIRECT_PORT.to_string(),
+            ],
+        ) {
+            log::debug!(
+                "disable_tun_capture: del DNS OUTPUT redirect failed: {e}"
+            );
         }
-        if let Err(e) = run_cmd("iptables", &[
-            "-t", "nat", "-D", "PREROUTING",
-            "-p", "udp", "--dport", "53",
-            "-m", "addrtype", "--dst-type", "LOCAL",
-            "-j", "REDIRECT", "--to-port", &DNS_REDIRECT_PORT.to_string(),
-        ]) {
-            log::debug!("disable_tun_capture: del DNS PREROUTING redirect failed: {e}");
+        if let Err(e) = run_cmd(
+            "iptables",
+            &[
+                "-t",
+                "nat",
+                "-D",
+                "PREROUTING",
+                "-p",
+                "udp",
+                "--dport",
+                "53",
+                "-m",
+                "addrtype",
+                "--dst-type",
+                "LOCAL",
+                "-j",
+                "REDIRECT",
+                "--to-port",
+                &DNS_REDIRECT_PORT.to_string(),
+            ],
+        ) {
+            log::debug!(
+                "disable_tun_capture: del DNS PREROUTING redirect failed: {e}"
+            );
         }
         self.tun_capture.store(false, Ordering::Release);
     }
 
-    pub fn cleanup_routing(&mut self) {  
+    pub fn cleanup_routing(&mut self) {
         // Stop the bypass watcher first and synchronously wait for it to
         // remove every rule it installed.
         if let Some(mut watcher) = self.bypass_watcher.take() {

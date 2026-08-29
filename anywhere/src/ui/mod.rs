@@ -8,9 +8,7 @@ use axum::extract::State;
 use axum::extract::WebSocketUpgrade;
 use axum::http::StatusCode;
 use axum::middleware::Next;
-use axum::middleware::{
-    self,
-};
+use axum::middleware::{self};
 use axum::response::IntoResponse;
 use axum::response::Json;
 use axum::routing::get;
@@ -197,16 +195,24 @@ async fn config_file_handler(
         Some(path) => match std::fs::read_to_string(path) {
             Ok(content) => (
                 StatusCode::OK,
-                [(axum::http::header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+                [(
+                    axum::http::header::CONTENT_TYPE,
+                    "text/plain; charset=utf-8",
+                )],
                 content,
             )
                 .into_response(),
             Err(e) => {
                 ::log::error!("Failed to read config file {path}: {e}");
-                (StatusCode::INTERNAL_SERVER_ERROR, "failed to read config file").into_response()
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "failed to read config file",
+                )
+                    .into_response()
             },
         },
-        None => (StatusCode::INTERNAL_SERVER_ERROR, "no config path set").into_response(),
+        None => (StatusCode::INTERNAL_SERVER_ERROR, "no config path set")
+            .into_response(),
     }
 }
 
@@ -303,7 +309,8 @@ fn trigger_restart(state: &AppContext) -> StatusCode {
                 let args: Vec<String> = std::env::args().collect();
                 ::log::info!("Restarting via execve: {exe_str} {:?}", args);
                 tokio::spawn(async move {
-                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(200))
+                        .await;
                     do_execve(&exe_str, &args);
                 });
                 StatusCode::NO_CONTENT
@@ -338,10 +345,8 @@ fn trigger_restart(state: &AppContext) -> StatusCode {
 /// ports/TUN are released via drop guards before the next run() iteration.
 fn trigger_reload(state: &AppContext) -> StatusCode {
     ::log::info!("Reload requested via in-process restart");
-    crate::runner::RESTART_REQUESTED.store(
-        true,
-        std::sync::atomic::Ordering::SeqCst,
-    );
+    crate::runner::RESTART_REQUESTED
+        .store(true, std::sync::atomic::Ordering::SeqCst);
     state.shutdown_signal.notify_waiters();
     StatusCode::NO_CONTENT
 }
@@ -354,9 +359,7 @@ fn trigger_reload(state: &AppContext) -> StatusCode {
 #[cfg(all(unix, not(target_os = "android")))]
 pub(crate) fn do_execve(exe: &str, args: &[String]) {
     use std::os::unix::process::CommandExt;
-    let err = std::process::Command::new(exe)
-        .args(&args[1..])
-        .exec();
+    let err = std::process::Command::new(exe).args(&args[1..]).exec();
     // exec() only returns on failure.
     ::log::error!("execve failed: {err}");
     std::process::exit(1);
@@ -387,8 +390,7 @@ struct PutConfigsPayload {
 }
 
 async fn put_configs_handler(
-    State(state): State<Arc<UiState>>,
-    Query(query): Query<PutConfigsQuery>,
+    State(state): State<Arc<UiState>>, Query(query): Query<PutConfigsQuery>,
     axum::extract::Json(body): axum::extract::Json<PutConfigsPayload>,
 ) -> impl IntoResponse {
     // Only process when force=true.
@@ -472,7 +474,11 @@ async fn proxies_handler(
     if let Some(ut_state) = state.ctx.urltest_states.get("GLOBAL") {
         let current_idx =
             ut_state.current.load(std::sync::atomic::Ordering::Relaxed);
-        let now = ut_state.children.get(current_idx).cloned().unwrap_or_default();
+        let now = ut_state
+            .children
+            .get(current_idx)
+            .cloned()
+            .unwrap_or_default();
         proxies.insert(
             "GLOBAL".into(),
             serde_json::json!({
@@ -527,9 +533,7 @@ async fn proxies_handler(
     // are unified into urltest_states.
     for (tag, type_) in &state.ctx.outbound_tags {
         if type_ == "urltest" || type_ == "select" {
-            if let Some(ut_state) =
-                state.ctx.urltest_states.get(tag.as_str())
-            {
+            if let Some(ut_state) = state.ctx.urltest_states.get(tag.as_str()) {
                 let current_idx =
                     ut_state.current.load(std::sync::atomic::Ordering::Relaxed);
                 let now = ut_state
@@ -614,8 +618,7 @@ struct SelectProxyBody {
 }
 
 async fn select_proxy_handler(
-    State(state): State<Arc<UiState>>,
-    Path(tag): Path<String>,
+    State(state): State<Arc<UiState>>, Path(tag): Path<String>,
     axum::extract::Json(body): axum::extract::Json<SelectProxyBody>,
 ) -> impl IntoResponse {
     // All group types are unified into urltest_states.
@@ -636,8 +639,7 @@ async fn select_proxy_handler(
 // ---------------------------------------------------------------------------
 
 async fn unfix_proxy_handler(
-    State(state): State<Arc<UiState>>,
-    Path(tag): Path<String>,
+    State(state): State<Arc<UiState>>, Path(tag): Path<String>,
 ) -> impl IntoResponse {
     // All group types are unified. Clearing the pin returns to auto mode:
     // - select mode: stays at current (no automatic switching)
@@ -692,9 +694,7 @@ async fn group_delay_handler(
     let children: Vec<String> =
         if let Some(ut_state) = state.ctx.urltest_states.get(&tag) {
             ut_state.children.clone()
-        } else if let Some(sel_state) =
-            state.ctx.urltest_states.get(&tag)
-        {
+        } else if let Some(sel_state) = state.ctx.urltest_states.get(&tag) {
             sel_state.children.clone()
         } else {
             return Err(StatusCode::NOT_FOUND);
@@ -764,11 +764,7 @@ async fn proxy_delay_handler(
         (host, port)
     };
 
-    let client = state
-        .ctx
-        .registry
-        .get(&tag)
-        .ok_or(StatusCode::NOT_FOUND)?;
+    let client = state.ctx.registry.get(&tag).ok_or(StatusCode::NOT_FOUND)?;
 
     let delay = tokio::time::timeout(
         std::time::Duration::from_millis(params.timeout),

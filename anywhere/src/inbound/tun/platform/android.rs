@@ -30,7 +30,10 @@ pub fn create_tun_from_fd(fd: RawFd) -> Result<AsyncDevice, std::io::Error> {
     tun_config.up();
 
     let device = tun::create_as_async(&tun_config).map_err(|e| {
-        std::io::Error::new(std::io::ErrorKind::Other, format!("tun create failed: {e}"))
+        std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("tun create failed: {e}"),
+        )
     })?;
 
     log::info!("TUN device opened from fd={}", fd);

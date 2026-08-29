@@ -1,3 +1,4 @@
+pub mod seq;
 pub mod ws;
 pub mod xhttp;
 
@@ -57,8 +58,7 @@ pub struct TransportContext {
 #[async_trait]
 pub trait TransportFactory: Send + Sync {
     async fn create(
-        &self,
-        ctx: &TransportContext,
+        &self, ctx: &TransportContext,
     ) -> Result<Box<dyn TransportSession>, TransportError>;
 
     fn supports_asymmetric(&self) -> bool {

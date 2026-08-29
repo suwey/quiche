@@ -809,7 +809,6 @@ impl SshOutboundClient {
             idle_timeout: SSH_UDP_IDLE_TIMEOUT,
         }))
     }
-
 }
 
 // Add socks5_udp_associate back — it was removed during the proxy_type
@@ -931,11 +930,15 @@ fn parse_socks5_udp_header(
     let payload_start = offset + 2;
     let payload_len = n - payload_start;
 
-    Ok((payload_start, payload_len, Destination {
-        address: dest_addr,
-        port,
-        resolved_ip: None,
-    }))
+    Ok((
+        payload_start,
+        payload_len,
+        Destination {
+            address: dest_addr,
+            port,
+            resolved_ip: None,
+        },
+    ))
 }
 
 #[async_trait]
@@ -1024,82 +1027,97 @@ mod tests {
 
     #[tokio::test]
     async fn test_from_config_missing_cmd() {
-        let cfg = OutboundConfig { type_: "ssh".into(),
-        tag: Some("test".into()),
-        server: Some("127.0.0.1:1080".into()),
-        cmd: None,
-        proxy_type: None,
-        password: None,
-        method: None,
-        plugin: None,
-        plugin_opts: None,
-        sni: None,
-        fp: false,
-        ech_config: None,
-        outbounds: None,
-        interval: None,
-        url: None,
-        insecure: false,
-        idle_session_check_interval: None,
-        idle_session_timeout: None,
-        min_idle_session: None,
-        xmux: None,
-        transport: None,
-        tls_fragment: false, uot: false, mode: None };
+        let cfg = OutboundConfig {
+            type_: "ssh".into(),
+            tag: Some("test".into()),
+            server: Some("127.0.0.1:1080".into()),
+            cmd: None,
+            proxy_type: None,
+            password: None,
+            method: None,
+            plugin: None,
+            plugin_opts: None,
+            sni: None,
+            fp: false,
+            ech_config: None,
+            outbounds: None,
+            interval: None,
+            url: None,
+            insecure: false,
+            idle_session_check_interval: None,
+            idle_session_timeout: None,
+            min_idle_session: None,
+            xmux: None,
+            transport: None,
+            tls_fragment: false,
+            tls_fragment_config: None,
+            uot: false,
+            mode: None,
+        };
         assert!(SshOutboundClient::from_config(&cfg).await.is_err());
     }
 
     #[tokio::test]
     async fn test_from_config_missing_server() {
-        let cfg = OutboundConfig { type_: "ssh".into(),
-        tag: Some("test".into()),
-        server: None,
-        cmd: Some("ssh -D 1080 -N host".into()),
-        proxy_type: None,
-        password: None,
-        method: None,
-        plugin: None,
-        plugin_opts: None,
-        sni: None,
-        fp: false,
-        ech_config: None,
-        outbounds: None,
-        interval: None,
-        url: None,
-        insecure: false,
-        idle_session_check_interval: None,
-        idle_session_timeout: None,
-        min_idle_session: None,
-        xmux: None,
-        transport: None,
-        tls_fragment: false, uot: false, mode: None };
+        let cfg = OutboundConfig {
+            type_: "ssh".into(),
+            tag: Some("test".into()),
+            server: None,
+            cmd: Some("ssh -D 1080 -N host".into()),
+            proxy_type: None,
+            password: None,
+            method: None,
+            plugin: None,
+            plugin_opts: None,
+            sni: None,
+            fp: false,
+            ech_config: None,
+            outbounds: None,
+            interval: None,
+            url: None,
+            insecure: false,
+            idle_session_check_interval: None,
+            idle_session_timeout: None,
+            min_idle_session: None,
+            xmux: None,
+            transport: None,
+            tls_fragment: false,
+            tls_fragment_config: None,
+            uot: false,
+            mode: None,
+        };
         assert!(SshOutboundClient::from_config(&cfg).await.is_err());
     }
 
     #[tokio::test]
     async fn test_from_config_ok() {
-        let cfg = OutboundConfig { type_: "ssh".into(),
-        tag: Some("test".into()),
-        server: Some("127.0.0.1:1080".into()),
-        cmd: Some("true".into()), // exits immediately, port won't come up
-        proxy_type: None,
-        password: None,
-        method: None,
-        plugin: None,
-        plugin_opts: None,
-        sni: None,
-        fp: false,
-        ech_config: None,
-        outbounds: None,
-        interval: None,
-        url: None,
-        insecure: false,
-        idle_session_check_interval: None,
-        idle_session_timeout: None,
-        min_idle_session: None,
-        xmux: None,
-        transport: None,
-        tls_fragment: false, uot: false, mode: None };
+        let cfg = OutboundConfig {
+            type_: "ssh".into(),
+            tag: Some("test".into()),
+            server: Some("127.0.0.1:1080".into()),
+            cmd: Some("true".into()), // exits immediately, port won't come up
+            proxy_type: None,
+            password: None,
+            method: None,
+            plugin: None,
+            plugin_opts: None,
+            sni: None,
+            fp: false,
+            ech_config: None,
+            outbounds: None,
+            interval: None,
+            url: None,
+            insecure: false,
+            idle_session_check_interval: None,
+            idle_session_timeout: None,
+            min_idle_session: None,
+            xmux: None,
+            transport: None,
+            tls_fragment: false,
+            tls_fragment_config: None,
+            uot: false,
+            mode: None,
+        };
         // from_config does NOT fail on spawn failure or port timeout — it
         // logs a warning and returns the client.
         let client = SshOutboundClient::from_config(&cfg).await.unwrap();

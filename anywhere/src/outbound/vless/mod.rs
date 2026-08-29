@@ -76,9 +76,8 @@ struct VlessPool {
 impl VlessPool {
     fn new(
         addr: SocketAddr, tls_server: String, insecure: bool, tls_fp: bool,
-        fragment: Option<FragmentConfig>,
-        transport_path: String, transport_headers: HashMap<String, String>,
-        water_mark: usize,
+        fragment: Option<FragmentConfig>, transport_path: String,
+        transport_headers: HashMap<String, String>, water_mark: usize,
     ) -> Arc<Self> {
         Arc::new(Self {
             ready: tokio::sync::Mutex::new(std::collections::VecDeque::new()),
@@ -199,21 +198,28 @@ impl VlessOutboundClient {
         let insecure = cfg.insecure;
         let tls_fp = cfg.fp;
 
-        let transport = cfg.transport.as_ref().ok_or("vless: missing [transport] config")?;
+        let transport = cfg
+            .transport
+            .as_ref()
+            .ok_or("vless: missing [transport] config")?;
         if transport.type_ != "ws" {
             return Err(format!(
-                "vless: unsupported transport type '{}'", transport.type_
+                "vless: unsupported transport type '{}'",
+                transport.type_
             )
             .into());
         }
-        let ws = transport.ws.as_ref().ok_or("vless: missing [transport.ws] config")?;
+        let ws = transport
+            .ws
+            .as_ref()
+            .ok_or("vless: missing [transport.ws] config")?;
         let transport_path = ws.path.clone().unwrap_or_else(|| "/".to_string());
         let mut transport_headers = ws.headers.clone().unwrap_or_default();
         transport_headers
             .entry("Host".to_string())
             .or_insert_with(|| tls_server.clone());
         let fragment = if cfg.tls_fragment {
-            Some(FragmentConfig::default())
+            Some(cfg.tls_fragment_config.clone().unwrap_or_default())
         } else {
             None
         };
@@ -238,10 +244,7 @@ impl VlessOutboundClient {
         );
         pool.spawn_replenish();
 
-        Ok(Self {
-            pool,
-            uuid,
-        })
+        Ok(Self { pool, uuid })
     }
 }
 
@@ -295,7 +298,6 @@ impl OutboundClient for VlessOutboundClient {
             }));
         Ok(Box::new(VlessDeferredPacketRelay { state }))
     }
-
 }
 
 // ---------------------------------------------------------------------------
@@ -336,12 +338,8 @@ fn split_vless_response(resp: Vec<u8>) -> io::Result<Vec<u8>> {
 /// async, no `spawn_blocking`, so a stuck connection can't wedge the tokio
 /// blocking pool (and thus Ctrl+C shutdown).
 fn spawn_vless_relay(
-    ws: WsStreamAsync,
-    uuid: [u8; 16],
-    dest: Destination,
-    command: VlessCommand,
-    first_payload: Vec<u8>,
-    data_tx: mpsc::UnboundedSender<Vec<u8>>,
+    ws: WsStreamAsync, uuid: [u8; 16], dest: Destination, command: VlessCommand,
+    first_payload: Vec<u8>, data_tx: mpsc::UnboundedSender<Vec<u8>>,
     outbound_rx: mpsc::UnboundedReceiver<Vec<u8>>,
 ) {
     tokio::spawn(async move {
@@ -359,14 +357,14 @@ fn spawn_vless_relay(
             Err(e) => {
                 log::error!("vless relay handshake recv: {e}");
                 return;
-            }
+            },
         };
         let initial = match split_vless_response(resp) {
             Ok(d) => d,
             Err(e) => {
                 log::error!("vless relay handshake decode: {e}");
                 return;
-            }
+            },
         };
         if !initial.is_empty() {
             let _ = data_tx.send(initial);
@@ -389,14 +387,14 @@ fn spawn_vless_relay(
                             if data_tx.send(d).is_err() {
                                 break;
                             }
-                        }
+                        },
                         Ok(WsFrame::Ping(p)) => {
                             let _ = pong_tx.send(p).await;
-                        }
+                        },
                         Err(e) => {
                             log::debug!("vless relay recv error: {e}");
                             break;
-                        }
+                        },
                     }
                 }
                 let _ = shutdown_tx.send(());
@@ -528,16 +526,28 @@ impl WsStreamAsync {
         match self {
             WsStreamAsync::Plain(c) => {
                 let (r, w) = tokio::io::split(c.inner);
-                let reader = WsConnAsyncReader { inner: r, recv_buf: c.recv_buf };
+                let reader = WsConnAsyncReader {
+                    inner: r,
+                    recv_buf: c.recv_buf,
+                };
                 let writer = WsConnAsyncWriter { inner: w };
-                (WsStreamAsyncReader::Plain(reader), WsStreamAsyncWriter::Plain(writer))
-            }
+                (
+                    WsStreamAsyncReader::Plain(reader),
+                    WsStreamAsyncWriter::Plain(writer),
+                )
+            },
             WsStreamAsync::Tls(c) => {
                 let (r, w) = tokio::io::split(c.inner);
-                let reader = WsConnAsyncReader { inner: r, recv_buf: c.recv_buf };
+                let reader = WsConnAsyncReader {
+                    inner: r,
+                    recv_buf: c.recv_buf,
+                };
                 let writer = WsConnAsyncWriter { inner: w };
-                (WsStreamAsyncReader::Tls(reader), WsStreamAsyncWriter::Tls(writer))
-            }
+                (
+                    WsStreamAsyncReader::Tls(reader),
+                    WsStreamAsyncWriter::Tls(writer),
+                )
+            },
         }
     }
 }
@@ -547,12 +557,8 @@ impl WsStreamAsync {
 /// Uses `tokio_boring` for async TLS and `WsConnAsync` for async WebSocket
 /// framing. The entire handshake is fully async — no `spawn_blocking`.
 pub(crate) async fn build_ws_async(
-    tcp: tokio::net::TcpStream,
-    tls_server: &str,
-    insecure: bool,
-    tls_fp: bool,
-    fragment: Option<&FragmentConfig>,
-    path: &str,
+    tcp: tokio::net::TcpStream, tls_server: &str, insecure: bool, tls_fp: bool,
+    fragment: Option<&FragmentConfig>, path: &str,
     headers: &HashMap<String, String>,
 ) -> io::Result<WsStreamAsync> {
     let host = tls_server;
@@ -645,7 +651,7 @@ impl StreamRelay for VlessDeferredStreamRelay {
                     drop(guard);
                     tokio::time::sleep(Duration::from_millis(1)).await;
                 },
-                DeferredTcpState::Active { data_rx, .. } =>
+                DeferredTcpState::Active { data_rx, .. } => {
                     match data_rx.try_recv() {
                         Ok(data) => {
                             let n = data.len().min(buf.len());
@@ -660,7 +666,8 @@ impl StreamRelay for VlessDeferredStreamRelay {
                             tokio::time::sleep(Duration::from_millis(1)).await;
                         },
                         Err(TryRecvError::Disconnected) => return Ok(0),
-                    },
+                    }
+                },
             }
         }
     }
@@ -675,7 +682,13 @@ impl StreamRelay for VlessDeferredStreamRelay {
             let (data_tx, data_rx) = mpsc::unbounded_channel();
             let (outbound_tx, outbound_rx) = mpsc::unbounded_channel();
             spawn_vless_relay(
-                ws, uuid, dest, VlessCommand::Tcp, first, data_tx, outbound_rx,
+                ws,
+                uuid,
+                dest,
+                VlessCommand::Tcp,
+                first,
+                data_tx,
+                outbound_rx,
             );
             *guard = DeferredTcpState::Active {
                 data_rx,
@@ -805,7 +818,13 @@ impl PacketRelay for VlessDeferredPacketRelay {
             let (data_tx, data_rx) = mpsc::unbounded_channel();
             let (outbound_tx, outbound_rx) = mpsc::unbounded_channel();
             spawn_vless_relay(
-                ws, uuid, dest, VlessCommand::Udp, first, data_tx, outbound_rx,
+                ws,
+                uuid,
+                dest,
+                VlessCommand::Udp,
+                first,
+                data_tx,
+                outbound_rx,
             );
             *guard = DeferredUdpState::Active {
                 data_rx,

@@ -6,12 +6,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use http_body_util::{BodyExt, Empty};
-use hyper::body::Bytes;
 use hyper::Request;
+use hyper::body::Bytes;
 use hyper_util::rt::TokioIo;
-use tokio_rustls::rustls::pki_types::ServerName;
-use tokio_rustls::rustls::ClientConfig;
 use tokio_rustls::TlsConnector;
+use tokio_rustls::rustls::ClientConfig;
+use tokio_rustls::rustls::pki_types::ServerName;
 
 /// Response from [`http_get_with_headers`].
 ///
@@ -34,15 +34,18 @@ pub async fn http_get(url: &str, user_agent: &str) -> Result<Vec<u8>, String> {
 /// Like [`http_get`] but also returns selected response headers
 /// (`content-type`, `subscription-userinfo`).
 pub async fn http_get_with_headers(
-    url: &str,
-    user_agent: &str,
+    url: &str, user_agent: &str,
 ) -> Result<HttpResponse, String> {
     let parsed = url::Url::parse(url).map_err(|e| format!("invalid URL: {e}"))?;
     let host = parsed
         .host_str()
         .ok_or_else(|| "URL has no host".to_string())?;
     let port = parsed.port_or_known_default().unwrap_or(80);
-    let path = if parsed.path().is_empty() { "/" } else { parsed.path() };
+    let path = if parsed.path().is_empty() {
+        "/"
+    } else {
+        parsed.path()
+    };
     let query = parsed.query().map(|q| format!("?{q}")).unwrap_or_default();
     let path_query = format!("{path}{query}");
 
@@ -79,11 +82,12 @@ pub async fn http_get_with_headers(
             let provider = tokio_rustls::rustls::crypto::ring::default_provider();
             let mut roots = tokio_rustls::rustls::RootCertStore::empty();
             roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-            let mut tls_config = ClientConfig::builder_with_provider(Arc::new(provider))
-                .with_safe_default_protocol_versions()
-                .map_err(|e| format!("TLS config: {e}"))?
-                .with_root_certificates(roots)
-                .with_no_client_auth();
+            let mut tls_config =
+                ClientConfig::builder_with_provider(Arc::new(provider))
+                    .with_safe_default_protocol_versions()
+                    .map_err(|e| format!("TLS config: {e}"))?
+                    .with_root_certificates(roots)
+                    .with_no_client_auth();
             tls_config.alpn_protocols = vec![b"http/1.1".to_vec()];
             let connector = TlsConnector::from(Arc::new(tls_config));
 
@@ -99,17 +103,14 @@ pub async fn http_get_with_headers(
 
             let io = tls;
             do_hyper_get(io, build_req).await
-        }
-        "http" => {
-            do_hyper_get(tcp, build_req).await
-        }
+        },
+        "http" => do_hyper_get(tcp, build_req).await,
         other => Err(format!("unsupported scheme: {other}")),
     }
 }
 
 async fn do_hyper_get<S>(
-    io: S,
-    build_req: impl FnOnce() -> Result<Request<Empty<Bytes>>, String>,
+    io: S, build_req: impl FnOnce() -> Result<Request<Empty<Bytes>>, String>,
 ) -> Result<HttpResponse, String>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -124,10 +125,11 @@ where
     });
 
     let req = build_req()?;
-    let resp = tokio::time::timeout(Duration::from_secs(30), sender.send_request(req))
-        .await
-        .map_err(|_| "HTTP response timeout".to_string())?
-        .map_err(|e| format!("send request: {e}"))?;
+    let resp =
+        tokio::time::timeout(Duration::from_secs(30), sender.send_request(req))
+            .await
+            .map_err(|_| "HTTP response timeout".to_string())?
+            .map_err(|e| format!("send request: {e}"))?;
 
     let status = resp.status();
     if !status.is_success() {

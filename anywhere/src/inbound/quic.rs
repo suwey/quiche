@@ -148,8 +148,8 @@ impl QuicInbound {
                     Self::handle_headers(incoming_headers, &passwords, &conn_tx)
                         .await;
                 },
-                ServerH3Event::Core(H3Event::ConnectionError(_)) |
-                ServerH3Event::Core(H3Event::ConnectionShutdown(_)) => return,
+                ServerH3Event::Core(H3Event::ConnectionError(_))
+                | ServerH3Event::Core(H3Event::ConnectionShutdown(_)) => return,
                 _ => {},
             }
         }
@@ -196,8 +196,8 @@ impl QuicInbound {
         );
 
         let is_connect = method.as_deref() == Some("CONNECT");
-        let auth_ok = auth_header.is_some() &&
-            passwords
+        let auth_ok = auth_header.is_some()
+            && passwords
                 .iter()
                 .any(|p| auth_header.as_deref() == Some(p.as_str()));
 

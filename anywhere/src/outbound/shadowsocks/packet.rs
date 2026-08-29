@@ -34,8 +34,8 @@ use std::io;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use chacha20poly1305::aead::{Aead, KeyInit, Nonce};
 use chacha20poly1305::XChaCha20Poly1305;
+use chacha20poly1305::aead::{Aead, KeyInit, Nonce};
 use tokio::net::UdpSocket;
 
 use crate::inbound::Destination;
@@ -58,7 +58,10 @@ struct SlidingWindow {
 
 impl SlidingWindow {
     fn new() -> Self {
-        Self { highest: 0, bitmap: 0 }
+        Self {
+            highest: 0,
+            bitmap: 0,
+        }
     }
 
     /// Returns `true` if `id` has not been seen (acceptable).
@@ -152,7 +155,8 @@ impl SsUdpRelay {
     fn compute_padding_len(payload_len: usize, port: u16) -> usize {
         if port == 53 && payload_len < MAX_PADDING_LENGTH {
             let mut rand_bytes = [0u8; 2];
-            getrandom::fill(&mut rand_bytes).expect("getrandom: system CSPRNG failed");
+            getrandom::fill(&mut rand_bytes)
+                .expect("getrandom: system CSPRNG failed");
             let r = u16::from_be_bytes(rand_bytes) as usize;
             r % (MAX_PADDING_LENGTH - payload_len) + 1
         } else {
@@ -183,7 +187,9 @@ impl SsUdpRelay {
 
         // 3. Body plaintext: type || timestamp || paddingLen || padding || SocksAddr || payload
         let addr = serialize_socks_addr(dest);
-        let mut body = Vec::with_capacity(1 + 8 + 2 + padding_len + addr.len() + payload.len());
+        let mut body = Vec::with_capacity(
+            1 + 8 + 2 + padding_len + addr.len() + payload.len(),
+        );
         body.push(HEADER_TYPE_CLIENT);
         body.extend_from_slice(&Self::now_secs().to_be_bytes());
         body.extend_from_slice(&(padding_len as u16).to_be_bytes());
@@ -211,7 +217,9 @@ impl SsUdpRelay {
     }
 
     /// Build an encrypted ChaCha20 UDP packet (client → server).
-    fn encrypt_packet_chacha(&self, payload: &[u8], dest: &Destination) -> Vec<u8> {
+    fn encrypt_packet_chacha(
+        &self, payload: &[u8], dest: &Destination,
+    ) -> Vec<u8> {
         // 1. Random 24-byte nonce
         let mut nonce = [0u8; PACKET_NONCE_SIZE];
         getrandom::fill(&mut nonce).expect("getrandom: system CSPRNG failed");
@@ -222,8 +230,9 @@ impl SsUdpRelay {
 
         // 3. Plaintext: sessionId || packetId || type || timestamp || paddingLen || padding || SocksAddr || payload
         let addr = serialize_socks_addr(dest);
-        let mut plain =
-            Vec::with_capacity(8 + 8 + 1 + 8 + 2 + padding_len + addr.len() + payload.len());
+        let mut plain = Vec::with_capacity(
+            8 + 8 + 1 + 8 + 2 + padding_len + addr.len() + payload.len(),
+        );
         plain.extend_from_slice(&self.session_id.to_be_bytes());
         plain.extend_from_slice(&self.packet_id.to_be_bytes());
         plain.push(HEADER_TYPE_CLIENT);
@@ -253,8 +262,7 @@ impl SsUdpRelay {
 
     /// Decrypt and parse an AES server response packet.
     fn decrypt_packet_aes(
-        &mut self,
-        packet: &[u8],
+        &mut self, packet: &[u8],
     ) -> io::Result<(Vec<u8>, Destination)> {
         // 1-2. Minimum size: 16 (ECB header) + 16 (AEAD tag)
         if packet.len() < 16 + OVERHEAD {
@@ -296,9 +304,9 @@ impl SsUdpRelay {
             .remote_cipher
             .as_ref()
             .expect("remote_cipher must be set");
-        let plain = remote_cipher
-            .open(nonce, &packet[16..])
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("decrypt: {e}")))?;
+        let plain = remote_cipher.open(nonce, &packet[16..]).map_err(|e| {
+            io::Error::new(io::ErrorKind::InvalidData, format!("decrypt: {e}"))
+        })?;
 
         // 9. Parse plaintext body
         let (payload, dest) = self.parse_server_body(&plain)?;
@@ -311,8 +319,7 @@ impl SsUdpRelay {
 
     /// Decrypt and parse a ChaCha20 server response packet.
     fn decrypt_packet_chacha(
-        &mut self,
-        packet: &[u8],
+        &mut self, packet: &[u8],
     ) -> io::Result<(Vec<u8>, Destination)> {
         // 1-2. Minimum size: 24 (nonce) + 16 (AEAD tag)
         if packet.len() < PACKET_NONCE_SIZE + OVERHEAD {
@@ -328,9 +335,15 @@ impl SsUdpRelay {
             .expect("invalid PSK length for XChaCha20Poly1305");
         let n: Nonce<XChaCha20Poly1305> =
             nonce.try_into().expect("nonce must be 24 bytes");
-        let plain = cipher
-            .decrypt(&n, &packet[PACKET_NONCE_SIZE..])
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("decrypt: {e}")))?;
+        let plain =
+            cipher
+                .decrypt(&n, &packet[PACKET_NONCE_SIZE..])
+                .map_err(|e| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("decrypt: {e}"),
+                    )
+                })?;
 
         // 6. Parse sessionId, packetId from decrypted plaintext
         if plain.len() < 16 {
@@ -364,7 +377,9 @@ impl SsUdpRelay {
     ///
     /// Layout: `type(1) || timestamp(8 BE) || clientSessionId(8 BE) ||
     /// paddingLen(2 BE) || padding || SocksAddr || payload`
-    fn parse_server_body<'a>(&self, body: &'a [u8]) -> io::Result<(&'a [u8], Destination)> {
+    fn parse_server_body<'a>(
+        &self, body: &'a [u8],
+    ) -> io::Result<(&'a [u8], Destination)> {
         // Minimum: type(1) + timestamp(8) + clientSessionId(8) + paddingLen(2) = 19
         if body.len() < 19 {
             return Err(io::Error::new(
@@ -396,7 +411,8 @@ impl SsUdpRelay {
         }
 
         // Client session ID (must match ours)
-        let client_session_id = u64::from_be_bytes(body[9..17].try_into().unwrap());
+        let client_session_id =
+            u64::from_be_bytes(body[9..17].try_into().unwrap());
         if client_session_id != self.session_id {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -415,8 +431,13 @@ impl SsUdpRelay {
         }
 
         // SocksAddr
-        let (dest, addr_len) = deserialize_socks_addr(&body[offset..])
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("socks addr: {e}")))?;
+        let (dest, addr_len) =
+            deserialize_socks_addr(&body[offset..]).map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("socks addr: {e}"),
+                )
+            })?;
         let offset = offset + addr_len;
 
         // Remaining bytes are the payload
@@ -429,15 +450,14 @@ impl SsUdpRelay {
 #[async_trait]
 impl PacketRelay for SsUdpRelay {
     async fn read_packet(
-        &mut self,
-        buf: &mut [u8],
+        &mut self, buf: &mut [u8],
     ) -> io::Result<(usize, Destination)> {
         let n = match self.socket.recv(buf).await {
             Ok(n) => n,
             Err(e) => {
                 log::debug!("ss: udp recv failed: {e}");
                 return Err(e);
-            }
+            },
         };
         let (payload, dest) = if self.method.is_aes() {
             self.decrypt_packet_aes(&buf[..n])
@@ -457,9 +477,7 @@ impl PacketRelay for SsUdpRelay {
     }
 
     async fn write_packet(
-        &mut self,
-        buf: &[u8],
-        dest: &Destination,
+        &mut self, buf: &[u8], dest: &Destination,
     ) -> io::Result<()> {
         let packet = if self.method.is_aes() {
             self.encrypt_packet_aes(buf, dest)
@@ -578,14 +596,9 @@ mod tests {
 
     /// Build an AES server→client response packet.
     fn build_server_aes(
-        method: &CipherMethod,
-        server_session_id: u64,
-        server_packet_id: u64,
-        client_session_id: u64,
-        dest: &Destination,
-        payload: &[u8],
-        timestamp: Option<u64>,
-        padding_len: u16,
+        method: &CipherMethod, server_session_id: u64, server_packet_id: u64,
+        client_session_id: u64, dest: &Destination, payload: &[u8],
+        timestamp: Option<u64>, padding_len: u16,
     ) -> Vec<u8> {
         let mut hdr = [0u8; 16];
         hdr[0..8].copy_from_slice(&server_session_id.to_be_bytes());
@@ -619,16 +632,12 @@ mod tests {
 
     /// Build a ChaCha20 server→client response packet.
     fn build_server_chacha(
-        method: &CipherMethod,
-        server_session_id: u64,
-        server_packet_id: u64,
-        client_session_id: u64,
-        dest: &Destination,
-        payload: &[u8],
-        timestamp: Option<u64>,
-        padding_len: u16,
+        method: &CipherMethod, server_session_id: u64, server_packet_id: u64,
+        client_session_id: u64, dest: &Destination, payload: &[u8],
+        timestamp: Option<u64>, padding_len: u16,
     ) -> Vec<u8> {
-        let cipher = XChaCha20Poly1305::new_from_slice(method.last_psk()).unwrap();
+        let cipher =
+            XChaCha20Poly1305::new_from_slice(method.last_psk()).unwrap();
 
         let mut nonce = [0u8; PACKET_NONCE_SIZE];
         getrandom::fill(&mut nonce).unwrap();
@@ -661,7 +670,8 @@ mod tests {
     #[tokio::test]
     async fn test_aes256_decrypt_round_trip() {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let method = CipherMethod::new("2022-blake3-aes-256-gcm", &make_psk(32)).unwrap();
+        let method =
+            CipherMethod::new("2022-blake3-aes-256-gcm", &make_psk(32)).unwrap();
         let mut relay = SsUdpRelay::new(socket, method.clone());
 
         let client_session_id = relay.session_id;
@@ -687,7 +697,8 @@ mod tests {
     #[tokio::test]
     async fn test_aes128_decrypt_round_trip() {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let method = CipherMethod::new("2022-blake3-aes-128-gcm", &make_psk(16)).unwrap();
+        let method =
+            CipherMethod::new("2022-blake3-aes-128-gcm", &make_psk(16)).unwrap();
         let mut relay = SsUdpRelay::new(socket, method.clone());
 
         let client_session_id = relay.session_id;
@@ -714,7 +725,8 @@ mod tests {
     async fn test_aes_encrypt_round_trip() {
         // Verify the client's encrypt path by parsing the produced packet.
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let method = CipherMethod::new("2022-blake3-aes-256-gcm", &make_psk(32)).unwrap();
+        let method =
+            CipherMethod::new("2022-blake3-aes-256-gcm", &make_psk(32)).unwrap();
         let relay = SsUdpRelay::new(socket, method.clone());
 
         let expected_session_id = relay.session_id;
@@ -742,7 +754,8 @@ mod tests {
         assert_eq!(plain[0], HEADER_TYPE_CLIENT);
         let padding_len = u16::from_be_bytes([plain[9], plain[10]]) as usize;
         let offset = 11 + padding_len;
-        let (parsed_dest, addr_len) = deserialize_socks_addr(&plain[offset..]).unwrap();
+        let (parsed_dest, addr_len) =
+            deserialize_socks_addr(&plain[offset..]).unwrap();
         let parsed_payload = &plain[offset + addr_len..];
 
         assert_eq!(parsed_dest, dest);
@@ -752,15 +765,24 @@ mod tests {
     #[tokio::test]
     async fn test_aes_with_padding() {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let method = CipherMethod::new("2022-blake3-aes-256-gcm", &make_psk(32)).unwrap();
+        let method =
+            CipherMethod::new("2022-blake3-aes-256-gcm", &make_psk(32)).unwrap();
         let mut relay = SsUdpRelay::new(socket, method.clone());
 
         let client_session_id = relay.session_id;
         let dest = Destination::new(Address::Ipv4([8, 8, 8, 8]), 53);
         let payload = b"pad";
 
-        let packet =
-            build_server_aes(&method, 7777, 0, client_session_id, &dest, payload, None, 200);
+        let packet = build_server_aes(
+            &method,
+            7777,
+            0,
+            client_session_id,
+            &dest,
+            payload,
+            None,
+            200,
+        );
 
         let (decrypted, parsed_dest) = relay.decrypt_packet_aes(&packet).unwrap();
         assert_eq!(decrypted, payload);
@@ -773,11 +795,13 @@ mod tests {
     async fn test_chacha_decrypt_round_trip() {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let method =
-            CipherMethod::new("2022-blake3-chacha20-poly1305", &make_psk(32)).unwrap();
+            CipherMethod::new("2022-blake3-chacha20-poly1305", &make_psk(32))
+                .unwrap();
         let mut relay = SsUdpRelay::new(socket, method.clone());
 
         let client_session_id = relay.session_id;
-        let dest = Destination::new(Address::Domain("example.com".to_string()), 443);
+        let dest =
+            Destination::new(Address::Domain("example.com".to_string()), 443);
         let payload = b"hello chacha udp";
 
         let packet = build_server_chacha(
@@ -791,7 +815,8 @@ mod tests {
             0,
         );
 
-        let (decrypted, parsed_dest) = relay.decrypt_packet_chacha(&packet).unwrap();
+        let (decrypted, parsed_dest) =
+            relay.decrypt_packet_chacha(&packet).unwrap();
         assert_eq!(decrypted, payload);
         assert_eq!(parsed_dest, dest);
     }
@@ -800,7 +825,8 @@ mod tests {
     async fn test_chacha_encrypt_round_trip() {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let method =
-            CipherMethod::new("2022-blake3-chacha20-poly1305", &make_psk(32)).unwrap();
+            CipherMethod::new("2022-blake3-chacha20-poly1305", &make_psk(32))
+                .unwrap();
         let relay = SsUdpRelay::new(socket, method.clone());
 
         let expected_session_id = relay.session_id;
@@ -812,11 +838,10 @@ mod tests {
         // XChaCha20-Poly1305 decrypt with PSK
         let cipher =
             XChaCha20Poly1305::new_from_slice(method.last_psk()).unwrap();
-        let n: Nonce<XChaCha20Poly1305> =
-            packet[..PACKET_NONCE_SIZE].try_into().expect("nonce must be 24 bytes");
-        let plain = cipher
-            .decrypt(&n, &packet[PACKET_NONCE_SIZE..])
-            .unwrap();
+        let n: Nonce<XChaCha20Poly1305> = packet[..PACKET_NONCE_SIZE]
+            .try_into()
+            .expect("nonce must be 24 bytes");
+        let plain = cipher.decrypt(&n, &packet[PACKET_NONCE_SIZE..]).unwrap();
 
         // Parse: sessionId || packetId || type || timestamp || paddingLen || padding || SocksAddr || payload
         let session_id = u64::from_be_bytes(plain[0..8].try_into().unwrap());
@@ -827,7 +852,8 @@ mod tests {
 
         let padding_len = u16::from_be_bytes([plain[25], plain[26]]) as usize;
         let offset = 27 + padding_len;
-        let (parsed_dest, addr_len) = deserialize_socks_addr(&plain[offset..]).unwrap();
+        let (parsed_dest, addr_len) =
+            deserialize_socks_addr(&plain[offset..]).unwrap();
         let parsed_payload = &plain[offset + addr_len..];
 
         assert_eq!(parsed_dest, dest);
@@ -839,7 +865,8 @@ mod tests {
     #[tokio::test]
     async fn test_timestamp_validation_aes() {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let method = CipherMethod::new("2022-blake3-aes-256-gcm", &make_psk(32)).unwrap();
+        let method =
+            CipherMethod::new("2022-blake3-aes-256-gcm", &make_psk(32)).unwrap();
         let mut relay = SsUdpRelay::new(socket, method.clone());
 
         let client_session_id = relay.session_id;
@@ -870,7 +897,8 @@ mod tests {
     async fn test_timestamp_validation_chacha() {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let method =
-            CipherMethod::new("2022-blake3-chacha20-poly1305", &make_psk(32)).unwrap();
+            CipherMethod::new("2022-blake3-chacha20-poly1305", &make_psk(32))
+                .unwrap();
         let mut relay = SsUdpRelay::new(socket, method.clone());
 
         let client_session_id = relay.session_id;
@@ -901,7 +929,8 @@ mod tests {
     #[tokio::test]
     async fn test_client_session_id_validation_aes() {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let method = CipherMethod::new("2022-blake3-aes-256-gcm", &make_psk(32)).unwrap();
+        let method =
+            CipherMethod::new("2022-blake3-aes-256-gcm", &make_psk(32)).unwrap();
         let mut relay = SsUdpRelay::new(socket, method.clone());
 
         let dest = Destination::new(Address::Ipv4([5, 6, 7, 8]), 443);
@@ -923,15 +952,17 @@ mod tests {
     async fn test_client_session_id_validation_chacha() {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let method =
-            CipherMethod::new("2022-blake3-chacha20-poly1305", &make_psk(32)).unwrap();
+            CipherMethod::new("2022-blake3-chacha20-poly1305", &make_psk(32))
+                .unwrap();
         let mut relay = SsUdpRelay::new(socket, method.clone());
 
         let dest = Destination::new(Address::Ipv4([5, 6, 7, 8]), 443);
         let payload = b"wrong sid";
 
         let wrong_id = relay.session_id.wrapping_add(1);
-        let packet =
-            build_server_chacha(&method, 66, 0, wrong_id, &dest, payload, None, 0);
+        let packet = build_server_chacha(
+            &method, 66, 0, wrong_id, &dest, payload, None, 0,
+        );
 
         let err = relay.decrypt_packet_chacha(&packet).unwrap_err();
         assert!(
@@ -945,15 +976,24 @@ mod tests {
     #[tokio::test]
     async fn test_replay_detection_aes() {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let method = CipherMethod::new("2022-blake3-aes-256-gcm", &make_psk(32)).unwrap();
+        let method =
+            CipherMethod::new("2022-blake3-aes-256-gcm", &make_psk(32)).unwrap();
         let mut relay = SsUdpRelay::new(socket, method.clone());
 
         let client_session_id = relay.session_id;
         let dest = Destination::new(Address::Ipv4([9, 9, 9, 9]), 53);
         let payload = b"replay me";
 
-        let packet =
-            build_server_aes(&method, 44, 0, client_session_id, &dest, payload, None, 0);
+        let packet = build_server_aes(
+            &method,
+            44,
+            0,
+            client_session_id,
+            &dest,
+            payload,
+            None,
+            0,
+        );
 
         // First reception: OK
         assert!(relay.decrypt_packet_aes(&packet).is_ok());
@@ -970,15 +1010,24 @@ mod tests {
     async fn test_replay_detection_chacha() {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let method =
-            CipherMethod::new("2022-blake3-chacha20-poly1305", &make_psk(32)).unwrap();
+            CipherMethod::new("2022-blake3-chacha20-poly1305", &make_psk(32))
+                .unwrap();
         let mut relay = SsUdpRelay::new(socket, method.clone());
 
         let client_session_id = relay.session_id;
         let dest = Destination::new(Address::Ipv4([9, 9, 9, 9]), 53);
         let payload = b"replay me";
 
-        let packet =
-            build_server_chacha(&method, 44, 0, client_session_id, &dest, payload, None, 0);
+        let packet = build_server_chacha(
+            &method,
+            44,
+            0,
+            client_session_id,
+            &dest,
+            payload,
+            None,
+            0,
+        );
 
         // First reception: OK
         assert!(relay.decrypt_packet_chacha(&packet).is_ok());
@@ -996,7 +1045,8 @@ mod tests {
     #[tokio::test]
     async fn test_bad_header_type() {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let method = CipherMethod::new("2022-blake3-aes-256-gcm", &make_psk(32)).unwrap();
+        let method =
+            CipherMethod::new("2022-blake3-aes-256-gcm", &make_psk(32)).unwrap();
         let mut relay = SsUdpRelay::new(socket, method.clone());
 
         let client_session_id = relay.session_id;
@@ -1035,18 +1085,25 @@ mod tests {
     #[tokio::test]
     async fn test_domain_address_round_trip() {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let method = CipherMethod::new("2022-blake3-aes-256-gcm", &make_psk(32)).unwrap();
+        let method =
+            CipherMethod::new("2022-blake3-aes-256-gcm", &make_psk(32)).unwrap();
         let mut relay = SsUdpRelay::new(socket, method.clone());
 
         let client_session_id = relay.session_id;
-        let dest = Destination::new(
-            Address::Domain("dns.google".to_string()),
-            53,
-        );
+        let dest =
+            Destination::new(Address::Domain("dns.google".to_string()), 53);
         let payload = b"domain test";
 
-        let packet =
-            build_server_aes(&method, 222, 0, client_session_id, &dest, payload, None, 0);
+        let packet = build_server_aes(
+            &method,
+            222,
+            0,
+            client_session_id,
+            &dest,
+            payload,
+            None,
+            0,
+        );
 
         let (decrypted, parsed_dest) = relay.decrypt_packet_aes(&packet).unwrap();
         assert_eq!(decrypted, payload);

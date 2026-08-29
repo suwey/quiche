@@ -41,16 +41,19 @@ impl Upstream {
 pub fn parse_upstream(s: &str) -> Result<Upstream, String> {
     let s = s.trim();
 
-    if let Some(rest) = s.strip_prefix("https://").or_else(|| s.strip_prefix("http://")) {
-        return parse_doh_url(rest).map(|(host, path, port)| Upstream::Doh { host, path, port });
+    if let Some(rest) = s
+        .strip_prefix("https://")
+        .or_else(|| s.strip_prefix("http://"))
+    {
+        return parse_doh_url(rest).map(|(host, path, port)| Upstream::Doh {
+            host,
+            path,
+            port,
+        });
     }
 
     // Reject known-but-unsupported schemes early with a helpful message.
-    if let Some(scheme) = s
-        .split("://")
-        .next()
-        .filter(|_| s.contains("://"))
-    {
+    if let Some(scheme) = s.split("://").next().filter(|_| s.contains("://")) {
         return Err(format!(
             "dns upstream '{s}': scheme '{scheme}://' is not supported. \
              Use DoH (https://host/dns-query) or a plain IP address instead"
@@ -81,7 +84,9 @@ pub fn parse_upstream(s: &str) -> Result<Upstream, String> {
             let tail = &rest[close + 1..];
             let port = tail
                 .strip_prefix(':')
-                .map(|p| p.parse::<u16>().map_err(|e| format!("invalid port: {e}")))
+                .map(|p| {
+                    p.parse::<u16>().map_err(|e| format!("invalid port: {e}"))
+                })
                 .transpose()?
                 .unwrap_or(53);
             (host, port)
@@ -125,7 +130,11 @@ fn parse_doh_url(rest: &str) -> Result<(String, String, u16), String> {
         Some(i) => (&rest[..i], &rest[i..]),
         None => (rest, "/dns-query"),
     };
-    let path = if path == "/" { "/dns-query".to_string() } else { path.to_string() };
+    let path = if path == "/" {
+        "/dns-query".to_string()
+    } else {
+        path.to_string()
+    };
 
     // Authority is host[:port]. IPv6 literals are bracketed, e.g. [::1]:443.
     let (host, port) = if let Some(authority) = authority.strip_prefix('[') {
@@ -136,7 +145,10 @@ fn parse_doh_url(rest: &str) -> Result<(String, String, u16), String> {
         let tail = &authority[close + 1..];
         let port = tail
             .strip_prefix(':')
-            .map(|p| p.parse::<u16>().map_err(|e| format!("invalid DoH port: {e}")))
+            .map(|p| {
+                p.parse::<u16>()
+                    .map_err(|e| format!("invalid DoH port: {e}"))
+            })
             .transpose()?
             .unwrap_or(443);
         (host.to_string(), port)
@@ -182,7 +194,7 @@ mod tests {
             Upstream::Plain(dest) => {
                 assert_eq!(dest.port, 53);
                 assert_eq!(dest.address, Address::Ipv4([8, 8, 8, 8]));
-            }
+            },
             Upstream::Doh { .. } => panic!("expected Plain"),
         }
     }
@@ -192,7 +204,7 @@ mod tests {
         match parse_upstream("1.1.1.1:5353").unwrap() {
             Upstream::Plain(dest) => {
                 assert_eq!(dest.port, 5353);
-            }
+            },
             Upstream::Doh { .. } => panic!("expected Plain"),
         }
     }
@@ -203,8 +215,13 @@ mod tests {
         match up {
             Upstream::Plain(dest) => {
                 assert_eq!(dest.port, 53);
-                assert_eq!(dest.address, Address::Ipv6([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]));
-            }
+                assert_eq!(
+                    dest.address,
+                    Address::Ipv6([
+                        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1
+                    ])
+                );
+            },
             Upstream::Doh { .. } => panic!("expected Plain"),
         }
     }
@@ -215,8 +232,14 @@ mod tests {
         match up {
             Upstream::Plain(dest) => {
                 assert_eq!(dest.port, 53);
-                assert_eq!(dest.address, Address::Ipv6([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01]));
-            }
+                assert_eq!(
+                    dest.address,
+                    Address::Ipv6([
+                        0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                        0x01
+                    ])
+                );
+            },
             Upstream::Doh { .. } => panic!("expected Plain"),
         }
     }
@@ -227,8 +250,13 @@ mod tests {
         match up {
             Upstream::Plain(dest) => {
                 assert_eq!(dest.port, 5353);
-                assert_eq!(dest.address, Address::Ipv6([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]));
-            }
+                assert_eq!(
+                    dest.address,
+                    Address::Ipv6([
+                        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1
+                    ])
+                );
+            },
             Upstream::Doh { .. } => panic!("expected Plain"),
         }
     }
@@ -239,8 +267,13 @@ mod tests {
         match up {
             Upstream::Plain(dest) => {
                 assert_eq!(dest.port, 53);
-                assert_eq!(dest.address, Address::Ipv6([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]));
-            }
+                assert_eq!(
+                    dest.address,
+                    Address::Ipv6([
+                        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1
+                    ])
+                );
+            },
             Upstream::Doh { .. } => panic!("expected Plain"),
         }
     }
@@ -252,7 +285,7 @@ mod tests {
                 assert_eq!(host, "dns.google");
                 assert_eq!(path, "/dns-query");
                 assert_eq!(port, 443);
-            }
+            },
             Upstream::Plain(_) => panic!("expected Doh"),
         }
     }
@@ -264,7 +297,7 @@ mod tests {
                 assert_eq!(host, "dns.alidns.com");
                 assert_eq!(path, "/dns-query");
                 assert_eq!(port, 443);
-            }
+            },
             Upstream::Plain(_) => panic!("expected Doh"),
         }
     }
@@ -276,7 +309,7 @@ mod tests {
                 assert_eq!(host, "dns.example");
                 assert_eq!(path, "/custom");
                 assert_eq!(port, 8443);
-            }
+            },
             Upstream::Plain(_) => panic!("expected Doh"),
         }
     }
@@ -286,7 +319,7 @@ mod tests {
         match parse_upstream("https://dns.google/").unwrap() {
             Upstream::Doh { ref path, .. } => {
                 assert_eq!(path, "/dns-query");
-            }
+            },
             Upstream::Plain(_) => panic!("expected Doh"),
         }
     }

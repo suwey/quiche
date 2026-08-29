@@ -501,9 +501,12 @@ fn handle_connection_inner(
                                 {
                                     let mut streams =
                                         inner.streams.lock().unwrap();
-                                    streams.insert(stream_id, StreamSender {
-                                        data_tx: data_tx.clone(),
-                                    });
+                                    streams.insert(
+                                        stream_id,
+                                        StreamSender {
+                                            data_tx: data_tx.clone(),
+                                        },
+                                    );
                                 }
 
                                 if !remaining_data.is_empty() {
@@ -546,7 +549,7 @@ fn handle_connection_inner(
                             }
                         }
                     },
-                    CMD_FIN =>
+                    CMD_FIN => {
                         if pending_syn.contains_key(&stream_id) {
                             pending_syn.remove(&stream_id);
                         } else {
@@ -554,7 +557,8 @@ fn handle_connection_inner(
                             if let Some(sender) = streams.remove(&stream_id) {
                                 drop(sender.data_tx);
                             }
-                        },
+                        }
+                    },
                     CMD_HEART_REQUEST => {
                         if let Ok(frame) =
                             encode_frame(CMD_HEART_RESPONSE, stream_id, &[])
@@ -580,8 +584,8 @@ fn handle_connection_inner(
                 }
             },
             Err(ref e)
-                if e.kind() == std::io::ErrorKind::WouldBlock ||
-                    e.kind() == std::io::ErrorKind::TimedOut =>
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
             {
                 // Send heartbeat.
                 if let Ok(frame) = encode_frame(CMD_HEART_REQUEST, 0, &[]) {

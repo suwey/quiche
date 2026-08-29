@@ -7,8 +7,6 @@ use boring::ssl::SslVerifyMode;
 use std::io;
 use tokio::net::TcpStream;
 use tokio::net::UdpSocket;
-#[cfg(target_os = "macos")]
-use std::os::fd::AsRawFd;
 
 use crate::tlsfragment::{FragmentConfig, FragmentTcpStream};
 
@@ -21,43 +19,97 @@ pub const ERR_UDP_NOT_SUPPORTED: &str = "UDP not supported by this outbound";
 // IP_BOUND_IF on macOS, so outbound sockets avoid the TUN route.
 // ---------------------------------------------------------------------------
 
-/// On macOS, find the default physical interface (en0/en1/…) by looking
-/// up the route to a public IP and extracting the interface name.
-/// Returns `None` if it cannot be determined (e.g. no network).
 #[cfg(target_os = "macos")]
-fn default_physical_iface() -> Option<String> {
-    use std::sync::LazyLock;
-    static CACHED: LazyLock<Option<String>> = LazyLock::new(|| {
-        let output = std::process::Command::new("route")
-            .args(["-n", "get", "default"])
-            .output()
-            .ok()?;
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        for line in stdout.lines() {
-            let trimmed = line.trim();
-            if let Some(rest) = trimmed.strip_prefix("interface:") {
-                let iface = rest.trim();
-                if !iface.is_empty() && !iface.starts_with("utun") {
-                    return Some(iface.to_string());
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MacosPhysicalIface {
+    name: String,
+    index: u32,
+    ipv4: Option<std::net::Ipv4Addr>,
+}
+
+#[cfg(target_os = "macos")]
+static MACOS_PHYSICAL_IFACE_CACHE: std::sync::OnceLock<
+    std::sync::RwLock<Option<MacosPhysicalIface>>,
+> = std::sync::OnceLock::new();
+
+/// On macOS, load the current default physical interface (en0/en1/…) and
+/// its IPv4 address. The cache is refreshed explicitly when the TUN route
+/// watcher detects a wake or network change.
+#[cfg(target_os = "macos")]
+fn load_macos_physical_iface() -> Option<MacosPhysicalIface> {
+    let output = std::process::Command::new("route")
+        .args(["-n", "get", "default"])
+        .output()
+        .ok()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut iface = None;
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("interface:") {
+            let name = rest.trim();
+            if !name.is_empty() && !name.starts_with("utun") {
+                iface = Some(name.to_string());
+            }
+            break;
+        }
+    }
+
+    let name = iface?;
+    let c_iface = std::ffi::CString::new(name.as_str()).ok()?;
+    let index = unsafe { libc::if_nametoindex(c_iface.as_ptr()) };
+    if index == 0 {
+        return None;
+    }
+
+    let output = std::process::Command::new("ifconfig")
+        .arg(&name)
+        .output()
+        .ok()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut ipv4 = None;
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("inet ") {
+            if let Some(ip_str) = rest.split_whitespace().next() {
+                if let Ok(ip) = ip_str.parse::<std::net::Ipv4Addr>() {
+                    ipv4 = Some(ip);
                 }
             }
+            break;
         }
-        None
-    });
-    CACHED.clone()
+    }
+
+    Some(MacosPhysicalIface { name, index, ipv4 })
+}
+
+/// Replace the cached macOS physical interface after a wake or network change.
+#[cfg(target_os = "macos")]
+pub fn refresh_macos_physical_iface_cache() {
+    let cache = MACOS_PHYSICAL_IFACE_CACHE
+        .get_or_init(|| std::sync::RwLock::new(load_macos_physical_iface()));
+    if let Ok(mut cached) = cache.write() {
+        *cached = load_macos_physical_iface();
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn cached_macos_physical_iface() -> Option<MacosPhysicalIface> {
+    let cache = MACOS_PHYSICAL_IFACE_CACHE
+        .get_or_init(|| std::sync::RwLock::new(load_macos_physical_iface()));
+    if let Ok(cached) = cache.read() {
+        if cached.as_ref().is_some_and(|iface| iface.ipv4.is_some()) {
+            return cached.clone();
+        }
+    }
+
+    refresh_macos_physical_iface_cache();
+    cache.read().ok().and_then(|cached| cached.clone())
 }
 
 /// Cached interface index for IP_BOUND_IF.
 #[cfg(target_os = "macos")]
 fn physical_iface_index() -> Option<u32> {
-    use std::sync::LazyLock;
-    static CACHED: LazyLock<Option<u32>> = LazyLock::new(|| {
-        let iface = default_physical_iface()?;
-        let c_iface = std::ffi::CString::new(iface.as_str()).ok()?;
-        let idx = unsafe { libc::if_nametoindex(c_iface.as_ptr()) };
-        if idx > 0 { Some(idx) } else { None }
-    });
-    *CACHED
+    cached_macos_physical_iface().map(|iface| iface.index)
 }
 
 /// On macOS, get the IPv4 address of the physical interface (e.g. en0).
@@ -65,27 +117,7 @@ fn physical_iface_index() -> Option<u32> {
 /// bypasses TUN split routes.
 #[cfg(target_os = "macos")]
 fn physical_iface_ipv4() -> Option<std::net::Ipv4Addr> {
-    use std::sync::LazyLock;
-    static CACHED: LazyLock<Option<std::net::Ipv4Addr>> = LazyLock::new(|| {
-        let iface = default_physical_iface()?;
-        let output = std::process::Command::new("ifconfig")
-            .arg(&iface)
-            .output()
-            .ok()?;
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        for line in stdout.lines() {
-            let trimmed = line.trim();
-            if let Some(rest) = trimmed.strip_prefix("inet ") {
-                if let Some(ip_str) = rest.split_whitespace().next() {
-                    if let Ok(ip) = ip_str.parse::<std::net::Ipv4Addr>() {
-                        return Some(ip);
-                    }
-                }
-            }
-        }
-        None
-    });
-    *CACHED
+    cached_macos_physical_iface().and_then(|iface| iface.ipv4)
 }
 
 /// Cached index of the physical (default-route) interface on Windows.
@@ -178,17 +210,10 @@ fn set_unicast_if_raw(raw: libc::SOCKET, ipv4: bool) {
 #[cfg(target_os = "macos")]
 #[allow(dead_code)]
 fn bind_to_physical_iface(fd: std::os::fd::RawFd) -> io::Result<()> {
-    let iface = default_physical_iface()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "no physical interface"))?;
-    let c_iface = std::ffi::CString::new(iface.as_str())
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-    let idx = unsafe { libc::if_nametoindex(c_iface.as_ptr()) };
-    if idx == 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
-            format!("if_nametoindex({iface}) failed"),
-        ));
-    }
+    let iface = cached_macos_physical_iface().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::Other, "no physical interface")
+    })?;
+    let idx = iface.index;
     // IP_BOUND_IF = 25 (IP level) on macOS. See <netinet/in.h>.
     const IP_BOUND_IF: libc::c_int = 25;
     let ret = unsafe {
@@ -203,7 +228,7 @@ fn bind_to_physical_iface(fd: std::os::fd::RawFd) -> io::Result<()> {
     if ret != 0 {
         return Err(io::Error::last_os_error());
     }
-    log::trace!("macOS: IP_BOUND_IF fd={fd} → {iface} (idx={idx})");
+    log::trace!("macOS: IP_BOUND_IF fd={fd} -> {} (idx={idx})", iface.name);
     Ok(())
 }
 
@@ -238,10 +263,12 @@ pub async fn connect_tcp_bypass(
             socket.set_tcp_nodelay(true)?;
             // Enable TCP keepalive to detect half-open connections.
             socket.set_keepalive(true)?;
-            socket.set_tcp_keepalive(&socket2::TcpKeepalive::new()
-                .with_time(std::time::Duration::from_secs(60))
-                .with_interval(std::time::Duration::from_secs(15))
-                .with_retries(3))?;
+            socket.set_tcp_keepalive(
+                &socket2::TcpKeepalive::new()
+                    .with_time(std::time::Duration::from_secs(60))
+                    .with_interval(std::time::Duration::from_secs(15))
+                    .with_retries(3),
+            )?;
             socket.connect_timeout(&addr.into(), TCP_CONNECT_TIMEOUT)?;
             let std_stream: std::net::TcpStream = socket.into();
             TcpStream::from_std(std_stream)
@@ -251,8 +278,8 @@ pub async fn connect_tcp_bypass(
     }
     #[cfg(target_os = "android")]
     {
-        use std::os::fd::AsRawFd;
         use crate::inbound::tun::platform::android::get_protector;
+        use std::os::fd::AsRawFd;
 
         // IMPORTANT: VpnService.protect() MUST be called BEFORE connect(),
         // otherwise the SYN packet is already routed into the TUN.
@@ -276,23 +303,27 @@ pub async fn connect_tcp_bypass(
             let fd = socket.as_raw_fd();
             let protected = protector.protect(fd);
             if !protected {
-                log::warn!("VpnService.protect() failed for TCP fd={fd} addr={addr}");
+                log::warn!(
+                    "VpnService.protect() failed for TCP fd={fd} addr={addr}"
+                );
             } else {
                 log::debug!("protect(fd={fd}) ok, connecting to {addr}");
             }
             socket.set_tcp_nodelay(true)?;
             // Enable TCP keepalive to detect half-open connections.
             socket.set_keepalive(true)?;
-            socket.set_tcp_keepalive(&socket2::TcpKeepalive::new()
-                .with_time(std::time::Duration::from_secs(60))
-                .with_interval(std::time::Duration::from_secs(15))
-                .with_retries(3))?;
+            socket.set_tcp_keepalive(
+                &socket2::TcpKeepalive::new()
+                    .with_time(std::time::Duration::from_secs(60))
+                    .with_interval(std::time::Duration::from_secs(15))
+                    .with_retries(3),
+            )?;
             socket.set_nonblocking(true)?;
 
             // Non-blocking connect returns EINPROGRESS immediately.
             // We need to poll for writability, then check SO_ERROR.
             match socket.connect(&addr.into()) {
-                Ok(()) => {}
+                Ok(()) => {},
                 Err(e) if e.raw_os_error() == Some(libc::EINPROGRESS) => {
                     // Wait for the socket to become writable (connect completes).
                     // Use poll() with a timeout.
@@ -306,7 +337,10 @@ pub async fn connect_tcp_bypass(
                         return Err(io::Error::last_os_error());
                     }
                     if ret == 0 {
-                        return Err(io::Error::new(io::ErrorKind::TimedOut, "connect poll timeout"));
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "connect poll timeout",
+                        ));
                     }
                     // Check SO_ERROR to see if connect succeeded.
                     let mut err: i32 = 0;
@@ -326,7 +360,7 @@ pub async fn connect_tcp_bypass(
                     if err != 0 {
                         return Err(io::Error::from_raw_os_error(err));
                     }
-                }
+                },
                 Err(e) => return Err(e),
             }
 
@@ -338,67 +372,7 @@ pub async fn connect_tcp_bypass(
     }
     #[cfg(target_os = "macos")]
     {
-        use socket2::Domain;
-        use socket2::Protocol;
-        use socket2::Socket;
-        use socket2::Type;
-        use std::os::fd::AsRawFd;
-
-        // macOS: use IP_BOUND_IF to bind socket to the physical interface.
-        // The kernel scopes route lookup to the bound interface, ignoring
-        // TUN split routes (which go through utun). Source IP is auto-selected
-        // from en0. No bind(), no pf route-to, no NAT needed.
-        // Requires: split routes installed with -ifscope OR host route for
-        // TUN address via utun (so gateway resolves to utun, not en0).
-        // Set IP_BOUND_IF to the physical interface (en0).
-        let domain = if addr.is_ipv4() {
-            Domain::IPV4
-        } else {
-            Domain::IPV6
-        };
-        let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
-        socket.set_tcp_nodelay(true)?;
-        socket.set_keepalive(true)?;
-        socket.set_tcp_keepalive(&socket2::TcpKeepalive::new()
-            .with_time(std::time::Duration::from_secs(60))
-            .with_interval(std::time::Duration::from_secs(15))
-            .with_retries(3))?;
-
-        let fd = socket.as_raw_fd();
-        if let Some(idx) = physical_iface_index() {
-            let ret = if addr.is_ipv4() {
-                const IP_BOUND_IF: libc::c_int = 25;
-                unsafe { libc::setsockopt(fd, libc::IPPROTO_IP, IP_BOUND_IF,
-                    &idx as *const _ as *const _,
-                    std::mem::size_of::<u32>() as libc::socklen_t) }
-            } else {
-                const IPV6_BOUND_IF: libc::c_int = 125;
-                unsafe { libc::setsockopt(fd, libc::IPPROTO_IPV6, IPV6_BOUND_IF,
-                    &idx as *const _ as *const _,
-                    std::mem::size_of::<u32>() as libc::socklen_t) }
-            };
-            if ret != 0 {
-                log::warn!("macOS TCP bypass: IP_BOUND_IF failed: {}", io::Error::last_os_error());
-            }
-        }
-
-
-        let socket_clone = socket.try_clone()?;
-        let connect_result = tokio::task::spawn_blocking(move || {
-            socket_clone.connect(&addr.into())
-        }).await;
-        match connect_result {
-            Ok(Ok(())) => {},
-            Ok(Err(e)) => {
-                log::warn!("macOS TCP bypass: connect to {addr} failed: {e}");
-                return Err(e);
-            },
-            Err(e) => return Err(io::Error::new(io::ErrorKind::Other, e)),
-        }
-
-        socket.set_nonblocking(true)?;
-        let std_stream: std::net::TcpStream = socket.into();
-        Ok(TcpStream::from_std(std_stream)?)
+        connect_tcp_bypass_macos(addr, true).await
     }
     #[cfg(target_os = "windows")]
     {
@@ -418,10 +392,12 @@ pub async fn connect_tcp_bypass(
         let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
         socket.set_tcp_nodelay(true)?;
         socket.set_keepalive(true)?;
-        socket.set_tcp_keepalive(&socket2::TcpKeepalive::new()
-            .with_time(std::time::Duration::from_secs(60))
-            .with_interval(std::time::Duration::from_secs(15))
-            .with_retries(3))?;
+        socket.set_tcp_keepalive(
+            &socket2::TcpKeepalive::new()
+                .with_time(std::time::Duration::from_secs(60))
+                .with_interval(std::time::Duration::from_secs(15))
+                .with_retries(3),
+        )?;
 
         let ipv4 = addr.is_ipv4();
         set_unicast_if_raw(socket.as_raw_socket() as libc::SOCKET, ipv4);
@@ -431,7 +407,8 @@ pub async fn connect_tcp_bypass(
         let socket_clone = socket.try_clone()?;
         let connect_result = tokio::task::spawn_blocking(move || {
             socket_clone.connect(&addr.into())
-        }).await;
+        })
+        .await;
         match connect_result {
             Ok(Ok(())) => {},
             Ok(Err(e)) => {
@@ -445,16 +422,116 @@ pub async fn connect_tcp_bypass(
         let std_stream: std::net::TcpStream = socket.into();
         Ok(TcpStream::from_std(std_stream)?)
     }
-    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "windows")))]
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "windows"
+    )))]
     {
         let stream = TcpStream::connect(addr).await?;
         let sock_ref = socket2::SockRef::from(&stream);
-        let _ = sock_ref.set_tcp_keepalive(&socket2::TcpKeepalive::new()
-            .with_time(std::time::Duration::from_secs(60))
-            .with_interval(std::time::Duration::from_secs(15))
-            .with_retries(3));
+        let _ = sock_ref.set_tcp_keepalive(
+            &socket2::TcpKeepalive::new()
+                .with_time(std::time::Duration::from_secs(60))
+                .with_interval(std::time::Duration::from_secs(15))
+                .with_retries(3),
+        );
         Ok(stream)
     }
+}
+
+#[cfg(target_os = "macos")]
+async fn connect_tcp_bypass_macos(
+    addr: std::net::SocketAddr, bind_interface: bool,
+) -> io::Result<TcpStream> {
+    use socket2::Domain;
+    use socket2::Protocol;
+    use socket2::Socket;
+    use socket2::Type;
+    use std::os::fd::AsRawFd;
+
+    let domain = if addr.is_ipv4() {
+        Domain::IPV4
+    } else {
+        Domain::IPV6
+    };
+    let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
+    socket.set_tcp_nodelay(true)?;
+    socket.set_keepalive(true)?;
+    socket.set_tcp_keepalive(
+        &socket2::TcpKeepalive::new()
+            .with_time(std::time::Duration::from_secs(60))
+            .with_interval(std::time::Duration::from_secs(15))
+            .with_retries(3),
+    )?;
+
+    if addr.is_ipv4() {
+        if let Some(src_ip) = physical_iface_ipv4() {
+            socket.bind(&std::net::SocketAddr::from((src_ip, 0)).into())?;
+        }
+    }
+
+    if bind_interface {
+        let fd = socket.as_raw_fd();
+        if let Some(idx) = physical_iface_index() {
+            let ret = if addr.is_ipv4() {
+                const IP_BOUND_IF: libc::c_int = 25;
+                unsafe {
+                    libc::setsockopt(
+                        fd,
+                        libc::IPPROTO_IP,
+                        IP_BOUND_IF,
+                        &idx as *const _ as *const _,
+                        std::mem::size_of::<u32>() as libc::socklen_t,
+                    )
+                }
+            } else {
+                const IPV6_BOUND_IF: libc::c_int = 125;
+                unsafe {
+                    libc::setsockopt(
+                        fd,
+                        libc::IPPROTO_IPV6,
+                        IPV6_BOUND_IF,
+                        &idx as *const _ as *const _,
+                        std::mem::size_of::<u32>() as libc::socklen_t,
+                    )
+                }
+            };
+            if ret != 0 {
+                log::warn!(
+                    "macOS TCP bypass: IP_BOUND_IF failed: {}",
+                    io::Error::last_os_error()
+                );
+            }
+        }
+    }
+
+    let socket_clone = socket.try_clone()?;
+    let connect_result =
+        tokio::task::spawn_blocking(move || socket_clone.connect(&addr.into()))
+            .await;
+    match connect_result {
+        Ok(Ok(())) => {},
+        Ok(Err(e)) => {
+            log::warn!("macOS TCP bypass: connect to {addr} failed: {e}");
+            if e.kind() == io::ErrorKind::NetworkUnreachable {
+                let destination = addr.ip();
+                let _ = tokio::task::spawn_blocking(move || {
+                    crate::inbound::tun::platform::macos::log_network_diagnostics(
+                        destination,
+                    )
+                })
+                .await;
+            }
+            return Err(e);
+        },
+        Err(e) => return Err(io::Error::new(io::ErrorKind::Other, e)),
+    }
+
+    socket.set_nonblocking(true)?;
+    let std_stream: std::net::TcpStream = socket.into();
+    Ok(TcpStream::from_std(std_stream)?)
 }
 
 /// Bind a UDP socket, applying SO_MARK on Linux so it bypasses TUN routing.
@@ -490,8 +567,8 @@ pub async fn bind_udp_bypass(
     }
     #[cfg(target_os = "android")]
     {
-        use std::os::fd::AsRawFd;
         use crate::inbound::tun::platform::android::get_protector;
+        use std::os::fd::AsRawFd;
 
         let socket = UdpSocket::bind(bind_addr).await?;
         let protector = get_protector();
@@ -503,31 +580,7 @@ pub async fn bind_udp_bypass(
     }
     #[cfg(target_os = "macos")]
     {
-        // Bind to physical interface source IP so UDP responses can route
-        // back via en0. Unlike TCP, UDP connect() doesn't do route lookup,
-        // so binding source IP won't cause EHOSTUNREACH.
-        let effective_bind = if bind_addr.ip().is_unspecified() {
-            if let Some(src_ip) = physical_iface_ipv4() {
-                std::net::SocketAddr::new(
-                    std::net::IpAddr::V4(src_ip),
-                    bind_addr.port(),
-                )
-            } else {
-                bind_addr
-            }
-        } else {
-            bind_addr
-        };
-        let socket = UdpSocket::bind(effective_bind).await?;
-        // Set IP_BOUND_IF to bypass TUN split routes (same as TCP).
-        let fd = socket.as_raw_fd();
-        if let Some(idx) = physical_iface_index() {
-            const IP_BOUND_IF: libc::c_int = 25;
-            unsafe { libc::setsockopt(fd, libc::IPPROTO_IP, IP_BOUND_IF,
-                &idx as *const _ as *const _,
-                std::mem::size_of::<u32>() as libc::socklen_t) };
-        }
-        Ok(socket)
+        bind_udp_bypass_macos(bind_addr, true).await
     }
     #[cfg(target_os = "windows")]
     {
@@ -539,17 +592,80 @@ pub async fn bind_udp_bypass(
         set_unicast_if_raw(socket.as_raw_socket() as libc::SOCKET, ipv4);
         Ok(socket)
     }
-    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "windows")))]
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "windows"
+    )))]
     {
         UdpSocket::bind(bind_addr).await
     }
+}
+
+pub async fn bind_udp_bypass_fallback(
+    bind_addr: std::net::SocketAddr,
+) -> io::Result<UdpSocket> {
+    #[cfg(target_os = "macos")]
+    {
+        bind_udp_bypass_macos(bind_addr, true).await
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        bind_udp_bypass(bind_addr).await
+    }
+}
+
+#[cfg(target_os = "macos")]
+async fn bind_udp_bypass_macos(
+    bind_addr: std::net::SocketAddr, bind_interface: bool,
+) -> io::Result<UdpSocket> {
+    use std::os::fd::AsRawFd;
+
+    let effective_bind = if bind_addr.ip().is_unspecified() {
+        if let Some(src_ip) = physical_iface_ipv4() {
+            std::net::SocketAddr::new(
+                std::net::IpAddr::V4(src_ip),
+                bind_addr.port(),
+            )
+        } else {
+            bind_addr
+        }
+    } else {
+        bind_addr
+    };
+    let socket = UdpSocket::bind(effective_bind).await?;
+
+    if bind_interface {
+        let fd = socket.as_raw_fd();
+        if let Some(idx) = physical_iface_index() {
+            const IP_BOUND_IF: libc::c_int = 25;
+            let ret = unsafe {
+                libc::setsockopt(
+                    fd,
+                    libc::IPPROTO_IP,
+                    IP_BOUND_IF,
+                    &idx as *const _ as *const _,
+                    std::mem::size_of::<u32>() as libc::socklen_t,
+                )
+            };
+            if ret != 0 {
+                log::warn!(
+                    "macOS UDP bypass: IP_BOUND_IF failed: {}",
+                    io::Error::last_os_error()
+                );
+            }
+        }
+    }
+    Ok(socket)
 }
 
 // Synchronous connect — for use inside `spawn_blocking`.
 // Bound the blocking connect so a stuck dial (e.g. unreachable proxy server)
 // can't wedge the tokio blocking pool — and therefore Ctrl+C shutdown — for
 // the OS-level connect timeout (which can be many seconds to minutes).
-const SYNC_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const SYNC_CONNECT_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(5);
 /// On Linux, applies SO_MARK before connect so the socket bypasses TUN routing.
 /// The address MUST be a resolved `SocketAddr` (IP:port), not a domain.
 pub fn connect_tcp_bypass_sync(
@@ -572,17 +688,19 @@ pub fn connect_tcp_bypass_sync(
         socket.set_mark(BYPASS_FWMARK)?;
         socket.set_tcp_nodelay(true)?;
         socket.set_keepalive(true)?;
-        socket.set_tcp_keepalive(&socket2::TcpKeepalive::new()
-            .with_time(std::time::Duration::from_secs(60))
-            .with_interval(std::time::Duration::from_secs(15))
-            .with_retries(3))?;
+        socket.set_tcp_keepalive(
+            &socket2::TcpKeepalive::new()
+                .with_time(std::time::Duration::from_secs(60))
+                .with_interval(std::time::Duration::from_secs(15))
+                .with_retries(3),
+        )?;
         socket.connect_timeout(&addr.into(), SYNC_CONNECT_TIMEOUT)?;
         Ok(socket.into())
     }
     #[cfg(target_os = "android")]
     {
-        use std::os::fd::AsRawFd;
         use crate::inbound::tun::platform::android::get_protector;
+        use std::os::fd::AsRawFd;
 
         // protect() MUST be called BEFORE connect().
         let domain = if addr.is_ipv4() {
@@ -601,10 +719,12 @@ pub fn connect_tcp_bypass_sync(
             log::warn!("VpnService.protect() failed for sync TCP fd={fd}");
         }
         socket.set_keepalive(true)?;
-        socket.set_tcp_keepalive(&socket2::TcpKeepalive::new()
-            .with_time(std::time::Duration::from_secs(60))
-            .with_interval(std::time::Duration::from_secs(15))
-            .with_retries(3))?;
+        socket.set_tcp_keepalive(
+            &socket2::TcpKeepalive::new()
+                .with_time(std::time::Duration::from_secs(60))
+                .with_interval(std::time::Duration::from_secs(15))
+                .with_retries(3),
+        )?;
         socket.connect_timeout(&addr.into(), SYNC_CONNECT_TIMEOUT)?;
         Ok(socket.into())
     }
@@ -625,29 +745,42 @@ pub fn connect_tcp_bypass_sync(
         let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
         socket.set_tcp_nodelay(true)?;
         socket.set_keepalive(true)?;
-        socket.set_tcp_keepalive(&socket2::TcpKeepalive::new()
-            .with_time(std::time::Duration::from_secs(60))
-            .with_interval(std::time::Duration::from_secs(15))
-            .with_retries(3))?;
+        socket.set_tcp_keepalive(
+            &socket2::TcpKeepalive::new()
+                .with_time(std::time::Duration::from_secs(60))
+                .with_interval(std::time::Duration::from_secs(15))
+                .with_retries(3),
+        )?;
 
         let fd = socket.as_raw_fd();
         if let Some(idx) = physical_iface_index() {
             if addr.is_ipv4() {
                 const IP_BOUND_IF: libc::c_int = 25;
-                unsafe { libc::setsockopt(fd, libc::IPPROTO_IP, IP_BOUND_IF,
-                    &idx as *const _ as *const _,
-                    std::mem::size_of::<u32>() as libc::socklen_t) };
+                unsafe {
+                    libc::setsockopt(
+                        fd,
+                        libc::IPPROTO_IP,
+                        IP_BOUND_IF,
+                        &idx as *const _ as *const _,
+                        std::mem::size_of::<u32>() as libc::socklen_t,
+                    )
+                };
             } else {
                 const IPV6_BOUND_IF: libc::c_int = 125;
-                unsafe { libc::setsockopt(fd, libc::IPPROTO_IPV6, IPV6_BOUND_IF,
-                    &idx as *const _ as *const _,
-                    std::mem::size_of::<u32>() as libc::socklen_t) };
+                unsafe {
+                    libc::setsockopt(
+                        fd,
+                        libc::IPPROTO_IPV6,
+                        IPV6_BOUND_IF,
+                        &idx as *const _ as *const _,
+                        std::mem::size_of::<u32>() as libc::socklen_t,
+                    )
+                };
             }
         }
 
         socket.connect_timeout(&addr.into(), SYNC_CONNECT_TIMEOUT)?;
         Ok(socket.into())
-
     }
     #[cfg(target_os = "windows")]
     {
@@ -665,24 +798,37 @@ pub fn connect_tcp_bypass_sync(
         let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
         socket.set_tcp_nodelay(true)?;
         socket.set_keepalive(true)?;
-        socket.set_tcp_keepalive(&socket2::TcpKeepalive::new()
-            .with_time(std::time::Duration::from_secs(60))
-            .with_interval(std::time::Duration::from_secs(15))
-            .with_retries(3))?;
+        socket.set_tcp_keepalive(
+            &socket2::TcpKeepalive::new()
+                .with_time(std::time::Duration::from_secs(60))
+                .with_interval(std::time::Duration::from_secs(15))
+                .with_retries(3),
+        )?;
 
-        set_unicast_if_raw(socket.as_raw_socket() as libc::SOCKET, addr.is_ipv4());
+        set_unicast_if_raw(
+            socket.as_raw_socket() as libc::SOCKET,
+            addr.is_ipv4(),
+        );
 
         socket.connect_timeout(&addr.into(), SYNC_CONNECT_TIMEOUT)?;
         Ok(socket.into())
     }
-    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "windows")))]
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "windows"
+    )))]
     {
-        let stream = std::net::TcpStream::connect_timeout(addr, SYNC_CONNECT_TIMEOUT)?;
+        let stream =
+            std::net::TcpStream::connect_timeout(addr, SYNC_CONNECT_TIMEOUT)?;
         let sock_ref = socket2::SockRef::from(&stream);
-        let _ = sock_ref.set_tcp_keepalive(&socket2::TcpKeepalive::new()
-            .with_time(std::time::Duration::from_secs(60))
-            .with_interval(std::time::Duration::from_secs(15))
-            .with_retries(3));
+        let _ = sock_ref.set_tcp_keepalive(
+            &socket2::TcpKeepalive::new()
+                .with_time(std::time::Duration::from_secs(60))
+                .with_interval(std::time::Duration::from_secs(15))
+                .with_retries(3),
+        );
         Ok(stream)
     }
 }
@@ -740,14 +886,15 @@ pub fn resolve_sni(
     let host = server.rsplit_once(':').map(|(h, _)| h).unwrap_or(server);
     match &cfg.sni {
         Some(s) => Ok(s.clone()),
-        None =>
+        None => {
             if host.parse::<std::net::IpAddr>().is_ok() {
                 Err(format!(
                     "server '{server}' is an IP but sni is not configured"
                 ))
             } else {
                 Ok(host.to_string())
-            },
+            }
+        },
     }
 }
 
@@ -812,14 +959,11 @@ pub type AsyncTlsStream = tokio_boring::SslStream<
 /// that implements `tokio::io::AsyncRead + AsyncWrite`, enabling fully async
 /// WebSocket I/O. TLS fragment splitting is supported via `AsyncFragmentStream`.
 pub async fn create_tls_stream_async(
-    tcp: tokio::net::TcpStream,
-    sni: &str,
-    fp: bool,
-    insecure: bool,
+    tcp: tokio::net::TcpStream, sni: &str, fp: bool, insecure: bool,
     fragment: Option<&FragmentConfig>,
 ) -> io::Result<AsyncTlsStream> {
-    use boring::ssl::SslConnector;
     use crate::obfuscation::fragment::AsyncFragmentStream;
+    use boring::ssl::SslConnector;
     let mut builder = SslConnector::builder(SslMethod::tls())
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
     if fp {
@@ -857,10 +1001,11 @@ pub fn resolve_addr(server: &str) -> Result<std::net::SocketAddr, String> {
             std::thread::sleep(std::time::Duration::from_millis(500));
         }
         match std::net::ToSocketAddrs::to_socket_addrs(server) {
-            Ok(mut addrs) =>
+            Ok(mut addrs) => {
                 if let Some(addr) = addrs.next() {
                     return Ok(addr);
-                },
+                }
+            },
             Err(e) => last_err = format!("{e}"),
         }
     }

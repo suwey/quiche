@@ -138,9 +138,6 @@ impl Default for UplinkDataConfig {
 /// Throttling for stream-up / packet-up mode.
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 pub struct ThrottleConfig {
-    /// Max bytes per POST (default: 1MB-1MB).
-    #[serde(default)]
-    pub max_each_post_bytes: Option<Range>,
     /// Min interval between POSTs in ms (default: 30-30ms).
     #[serde(default)]
     pub min_posts_interval_ms: Option<Range>,
@@ -156,7 +153,7 @@ pub struct ThrottleConfig {
 // Xmux config (connection pool tuning)
 // ---------------------------------------------------------------------------
 
-/// Xmux connection pool tuning.
+/// Connection pool tuning (shared by XHTTP H2/H3, vless WS, mless).
 /// All defaults are 0 = unlimited (matching Xray defaults).
 ///
 /// `pool_size` is used by WS-based outbounds (vless/mless) to control
@@ -164,24 +161,24 @@ pub struct ThrottleConfig {
 /// XHTTP (which uses `max_connections` + `max_concurrency` instead).
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 pub struct XmuxConfig {
-    /// Max concurrent streams per H2 connection (0 = unlimited).
+    /// Max concurrent streams per connection (0 = unlimited).
     #[serde(default)]
     pub max_concurrency: Option<Range>,
-    /// Max H2 connections (0 = unlimited).
+    /// Max pooled connections (0 = unlimited).
     #[serde(default)]
     pub max_connections: Option<Range>,
-    /// Max reuse times per connection (0 = unlimited).
+    /// Max times a connection can be reused (0 = unlimited).
     #[serde(default)]
-    pub c_max_reuse_times: Option<Range>,
-    /// Max requests per H2 stream (0 = unlimited).
+    pub max_reuses: Option<Range>,
+    /// Max total requests a connection can serve (0 = unlimited).
     #[serde(default)]
-    pub h_max_request_times: Option<Range>,
-    /// Max reusable seconds (0 = unlimited).
+    pub max_requests: Option<Range>,
+    /// Connection TTL in seconds (0 = unlimited).
     #[serde(default)]
-    pub h_max_reusable_secs: Option<Range>,
-    /// Keep-alive period in seconds (0 = default).
+    pub max_reusable_secs: Option<Range>,
+    /// Keep-alive period in seconds (0 = disabled).
     #[serde(default)]
-    pub h_keep_alive_period: u64,
+    pub keep_alive_period: u64,
     /// Number of parallel WS connections for vless/mless outbounds.
     /// vless: number of pre-built WS connections to keep ready (default: 15).
     /// mless: number of multiplexer instances, each with its own WS + crypto (default: 1).
@@ -239,7 +236,6 @@ pub struct XhttpConfig {
     pub no_sse_header: bool,
 
     // --- Session metadata placement ---
-
     /// Where to place the session_id in HTTP requests (default: path).
     #[serde(default)]
     pub session_id_placement: SessionPlacement,
@@ -254,35 +250,63 @@ pub struct XhttpConfig {
     pub seq_key: String,
 
     // --- Asymmetric direction config (M6) ---
-
     /// Override uplink target (for asymmetric mode).
     pub uplink_target: Option<XhttpDirectionConfig>,
     /// Override downlink target (for asymmetric mode).
     pub downlink_target: Option<XhttpDirectionConfig>,
 
     // --- Padding ---
-
     /// XPadding configuration. When present, XPadding is injected.
     pub padding: Option<XPaddingConfig>,
 
     // --- Uplink data control ---
-
     /// Uplink data method, placement, chunk size.
     #[serde(default)]
     pub uplink: UplinkDataConfig,
 
     // --- Throttling ---
-
     /// Throttling for stream-up / packet-up.
     #[serde(default)]
     pub throttle: ThrottleConfig,
+
+    /// Obfuscation chain configuration. When present, the HTTP-layer
+    /// obfuscation chain is constructed and applied to request/response
+    /// data in the XHTTP transport.
+    #[serde(default)]
+    pub obfuscation: Option<ObfuscationChainConfig>,
 }
 
-fn default_port() -> u16 { 443 }
-fn default_path() -> String { "/".to_string() }
-fn default_session_key() -> String { "session".to_string() }
-fn default_seq_placement() -> SessionPlacement { SessionPlacement::Query }
-fn default_seq_key() -> String { "seq".to_string() }
+fn default_port() -> u16 {
+    443
+}
+fn default_path() -> String {
+    "/".to_string()
+}
+fn default_session_key() -> String {
+    "session".to_string()
+}
+fn default_seq_placement() -> SessionPlacement {
+    SessionPlacement::Query
+}
+fn default_seq_key() -> String {
+    "seq".to_string()
+}
+
+/// Configuration for the HTTP-layer obfuscation chain.
+///
+/// The chain processes data through a sequence of layers before sending
+/// (pre_send) and after receiving (post_recv). Layers are applied in order
+/// for uplink and reverse order for downlink.
+///
+/// Currently no concrete layers are implemented; this config exists so
+/// that layers can be added incrementally without further transport changes.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct ObfuscationChainConfig {
+    /// Ordered list of obfuscation layer names to apply.
+    /// Empty list = no-op chain (same as `obfuscation = None`).
+    #[serde(default)]
+    pub layers: Vec<String>,
+}
 
 impl Default for XhttpConfig {
     fn default() -> Self {
@@ -305,6 +329,7 @@ impl Default for XhttpConfig {
             padding: None,
             uplink: UplinkDataConfig::default(),
             throttle: ThrottleConfig::default(),
+            obfuscation: None,
         }
     }
 }
@@ -357,22 +382,37 @@ mod tests {
     #[test]
     fn resolve_auto_mode() {
         // Auto resolves to PacketUp to match Xray-core non-REALITY behavior
-        let cfg = XhttpConfig { mode: XhttpMode::Auto, ..Default::default() };
+        let cfg = XhttpConfig {
+            mode: XhttpMode::Auto,
+            ..Default::default()
+        };
         assert_eq!(resolve_mode(&cfg), XhttpMode::PacketUp);
 
-        let cfg = XhttpConfig { mode: XhttpMode::StreamUp, ..Default::default() };
+        let cfg = XhttpConfig {
+            mode: XhttpMode::StreamUp,
+            ..Default::default()
+        };
         assert_eq!(resolve_mode(&cfg), XhttpMode::StreamUp);
     }
 
     #[test]
     fn resolve_auto_http_version() {
-        let cfg = XhttpConfig { http_version: HttpVersionPref::Auto, ..Default::default() };
+        let cfg = XhttpConfig {
+            http_version: HttpVersionPref::Auto,
+            ..Default::default()
+        };
         assert_eq!(resolve_http_version(&cfg), HttpVersionPref::Http2);
 
-        let cfg = XhttpConfig { http_version: HttpVersionPref::Http3, ..Default::default() };
+        let cfg = XhttpConfig {
+            http_version: HttpVersionPref::Http3,
+            ..Default::default()
+        };
         assert_eq!(resolve_http_version(&cfg), HttpVersionPref::Http3);
 
-        let cfg = XhttpConfig { http_version: HttpVersionPref::Http1, ..Default::default() };
+        let cfg = XhttpConfig {
+            http_version: HttpVersionPref::Http1,
+            ..Default::default()
+        };
         assert_eq!(resolve_http_version(&cfg), HttpVersionPref::Http1);
     }
 

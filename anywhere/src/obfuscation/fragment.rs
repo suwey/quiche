@@ -11,9 +11,9 @@
 //! unchanged.
 
 use std::io::{self, Read, Write};
-use std::time::Duration;
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use crate::obfuscation::range::{Range, SegmentRange};
 
@@ -88,7 +88,7 @@ impl FragmentConfig {
                 let lo = r.from as usize;
                 let hi = r.to as usize;
                 pkt_idx >= lo && pkt_idx <= hi
-            }
+            },
             None => pkt_idx == 0, // legacy: first packet only
         }
     }
@@ -107,7 +107,9 @@ impl FragmentConfig {
     ///
     /// Returns `None` if no lengths configured.
     pub fn length_for_segment(&self, seg_idx: usize) -> Option<usize> {
-        self.lengths.as_ref().map(|sr| sr.rand_for_segment(seg_idx) as usize)
+        self.lengths
+            .as_ref()
+            .map(|sr| sr.rand_for_segment(seg_idx) as usize)
     }
 
     /// Return the maximum number of split segments.
@@ -225,7 +227,8 @@ fn find_sni_location(payload: &[u8]) -> Option<SniLocation> {
     // Walk extensions to find SNI
     while pos + 4 <= ext_end {
         let ext_type = u16::from_be_bytes([payload[pos], payload[pos + 1]]);
-        let ext_len = u16::from_be_bytes([payload[pos + 2], payload[pos + 3]]) as usize;
+        let ext_len =
+            u16::from_be_bytes([payload[pos + 2], payload[pos + 3]]) as usize;
         pos += 4;
 
         if pos + ext_len > ext_end {
@@ -268,9 +271,7 @@ fn find_sni_location(payload: &[u8]) -> Option<SniLocation> {
 ///    segment).
 /// 3. Final segment is the remainder of the payload after SNI.
 fn compute_split_points(
-    payload: &[u8],
-    sni: &SniLocation,
-    config: &FragmentConfig,
+    payload: &[u8], sni: &SniLocation, config: &FragmentConfig,
 ) -> Vec<(usize, usize)> {
     // Enhanced mode: split by configured segment lengths
     if config.lengths.is_some() {
@@ -285,7 +286,10 @@ fn compute_split_points(
             let mut min_len = splits[1].1 - splits[1].0;
             for i in 1..splits.len() {
                 let len = splits[i].1 - splits[i].0;
-                if len < min_len { min_len = len; min_idx = i; }
+                if len < min_len {
+                    min_len = len;
+                    min_idx = i;
+                }
             }
             splits[min_idx - 1].1 = splits[min_idx].1;
             splits.remove(min_idx);
@@ -295,32 +299,50 @@ fn compute_split_points(
 }
 
 /// Split by configured per-segment lengths (enhanced mode).
-fn compute_split_by_length(payload: &[u8], config: &FragmentConfig) -> Vec<(usize, usize)> {
+fn compute_split_by_length(
+    payload: &[u8], config: &FragmentConfig,
+) -> Vec<(usize, usize)> {
     let max_splits = config.max_splits().unwrap_or(8);
     let mut splits = Vec::new();
     let mut offset = 0;
     for seg_idx in 0..max_splits {
-        if offset >= payload.len() { break; }
-        let target = config.length_for_segment(seg_idx).unwrap_or(payload.len() - offset);
+        if offset >= payload.len() {
+            break;
+        }
+        let target = config
+            .length_for_segment(seg_idx)
+            .unwrap_or(payload.len() - offset);
         let end = (offset + target).min(payload.len());
-        if end > offset { splits.push((offset, end)); offset = end; }
+        if end > offset {
+            splits.push((offset, end));
+            offset = end;
+        }
     }
     if offset < payload.len() {
-        if let Some(last) = splits.last_mut() { last.1 = payload.len(); }
-        else { splits.push((0, payload.len())); }
+        if let Some(last) = splits.last_mut() {
+            last.1 = payload.len();
+        } else {
+            splits.push((0, payload.len()));
+        }
     }
     splits
 }
 
 /// Split at SNI label "." boundaries (legacy mode).
-fn compute_split_by_sni(payload: &[u8], sni: &SniLocation) -> Vec<(usize, usize)> {
+fn compute_split_by_sni(
+    payload: &[u8], sni: &SniLocation,
+) -> Vec<(usize, usize)> {
     let sni_bytes = &payload[sni.offset..sni.offset + sni.length];
     let sni_str = match std::str::from_utf8(sni_bytes) {
         Ok(s) => s,
         Err(_) => {
             let mid = sni.offset + sni.length / 2;
-            return vec![(0, sni.offset), (sni.offset, mid), (mid, payload.len())];
-        }
+            return vec![
+                (0, sni.offset),
+                (sni.offset, mid),
+                (mid, payload.len()),
+            ];
+        },
     };
     let labels: Vec<&str> = sni_str.split('.').collect();
     if labels.len() < 2 {
@@ -334,14 +356,18 @@ fn compute_split_by_sni(payload: &[u8], sni: &SniLocation) -> Vec<(usize, usize)
         cur += split_at;
         points.push(cur);
         cur += label.len() - split_at;
-        if i < labels.len() - 1 { cur += 1; }
+        if i < labels.len() - 1 {
+            cur += 1;
+        }
     }
     points.push(payload.len());
     points.sort();
     points.dedup();
     let mut ranges = Vec::new();
     for i in 0..points.len() - 1 {
-        if points[i] < points[i + 1] { ranges.push((points[i], points[i + 1])); }
+        if points[i] < points[i + 1] {
+            ranges.push((points[i], points[i + 1]));
+        }
     }
     ranges
 }
@@ -364,17 +390,17 @@ impl<S: std::os::fd::AsRawFd> FragmentTcpStream<S> {
     pub fn new(inner: S, config: Option<FragmentConfig>) -> Self {
         Self {
             fd: Some(inner.as_raw_fd()),
-            config: config,
+            config,
             first_write_done: false,
             inner,
         }
     }
 
     /// Construct with ACK detection and a `FragmentConfig` (enhanced mode).
-    pub fn with_config(inner: S, _config: FragmentConfig) -> Self {
+    pub fn with_config(inner: S, config: FragmentConfig) -> Self {
         Self {
             fd: Some(inner.as_raw_fd()),
-            config: Some(FragmentConfig::default()),
+            config: Some(config),
             first_write_done: false,
             inner,
         }
@@ -387,18 +413,18 @@ impl<S> FragmentTcpStream<S> {
         Self {
             #[cfg(unix)]
             fd: None,
-            config: config,
+            config,
             first_write_done: false,
             inner,
         }
     }
 
     /// Construct without ACK detection, with a `FragmentConfig` (enhanced mode).
-    pub fn new_no_ack_with_config(inner: S, _config: FragmentConfig) -> Self {
+    pub fn new_no_ack_with_config(inner: S, config: FragmentConfig) -> Self {
         Self {
             #[cfg(unix)]
             fd: None,
-            config: Some(FragmentConfig::default()),
+            config: Some(config),
             first_write_done: false,
             inner,
         }
@@ -454,12 +480,24 @@ impl<S: Write> Write for FragmentTcpStream<S> {
                                     wait_for_ack(fd);
                                 } else {
                                     // No fd available - sleep fallback.
-                                    std::thread::sleep(config.delay_for_segment(i).unwrap_or(Duration::from_millis(FRAGMENT_SLEEP_DELAY_MS)));
+                                    std::thread::sleep(
+                                        config.delay_for_segment(i).unwrap_or(
+                                            Duration::from_millis(
+                                                FRAGMENT_SLEEP_DELAY_MS,
+                                            ),
+                                        ),
+                                    );
                                 }
                             }
                             #[cfg(not(unix))]
                             {
-                                std::thread::sleep(config.delay_for_segment(i).unwrap_or(Duration::from_millis(FRAGMENT_SLEEP_DELAY_MS)));
+                                std::thread::sleep(
+                                    config.delay_for_segment(i).unwrap_or(
+                                        Duration::from_millis(
+                                            FRAGMENT_SLEEP_DELAY_MS,
+                                        ),
+                                    ),
+                                );
                             }
                         }
                     }
@@ -522,13 +560,21 @@ impl<S> AsyncFragmentStream<S> {
             state: AsyncFragmentState::Idle,
         }
     }
+
+    /// Get a reference to the underlying stream.
+    pub fn get_ref(&self) -> &S {
+        &self.inner
+    }
+
+    /// Get a mutable reference to the underlying stream.
+    pub fn get_mut(&mut self) -> &mut S {
+        &mut self.inner
+    }
 }
 
 impl<S: AsyncRead + Unpin> AsyncRead for AsyncFragmentStream<S> {
     fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
+        self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let this = self.get_mut();
         Pin::new(&mut this.inner).poll_read(cx, buf)
@@ -537,9 +583,7 @@ impl<S: AsyncRead + Unpin> AsyncRead for AsyncFragmentStream<S> {
 
 impl<S: AsyncWrite + Unpin> AsyncWrite for AsyncFragmentStream<S> {
     fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
+        self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
 
@@ -555,7 +599,8 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for AsyncFragmentStream<S> {
                         let chunks = compute_split_points(buf, &sni, &config);
                         log::debug!(
                             "tls fragment (async): splitting ClientHello ({}B) into {} segments",
-                            buf.len(), chunks.len(),
+                            buf.len(),
+                            chunks.len(),
                         );
                         this.state = AsyncFragmentState::Writing {
                             buf: buf.to_vec(),
@@ -567,8 +612,12 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for AsyncFragmentStream<S> {
                         this.state = AsyncFragmentState::Done;
                         return Pin::new(&mut this.inner).poll_write(cx, buf);
                     }
-                }
-                AsyncFragmentState::Writing { buf, chunks, current } => {
+                },
+                AsyncFragmentState::Writing {
+                    buf,
+                    chunks,
+                    current,
+                } => {
                     if *current >= chunks.len() {
                         let total = buf.len();
                         this.first_write_done = true;
@@ -585,12 +634,15 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for AsyncFragmentStream<S> {
                         Poll::Ready(Ok(n)) => {
                             if n < chunk.len() {
                                 return Poll::Ready(Err(io::Error::new(
-                                    io::ErrorKind::WriteZero, "fragment: partial write",
+                                    io::ErrorKind::WriteZero,
+                                    "fragment: partial write",
                                 )));
                             }
                             match Pin::new(&mut this.inner).poll_flush(cx) {
-                                Poll::Ready(Ok(())) => {}
-                                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                                Poll::Ready(Ok(())) => {},
+                                Poll::Ready(Err(e)) => {
+                                    return Poll::Ready(Err(e));
+                                },
                                 Poll::Pending => return Poll::Pending,
                             }
                             *current += 1;
@@ -598,42 +650,56 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for AsyncFragmentStream<S> {
                                 let b = std::mem::take(buf);
                                 let c = std::mem::take(chunks);
                                 this.state = AsyncFragmentState::Sleeping {
-                                    buf: b, chunks: c, current: *current,
+                                    buf: b,
+                                    chunks: c,
+                                    current: *current,
                                     sleep: Box::pin(tokio::time::sleep(
-                                        config.delay_for_segment(*current)
-                                            .unwrap_or(Duration::from_millis(FRAGMENT_SLEEP_DELAY_MS)),
+                                        config
+                                            .delay_for_segment(*current)
+                                            .unwrap_or(Duration::from_millis(
+                                                FRAGMENT_SLEEP_DELAY_MS,
+                                            )),
                                     )),
                                 };
                             }
-                        }
+                        },
                         Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                         Poll::Pending => return Poll::Pending,
                     }
-                }
-                AsyncFragmentState::Sleeping { sleep, buf, chunks, current } => {
-                    match sleep.as_mut().poll(cx) {
-                        Poll::Ready(()) => {
-                            let b = std::mem::take(buf);
-                            let c = std::mem::take(chunks);
-                            this.state = AsyncFragmentState::Writing {
-                                buf: b, chunks: c, current: *current,
-                            };
-                        }
-                        Poll::Pending => return Poll::Pending,
-                    }
-                }
+                },
+                AsyncFragmentState::Sleeping {
+                    sleep,
+                    buf,
+                    chunks,
+                    current,
+                } => match sleep.as_mut().poll(cx) {
+                    Poll::Ready(()) => {
+                        let b = std::mem::take(buf);
+                        let c = std::mem::take(chunks);
+                        this.state = AsyncFragmentState::Writing {
+                            buf: b,
+                            chunks: c,
+                            current: *current,
+                        };
+                    },
+                    Poll::Pending => return Poll::Pending,
+                },
                 AsyncFragmentState::Done => {
                     return Pin::new(&mut this.inner).poll_write(cx, buf);
-                }
+                },
             }
         }
     }
 
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    fn poll_flush(
+        self: Pin<&mut Self>, cx: &mut Context<'_>,
+    ) -> Poll<io::Result<()>> {
         Pin::new(&mut self.get_mut().inner).poll_flush(cx)
     }
 
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    fn poll_shutdown(
+        self: Pin<&mut Self>, cx: &mut Context<'_>,
+    ) -> Poll<io::Result<()>> {
         Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
     }
 }
@@ -681,7 +747,8 @@ mod tests {
         extensions.extend_from_slice(&u16::to_be_bytes(sni_ext_data_len as u16));
         extensions.extend_from_slice(&u16::to_be_bytes(sni_list_len as u16));
         extensions.push(0x00);
-        extensions.extend_from_slice(&u16::to_be_bytes(domain_bytes.len() as u16));
+        extensions
+            .extend_from_slice(&u16::to_be_bytes(domain_bytes.len() as u16));
         extensions.extend_from_slice(domain_bytes);
 
         let mut body = Vec::new();
@@ -717,13 +784,17 @@ mod tests {
     fn find_sni_in_client_hello() {
         let hello = build_client_hello_with_sni("proxy.example.com");
         let loc = find_sni_location(&hello).expect("should find SNI");
-        let name = std::str::from_utf8(&hello[loc.offset..loc.offset + loc.length]).unwrap();
+        let name =
+            std::str::from_utf8(&hello[loc.offset..loc.offset + loc.length])
+                .unwrap();
         assert_eq!(name, "proxy.example.com");
     }
 
     #[test]
     fn no_sni_in_non_tls() {
-        assert!(find_sni_location(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n").is_none());
+        assert!(
+            find_sni_location(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n").is_none()
+        );
     }
 
     #[test]
@@ -733,15 +804,17 @@ mod tests {
         let mock = MockStream {
             writes: writes.clone(),
         };
-        let mut stream = FragmentTcpStream::new_no_ack(
-            mock,
-            Some(FragmentConfig::default()),
-        );
+        let mut stream =
+            FragmentTcpStream::new_no_ack(mock, Some(FragmentConfig::default()));
 
         stream.write_all(&hello).unwrap();
 
         let recorded = writes.lock().unwrap();
-        assert!(recorded.len() >= 2, "should write multiple chunks: got {}", recorded.len());
+        assert!(
+            recorded.len() >= 2,
+            "should write multiple chunks: got {}",
+            recorded.len()
+        );
         // Reassemble and verify completeness.
         let total: Vec<u8> = recorded.iter().flatten().cloned().collect();
         assert_eq!(total, hello);
@@ -753,13 +826,18 @@ mod tests {
         let mock = MockStream {
             writes: writes.clone(),
         };
-        let mut stream = FragmentTcpStream::new_no_ack(mock, Some(FragmentConfig::default()));
+        let mut stream =
+            FragmentTcpStream::new_no_ack(mock, Some(FragmentConfig::default()));
 
         let payload = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
         stream.write_all(payload).unwrap();
 
         let recorded = writes.lock().unwrap();
-        assert_eq!(recorded.len(), 1, "non-TLS should pass through as single write");
+        assert_eq!(
+            recorded.len(),
+            1,
+            "non-TLS should pass through as single write"
+        );
         assert_eq!(recorded[0], payload);
     }
 
@@ -770,10 +848,8 @@ mod tests {
         let mock = MockStream {
             writes: writes.clone(),
         };
-        let mut stream = FragmentTcpStream::new_no_ack(
-            mock,
-            Some(FragmentConfig::default()),
-        );
+        let mut stream =
+            FragmentTcpStream::new_no_ack(mock, Some(FragmentConfig::default()));
 
         // First write: ClientHello → fragmented.
         stream.write_all(&hello).unwrap();
@@ -790,7 +866,8 @@ mod tests {
     fn single_label_sni_splits_at_midpoint() {
         let hello = build_client_hello_with_sni("localhost");
         let loc = find_sni_location(&hello).unwrap();
-        let splits = compute_split_points(&hello, &loc, &FragmentConfig::default());
+        let splits =
+            compute_split_points(&hello, &loc, &FragmentConfig::default());
         assert!(splits.len() >= 2);
     }
 }
@@ -799,14 +876,12 @@ mod tests {
 // ObfuscationLayer trait implementation
 // ---------------------------------------------------------------------------
 
-use crate::obfuscation::{ObfuscationLayer, ObfContext};
+use crate::obfuscation::{ObfContext, ObfuscationLayer};
 
 #[async_trait::async_trait]
 impl ObfuscationLayer for FragmentConfig {
     async fn pre_send(
-        &mut self,
-        data: &[u8],
-        _ctx: &ObfContext<'_>,
+        &mut self, data: &[u8], _ctx: &ObfContext<'_>,
     ) -> io::Result<Vec<u8>> {
         // FragmentConfig 作用于 TCP 层（TLS ClientHello 分片），
         // 不在数据层修改 payload，直接透传
@@ -814,9 +889,7 @@ impl ObfuscationLayer for FragmentConfig {
     }
 
     async fn post_recv(
-        &mut self,
-        data: &[u8],
-        _ctx: &ObfContext<'_>,
+        &mut self, data: &[u8], _ctx: &ObfContext<'_>,
     ) -> io::Result<Vec<u8>> {
         Ok(data.to_vec())
     }
@@ -833,7 +906,7 @@ impl ObfuscationLayer for FragmentConfig {
 #[cfg(test)]
 mod obfuscation_trait_tests {
     use super::*;
-    use crate::obfuscation::{ObfuscationLayer, ObfContext};
+    use crate::obfuscation::{ObfContext, ObfuscationLayer};
 
     #[tokio::test]
     async fn fragment_impl_obfuscation_layer() {

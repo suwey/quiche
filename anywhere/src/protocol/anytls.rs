@@ -428,7 +428,7 @@ pub enum WriteMsg {
 // anytls) keep resolving without import churn. New callers (e.g.
 // shadowsocks UoT) should use `crate::protocol::uot` directly.
 pub use crate::protocol::uot::{
-    uot_magic_address_with_port, UOT_MAGIC_ADDRESS, UOT_ATYP_IPV4,
-    UOT_ATYP_IPV6, UOT_ATYP_DOMAIN, SOCKS_ATYP_IPV4, SOCKS_ATYP_DOMAIN,
-    SOCKS_ATYP_IPV6, uot_encode_associate_packet, uot_try_parse_associate_packet,
+    SOCKS_ATYP_DOMAIN, SOCKS_ATYP_IPV4, SOCKS_ATYP_IPV6, UOT_ATYP_DOMAIN,
+    UOT_ATYP_IPV4, UOT_ATYP_IPV6, UOT_MAGIC_ADDRESS, uot_encode_associate_packet,
+    uot_magic_address_with_port, uot_try_parse_associate_packet,
 };

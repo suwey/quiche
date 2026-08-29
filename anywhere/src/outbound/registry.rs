@@ -8,13 +8,11 @@ use crate::outbound::anytls::AnyTlsOutboundClient;
 use crate::outbound::direct::DirectOutboundClient;
 use crate::outbound::mless::MlessOutboundClient;
 use crate::outbound::quic::QuicOutboundClient;
-use crate::outbound::urltest::UrlTestOutboundClient;
-use crate::outbound::urltest::UrlTestState;
-use crate::outbound::urltest::{
-    self, SelectMode,
-};
 use crate::outbound::shadowsocks::ShadowsocksOutboundClient;
 use crate::outbound::ssh::SshOutboundClient;
+use crate::outbound::urltest::UrlTestOutboundClient;
+use crate::outbound::urltest::UrlTestState;
+use crate::outbound::urltest::{self, SelectMode};
 use crate::outbound::vless::VlessOutboundClient;
 
 /// Holds outbound clients keyed by configured tag.
@@ -47,6 +45,7 @@ impl OutboundRegistry {
 
     fn clients_from_direct_configs(
         configs: &[OutboundConfig],
+        tls_fragment: Option<crate::tlsfragment::FragmentConfig>,
     ) -> Result<
         HashMap<String, Arc<dyn OutboundClient>>,
         Box<dyn std::error::Error>,
@@ -57,7 +56,7 @@ impl OutboundRegistry {
         for config in configs.iter().filter(|c| c.type_ == "direct") {
             clients.insert(
                 Self::tag(config)?.to_string(),
-                Arc::new(DirectOutboundClient),
+                Arc::new(DirectOutboundClient::new(tls_fragment.clone())),
             );
         }
 
@@ -71,8 +70,16 @@ impl OutboundRegistry {
         config: &Config,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         Self::validate_tags(&config.outbounds)?;
+        let tls_fragment = if config.common.tls_fragment {
+            Some(crate::tlsfragment::FragmentConfig::default())
+        } else {
+            None
+        };
         let mut clients: HashMap<String, Arc<dyn OutboundClient>> =
-            Self::clients_from_direct_configs(&config.outbounds)?;
+            Self::clients_from_direct_configs(
+                &config.outbounds,
+                tls_fragment.clone(),
+            )?;
 
         for cfg in config.outbounds.iter().filter(|o| o.type_ == "quic") {
             let client = QuicOutboundClient::from_config(vec![cfg]).await?;
@@ -156,8 +163,7 @@ impl OutboundRegistry {
         // is true (i.e. mode is latency or seq, not select).
         let mut urltest_states: HashMap<String, Arc<UrlTestState>> =
             HashMap::new();
-        let mut test_loop_handles: Vec<tokio::task::JoinHandle<()>> =
-            Vec::new();
+        let mut test_loop_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
         for cfg in config
             .outbounds
@@ -187,10 +193,7 @@ impl OutboundRegistry {
                 .collect();
 
             if valid_children.is_empty() {
-                log::error!(
-                    "{} '{tag}': no valid children, skipping",
-                    cfg.type_
-                );
+                log::error!("{} '{tag}': no valid children, skipping", cfg.type_);
                 continue;
             }
 
@@ -211,8 +214,12 @@ impl OutboundRegistry {
                 .unwrap_or_else(|| "www.google.com".to_string());
             let interval = cfg.interval.unwrap_or(300);
 
-            let client =
-                UrlTestOutboundClient::new(valid_children, &clients, test_url, mode);
+            let client = UrlTestOutboundClient::new(
+                valid_children,
+                &clients,
+                test_url,
+                mode,
+            );
             let state = client.state.clone();
             let test_url_for_loop = client.test_url.clone();
 
@@ -235,7 +242,8 @@ impl OutboundRegistry {
         // Ensure a "direct" outbound is always available (used by built-in
         // private rules).
         clients.entry("direct".to_string()).or_insert_with(|| {
-            Arc::new(DirectOutboundClient) as Arc<dyn OutboundClient>
+            Arc::new(DirectOutboundClient::new(tls_fragment))
+                as Arc<dyn OutboundClient>
         });
 
         // --- GLOBAL group ---
@@ -247,58 +255,65 @@ impl OutboundRegistry {
         // Skip auto-creation if the user already configured an outbound
         // named "GLOBAL" — theirs wins.
         if !clients.contains_key("GLOBAL") {
-        let global_children: Vec<String> = config
-            .outbounds
-            .iter()
-            .enumerate()
-            .filter(|(_, c)| c.type_ != "urltest")
-            .map(|(i, c)| c.tag_or_default(i))
-            .filter(|tag| tag != "direct" && tag != "reject")
-            .filter(|tag| clients.contains_key(tag))
-            .collect();
+            let global_children: Vec<String> = config
+                .outbounds
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| c.type_ != "urltest")
+                .map(|(i, c)| c.tag_or_default(i))
+                .filter(|tag| tag != "direct" && tag != "reject")
+                .filter(|tag| clients.contains_key(tag))
+                .collect();
 
-        if !global_children.is_empty() {
-            let global_client = UrlTestOutboundClient::new(
-                global_children,
-                &clients,
-                "www.google.com".to_string(),
-                SelectMode::Seq,
-            );
+            if !global_children.is_empty() {
+                let global_client = UrlTestOutboundClient::new(
+                    global_children,
+                    &clients,
+                    "www.google.com".to_string(),
+                    SelectMode::Seq,
+                );
 
-            // Derive pin from the last user rule (MATCH/catch-all).
-            // If its outbound is a leaf proxy in GLOBAL's children, pin to it.
-            let pin_tag = config.rules.iter().rev().find_map(|r| {
-                let is_catch_all = r.domain.is_none()
-                    && r.domain_suffix.is_none()
-                    && r.domain_keyword.is_none()
-                    && r.ip_cidr.is_none()
-                    && r.port.is_none()
-                    && r.port_range.is_none()
-                    && r.network.is_none()
-                    && r.protocol.is_none()
-                    && r.geo_url.is_none();
-                if is_catch_all { Some(r.outbound.clone()) } else { None }
-            });
-            if let Some(ref pin) = pin_tag {
-                if global_client.state.set_fixed_by_name(pin) {
-                    log::info!("GLOBAL: pinned to '{pin}' (from catch-all rule)");
-                } else {
-                    log::warn!("GLOBAL: catch-all rule outbound '{pin}' is not a child, not pinning");
+                // Derive pin from the last user rule (MATCH/catch-all).
+                // If its outbound is a leaf proxy in GLOBAL's children, pin to it.
+                let pin_tag = config.rules.iter().rev().find_map(|r| {
+                    let is_catch_all = r.domain.is_none()
+                        && r.domain_suffix.is_none()
+                        && r.domain_keyword.is_none()
+                        && r.ip_cidr.is_none()
+                        && r.port.is_none()
+                        && r.port_range.is_none()
+                        && r.network.is_none()
+                        && r.protocol.is_none()
+                        && r.geo_url.is_none();
+                    if is_catch_all {
+                        Some(r.outbound.clone())
+                    } else {
+                        None
+                    }
+                });
+                if let Some(ref pin) = pin_tag {
+                    if global_client.state.set_fixed_by_name(pin) {
+                        log::info!(
+                            "GLOBAL: pinned to '{pin}' (from catch-all rule)"
+                        );
+                    } else {
+                        log::warn!(
+                            "GLOBAL: catch-all rule outbound '{pin}' is not a child, not pinning"
+                        );
+                    }
                 }
-            }
 
-            urltest_states.insert(
-                "GLOBAL".to_string(),
-                global_client.state.clone(),
-            );
-            let global_arc = Arc::new(global_client) as Arc<dyn OutboundClient>;
-            test_loop_handles.push(urltest::spawn_test_loop(
-                Arc::clone(&global_arc),
-                "www.google.com".to_string(),
-                300,
-            ));
-            clients.insert("GLOBAL".to_string(), global_arc);
-        }
+                urltest_states
+                    .insert("GLOBAL".to_string(), global_client.state.clone());
+                let global_arc =
+                    Arc::new(global_client) as Arc<dyn OutboundClient>;
+                test_loop_handles.push(urltest::spawn_test_loop(
+                    Arc::clone(&global_arc),
+                    "www.google.com".to_string(),
+                    300,
+                ));
+                clients.insert("GLOBAL".to_string(), global_arc);
+            }
         } // end if !clients.contains_key("GLOBAL")
 
         Ok(Self {
@@ -341,35 +356,41 @@ mod tests {
     use crate::config::OutboundConfig;
 
     fn outbound(type_: &str, tag: Option<&str>) -> OutboundConfig {
-        OutboundConfig { type_: type_.to_string(),
-        tag: tag.map(str::to_string),
-        server: None,
-        password: None,
-        method: None,
-        plugin: None,
-        plugin_opts: None,
-        cmd: None,
-        proxy_type: None,
-        sni: None,
-        fp: false,
-        ech_config: None,
-        outbounds: None,
-        interval: None,
-        url: None,
-        insecure: false,
-        idle_session_check_interval: None,
-        idle_session_timeout: None,
-        min_idle_session: None,
-        xmux: None,
-        transport: None,
-        tls_fragment: false, uot: false, mode: None }
+        OutboundConfig {
+            type_: type_.to_string(),
+            tag: tag.map(str::to_string),
+            server: None,
+            password: None,
+            method: None,
+            plugin: None,
+            plugin_opts: None,
+            cmd: None,
+            proxy_type: None,
+            sni: None,
+            fp: false,
+            ech_config: None,
+            outbounds: None,
+            interval: None,
+            url: None,
+            insecure: false,
+            idle_session_check_interval: None,
+            idle_session_timeout: None,
+            min_idle_session: None,
+            xmux: None,
+            transport: None,
+            tls_fragment: false,
+            tls_fragment_config: None,
+            uot: false,
+            mode: None,
+        }
     }
 
     #[test]
     fn indexes_direct_outbound_by_configured_tag() {
         let outbounds = vec![outbound("direct", Some("direct-1"))];
         let clients =
-            OutboundRegistry::clients_from_direct_configs(&outbounds).unwrap();
+            OutboundRegistry::clients_from_direct_configs(&outbounds, None)
+                .unwrap();
 
         assert!(clients.contains_key("direct-1"));
         assert!(!clients.contains_key("direct"));
@@ -380,7 +401,8 @@ mod tests {
         let outbounds = vec![outbound("direct", None)];
 
         assert!(
-            OutboundRegistry::clients_from_direct_configs(&outbounds).is_err()
+            OutboundRegistry::clients_from_direct_configs(&outbounds, None)
+                .is_err()
         );
     }
 

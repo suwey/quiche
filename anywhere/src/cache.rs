@@ -23,8 +23,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use parking_lot::RwLock;
-use serde::{Deserialize, Serialize};
 use redb::ReadableDatabase;
+use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
 // StatusSink trait — what modules depend on
@@ -140,26 +140,32 @@ impl CacheStore {
     ///
     /// `db_path` — path to the redb file (e.g. `filesDir/cache.db`).
     /// `json_dir` — directory to write `engine_status.json` (Android only).
-    pub fn open(db_path: &Path, json_dir: Option<PathBuf>) -> Result<Self, String> {
+    pub fn open(
+        db_path: &Path, json_dir: Option<PathBuf>,
+    ) -> Result<Self, String> {
         let db = redb::Database::create(db_path)
             .map_err(|e| format!("open cache.db: {e}"))?;
 
         // Ensure the "state" table exists.
-        let table_def: redb::TableDefinition<&str, &str> = redb::TableDefinition::new("state");
+        let table_def: redb::TableDefinition<&str, &str> =
+            redb::TableDefinition::new("state");
         let txn = db.begin_write().map_err(|e| e.to_string())?;
         txn.open_table(table_def).map_err(|e| e.to_string())?;
         txn.commit().map_err(|e| e.to_string())?;
 
         // Load persistent values.
         let (selected_node, mode) = {
-            let table_def: redb::TableDefinition<&str, &str> = redb::TableDefinition::new("state");
+            let table_def: redb::TableDefinition<&str, &str> =
+                redb::TableDefinition::new("state");
             let txn = db.begin_read().map_err(|e| e.to_string())?;
             let table = txn.open_table(table_def).map_err(|e| e.to_string())?;
-            let node = table.get(keys::SELECTED_NODE)
+            let node = table
+                .get(keys::SELECTED_NODE)
                 .ok()
                 .flatten()
                 .map(|v| v.value().to_string());
-            let mode = table.get(keys::MODE)
+            let mode = table
+                .get(keys::MODE)
                 .ok()
                 .flatten()
                 .map(|v| v.value().to_string())
@@ -201,7 +207,8 @@ impl CacheStore {
 
     fn persist(&self, key: &str, value: &str) {
         if let Some(ref db) = self.db {
-            let table_def: redb::TableDefinition<&str, &str> = redb::TableDefinition::new("state");
+            let table_def: redb::TableDefinition<&str, &str> =
+                redb::TableDefinition::new("state");
             if let Ok(txn) = db.begin_write() {
                 if let Ok(mut table) = txn.open_table(table_def) {
                     let _ = table.insert(key, value);
@@ -290,30 +297,31 @@ impl StatusSink for CacheStore {
                     match p {
                         EnginePhase::Starting => {
                             s.running = true;
-                            s.started_at = Some(chrono::Local::now().to_rfc3339());
+                            s.started_at =
+                                Some(chrono::Local::now().to_rfc3339());
                             s.notices.clear();
-                        }
+                        },
                         EnginePhase::Ready => {
                             s.phase = "ready".into();
-                        }
+                        },
                         EnginePhase::Stopping => {
                             s.phase = "stopping".into();
-                        }
-                        _ => {}
+                        },
+                        _ => {},
                     }
-                }
+                },
                 StatusEvent::Notice { level, msg } => {
                     s.notices.push(Notice {
                         level: level.clone(),
                         msg: msg.clone(),
                     });
-                }
+                },
                 StatusEvent::NodeChanged { tag } => {
                     s.selected_node = Some(tag.clone());
-                }
+                },
                 StatusEvent::ModeChanged { mode } => {
                     s.mode = mode.clone();
-                }
+                },
             }
         }
 
@@ -321,11 +329,11 @@ impl StatusSink for CacheStore {
         match &event {
             StatusEvent::NodeChanged { tag } => {
                 self.persist(keys::SELECTED_NODE, tag);
-            }
+            },
             StatusEvent::ModeChanged { mode } => {
                 self.persist(keys::MODE, mode);
-            }
-            _ => {}
+            },
+            _ => {},
         }
 
         // Sync JSON snapshot.

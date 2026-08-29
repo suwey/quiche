@@ -2,8 +2,8 @@
 //!
 //! 混淆层不修改数据内容，只修改数据的外在特征（大小、时序、头部）
 
-use std::io;
 use async_trait::async_trait;
+use std::io;
 
 pub mod fragment;
 pub mod jitter;
@@ -16,15 +16,11 @@ pub mod range;
 pub trait ObfuscationLayer: Send {
     /// 在上行数据发送前调用
     async fn pre_send(
-        &mut self,
-        data: &[u8],
-        ctx: &ObfContext<'_>,
+        &mut self, data: &[u8], ctx: &ObfContext<'_>,
     ) -> io::Result<Vec<u8>>;
     /// 在下行数据接收后调用
     async fn post_recv(
-        &mut self,
-        data: &[u8],
-        ctx: &ObfContext<'_>,
+        &mut self, data: &[u8], ctx: &ObfContext<'_>,
     ) -> io::Result<Vec<u8>>;
     /// 此混淆层是否需要 HTTP 请求上下文
     fn needs_http_ctx(&self) -> bool {
@@ -76,7 +72,9 @@ impl ObfuscationChain {
     }
 
     /// 上行发送前：按添加顺序正向依次执行各层的 `pre_send`。
-    pub async fn pre_send(&mut self, data: &[u8], ctx: &ObfContext<'_>) -> io::Result<Vec<u8>> {
+    pub async fn pre_send(
+        &mut self, data: &[u8], ctx: &ObfContext<'_>,
+    ) -> io::Result<Vec<u8>> {
         let mut buf = data.to_vec();
         for layer in &mut self.layers {
             buf = layer.pre_send(&buf, ctx).await?;
@@ -85,7 +83,9 @@ impl ObfuscationChain {
     }
 
     /// 下行接收后：按添加顺序逆序依次执行各层的 `post_recv`。
-    pub async fn post_recv(&mut self, data: &[u8], ctx: &ObfContext<'_>) -> io::Result<Vec<u8>> {
+    pub async fn post_recv(
+        &mut self, data: &[u8], ctx: &ObfContext<'_>,
+    ) -> io::Result<Vec<u8>> {
         let mut buf = data.to_vec();
         for layer in self.layers.iter_mut().rev() {
             buf = layer.post_recv(&buf, ctx).await?;
@@ -118,16 +118,26 @@ mod chain_tests {
 
     #[async_trait]
     impl ObfuscationLayer for OrderLayer {
-        async fn pre_send(&mut self, data: &[u8], _ctx: &ObfContext<'_>) -> io::Result<Vec<u8>> {
-            self.calls.lock().unwrap().push(format!("pre_send:{}", self.name));
+        async fn pre_send(
+            &mut self, data: &[u8], _ctx: &ObfContext<'_>,
+        ) -> io::Result<Vec<u8>> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("pre_send:{}", self.name));
             // 前缀数据以标识经过的层
             let mut out = format!("[{}]", self.name).into_bytes();
             out.extend_from_slice(data);
             Ok(out)
         }
 
-        async fn post_recv(&mut self, data: &[u8], _ctx: &ObfContext<'_>) -> io::Result<Vec<u8>> {
-            self.calls.lock().unwrap().push(format!("post_recv:{}", self.name));
+        async fn post_recv(
+            &mut self, data: &[u8], _ctx: &ObfContext<'_>,
+        ) -> io::Result<Vec<u8>> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("post_recv:{}", self.name));
             // 移除前缀以还原数据
             let prefix = format!("[{}]", self.name).into_bytes();
             if data.starts_with(&prefix) {
@@ -219,7 +229,10 @@ mod chain_tests {
         assert_eq!(recv, b"data");
 
         let recorded = calls.lock().unwrap().clone();
-        assert_eq!(recorded, vec!["post_recv:L3", "post_recv:L2", "post_recv:L1"]);
+        assert_eq!(
+            recorded,
+            vec!["post_recv:L3", "post_recv:L2", "post_recv:L1"]
+        );
     }
 
     #[tokio::test]
@@ -229,14 +242,26 @@ mod chain_tests {
 
         // pre_send
         let mut send_chain = ObfuscationChain::new()
-            .with_layer(Box::new(OrderLayer::new("X", Arc::new(Mutex::new(Vec::new())))))
-            .with_layer(Box::new(OrderLayer::new("Y", Arc::new(Mutex::new(Vec::new())))));
+            .with_layer(Box::new(OrderLayer::new(
+                "X",
+                Arc::new(Mutex::new(Vec::new())),
+            )))
+            .with_layer(Box::new(OrderLayer::new(
+                "Y",
+                Arc::new(Mutex::new(Vec::new())),
+            )));
         let sent = send_chain.pre_send(original, &ctx).await.unwrap();
 
         // post_recv with a fresh chain (same layer order)
         let mut recv_chain = ObfuscationChain::new()
-            .with_layer(Box::new(OrderLayer::new("X", Arc::new(Mutex::new(Vec::new())))))
-            .with_layer(Box::new(OrderLayer::new("Y", Arc::new(Mutex::new(Vec::new())))));
+            .with_layer(Box::new(OrderLayer::new(
+                "X",
+                Arc::new(Mutex::new(Vec::new())),
+            )))
+            .with_layer(Box::new(OrderLayer::new(
+                "Y",
+                Arc::new(Mutex::new(Vec::new())),
+            )));
         let recv = recv_chain.post_recv(&sent, &ctx).await.unwrap();
 
         assert_eq!(recv, original);

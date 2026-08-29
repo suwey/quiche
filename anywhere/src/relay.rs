@@ -325,16 +325,14 @@ pub async fn bidirectional_relay(
 
         if !ab {
             // A→B still running — drain it.
-            let _ = tokio::time::timeout(
-                HALF_CLOSE_TIMEOUT,
-                copy_one_way(a3, b3),
-            ).await;
+            let _ =
+                tokio::time::timeout(HALF_CLOSE_TIMEOUT, copy_one_way(a3, b3))
+                    .await;
         } else if !ba {
             // B→A still running — drain it.
-            let _ = tokio::time::timeout(
-                HALF_CLOSE_TIMEOUT,
-                copy_one_way(b4, a4),
-            ).await;
+            let _ =
+                tokio::time::timeout(HALF_CLOSE_TIMEOUT, copy_one_way(b4, a4))
+                    .await;
         }
     }
 
@@ -359,14 +357,14 @@ async fn copy_one_way(src: &mut dyn StreamRelay, dst: &mut dyn StreamRelay) {
             },
             Ok(n) => {
                 if let Err(e) = dst.write(&buf[..n]).await {
-                    log::trace!("relay: copy_one_way dst write error {e}, breaking");
+                    log::trace!(
+                        "relay: copy_one_way dst write error {e}, breaking"
+                    );
                     break;
                 }
             },
             Err(e) => {
-                log::trace!(
-                    "relay: copy_one_way src read error {e}, breaking"
-                );
+                log::trace!("relay: copy_one_way src read error {e}, breaking");
                 break;
             },
         }
@@ -384,8 +382,7 @@ async fn copy_one_way(src: &mut dyn StreamRelay, dst: &mut dyn StreamRelay) {
 /// are closed. This prevents zombie UDP sessions from lingering indefinitely
 /// after NAT mappings expire or the peer disappears.
 pub async fn bidirectional_packet_relay(
-    a: &mut dyn PacketRelay,
-    b: &mut dyn PacketRelay,
+    a: &mut dyn PacketRelay, b: &mut dyn PacketRelay,
     idle_timeout: std::time::Duration,
 ) {
     // SAFETY: see `bidirectional_relay` — `tokio::select!` guarantees mutual
@@ -423,12 +420,14 @@ pub async fn bidirectional_packet_relay(
             let _ = tokio::time::timeout(
                 HALF_CLOSE_TIMEOUT,
                 copy_packets_one_way(a3, b3, idle_timeout),
-            ).await;
+            )
+            .await;
         } else if !ba {
             let _ = tokio::time::timeout(
                 HALF_CLOSE_TIMEOUT,
                 copy_packets_one_way(b4, a4, idle_timeout),
-            ).await;
+            )
+            .await;
         }
     }
     let _ = a.close().await;
@@ -436,17 +435,12 @@ pub async fn bidirectional_packet_relay(
 }
 
 async fn copy_packets_one_way(
-    src: &mut dyn PacketRelay,
-    dst: &mut dyn PacketRelay,
+    src: &mut dyn PacketRelay, dst: &mut dyn PacketRelay,
     idle_timeout: std::time::Duration,
 ) {
     let mut buf = vec![0u8; UDP_BUF_SIZE];
     loop {
-        match tokio::time::timeout(
-            idle_timeout,
-            src.read_packet(&mut buf),
-        )
-        .await
+        match tokio::time::timeout(idle_timeout, src.read_packet(&mut buf)).await
         {
             Err(_) => {
                 log::debug!(
@@ -532,7 +526,9 @@ pub struct PrependPacketRelay {
 }
 
 impl PrependPacketRelay {
-    pub fn new(inner: Box<dyn PacketRelay>, first_packet: Vec<u8>, dest: Destination) -> Self {
+    pub fn new(
+        inner: Box<dyn PacketRelay>, first_packet: Vec<u8>, dest: Destination,
+    ) -> Self {
         Self {
             inner,
             pending: Some(first_packet),
@@ -546,7 +542,9 @@ impl PacketRelay for PrependPacketRelay {
     async fn read_packet(
         &mut self, buf: &mut [u8],
     ) -> io::Result<(usize, Destination)> {
-        if let (Some(payload), Some(dest)) = (self.pending.take(), self.pending_dest.take()) {
+        if let (Some(payload), Some(dest)) =
+            (self.pending.take(), self.pending_dest.take())
+        {
             let len = payload.len().min(buf.len());
             buf[..len].copy_from_slice(&payload[..len]);
             return Ok((len, dest));

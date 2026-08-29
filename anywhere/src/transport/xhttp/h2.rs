@@ -11,16 +11,16 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use bytes::Bytes;
 use super::config::HttpVersionPref;
+use bytes::Bytes;
 use http_body::{Body, Frame};
-use hyper::client::conn::http2;
 use hyper::client::conn::http1;
+use hyper::client::conn::http2;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use tokio::sync::mpsc;
+use tokio_rustls::TlsConnector;
 use tokio_rustls::rustls;
 use tokio_rustls::rustls::pki_types::ServerName;
-use tokio_rustls::TlsConnector;
 
 use std::io;
 use std::pin::Pin;
@@ -40,8 +40,7 @@ impl Body for ChannelBody {
     type Error = io::Error;
 
     fn poll_frame(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
+        self: Pin<&mut Self>, cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Bytes>, io::Error>>> {
         let this = self.get_mut();
         this.rx.poll_recv(cx)
@@ -60,7 +59,16 @@ pub enum HttpSendRequest {
 impl HttpSendRequest {
     pub fn send_request(
         &mut self, req: http::Request<ReqBody>,
-    ) -> Pin<Box<dyn Future<Output = Result<hyper::Response<hyper::body::Incoming>, hyper::Error>> + Send>> {
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = Result<
+                        hyper::Response<hyper::body::Incoming>,
+                        hyper::Error,
+                    >,
+                > + Send,
+        >,
+    > {
         match self {
             HttpSendRequest::H1(s) => Box::pin(s.send_request(req)),
             HttpSendRequest::H2(s) => Box::pin(s.send_request(req)),
@@ -75,7 +83,9 @@ pub type H2SendRequest = http2::SendRequest<ReqBody>;
 // ---------------------------------------------------------------------------
 
 /// Build a rustls `ClientConfig` with the given ALPN protocols.
-fn build_tls_config(insecure: bool, alpn: Vec<Vec<u8>>) -> Arc<rustls::ClientConfig> {
+fn build_tls_config(
+    insecure: bool, alpn: Vec<Vec<u8>>,
+) -> Arc<rustls::ClientConfig> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let mut config = if insecure {
         rustls::ClientConfig::builder_with_provider(provider)
@@ -103,31 +113,27 @@ struct NoCertVerifier;
 
 impl rustls::client::danger::ServerCertVerifier for NoCertVerifier {
     fn verify_server_cert(
-        &self,
-        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        &self, _end_entity: &rustls::pki_types::CertificateDer<'_>,
         _intermediates: &[rustls::pki_types::CertificateDer<'_>],
-        _server_name: &ServerName<'_>,
-        _ocsp_response: &[u8],
+        _server_name: &ServerName<'_>, _ocsp_response: &[u8],
         _now: rustls::pki_types::UnixTime,
     ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
         Ok(rustls::client::danger::ServerCertVerified::assertion())
     }
 
     fn verify_tls12_signature(
-        &self,
-        _message: &[u8],
-        _cert: &rustls::pki_types::CertificateDer<'_>,
+        &self, _message: &[u8], _cert: &rustls::pki_types::CertificateDer<'_>,
         _dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error>
+    {
         Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
     }
 
     fn verify_tls13_signature(
-        &self,
-        _message: &[u8],
-        _cert: &rustls::pki_types::CertificateDer<'_>,
+        &self, _message: &[u8], _cert: &rustls::pki_types::CertificateDer<'_>,
         _dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error>
+    {
         Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
     }
 
@@ -151,9 +157,7 @@ impl rustls::client::danger::ServerCertVerifier for NoCertVerifier {
 // ---------------------------------------------------------------------------
 
 pub async fn connect(
-    addr: std::net::SocketAddr,
-    host: &str,
-    insecure: bool,
+    addr: std::net::SocketAddr, host: &str, insecure: bool,
     http_version: HttpVersionPref,
 ) -> io::Result<HttpSendRequest> {
     // 1. TCP connect (bypasses TUN via SO_MARK / VpnService.protect)
@@ -179,15 +183,18 @@ pub async fn connect(
     // 3. TLS handshake with ALPN
     let tls_config = build_tls_config(insecure, alpn);
     let connector = TlsConnector::from(tls_config);
-    let server_name = ServerName::try_from(host.to_string())
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+    let server_name = ServerName::try_from(host.to_string()).map_err(|e| {
+        io::Error::new(io::ErrorKind::InvalidInput, e.to_string())
+    })?;
 
     let tls = tokio::time::timeout(
         Duration::from_secs(10),
         connector.connect(server_name, tcp),
     )
     .await
-    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "TLS handshake timed out"))?
+    .map_err(|_| {
+        io::Error::new(io::ErrorKind::TimedOut, "TLS handshake timed out")
+    })?
     .map_err(|e| io::Error::new(io::ErrorKind::ConnectionRefused, e))?;
 
     // Verify ALPN negotiation
@@ -245,12 +252,7 @@ pub async fn connect(
 /// - `body`: pass to `Request::builder().body(body)`
 pub fn make_stream_body(
     buffer: usize,
-) -> (
-    mpsc::Sender<Result<Frame<Bytes>, io::Error>>,
-    ReqBody,
-) {
+) -> (mpsc::Sender<Result<Frame<Bytes>, io::Error>>, ReqBody) {
     let (tx, rx) = mpsc::channel(buffer);
     (tx, ChannelBody { rx })
 }
-
-

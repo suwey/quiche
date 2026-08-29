@@ -264,8 +264,8 @@ pub fn build_udp_response_ipv6(
 /// and addressed to `orig_src` (the client), embedding the original IP+UDP
 /// header so the client stack can match it to the flow and fall back to TCP.
 pub fn build_icmp_port_unreachable_ipv4(
-    orig_src_ip: Ipv4Addr, orig_src_port: u16,
-    orig_dst_ip: Ipv4Addr, orig_dst_port: u16,
+    orig_src_ip: Ipv4Addr, orig_src_port: u16, orig_dst_ip: Ipv4Addr,
+    orig_dst_port: u16,
 ) -> Vec<u8> {
     // outer IPv4(20) + ICMP(8) + embedded IPv4(20) + embedded UDP(8) = 56
     let mut buf = vec![0u8; 56];
@@ -312,8 +312,8 @@ pub fn build_icmp_port_unreachable_ipv4(
 /// Build an ICMPv6 destination-unreachable (port unreachable) packet.
 /// See [`build_icmp_port_unreachable_ipv4`] for semantics.
 pub fn build_icmp_port_unreachable_ipv6(
-    orig_src_ip: Ipv6Addr, orig_src_port: u16,
-    orig_dst_ip: Ipv6Addr, orig_dst_port: u16,
+    orig_src_ip: Ipv6Addr, orig_src_port: u16, orig_dst_ip: Ipv6Addr,
+    orig_dst_port: u16,
 ) -> Vec<u8> {
     // outer IPv6(40) + ICMPv6(8) + embedded IPv6(40) + embedded UDP(8) = 96
     let icmpv6_len: u32 = 8 + 40 + 8; // 56

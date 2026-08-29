@@ -3,6 +3,8 @@ use std::net::ToSocketAddrs;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use tokio::io::AsyncReadExt;
+use tokio::io::AsyncWriteExt;
 use tokio::net::UdpSocket;
 use tokio::time::Instant;
 #[allow(unused)]
@@ -11,16 +13,66 @@ use tokio::time::timeout_at;
 
 use crate::inbound::Address;
 use crate::inbound::Destination;
+use crate::obfuscation::fragment::AsyncFragmentStream;
 use crate::outbound::OutboundClient;
 use crate::outbound::common::bind_udp_bypass;
 use crate::outbound::common::connect_tcp_bypass;
 use crate::relay::PacketRelay;
 use crate::relay::StreamRelay;
 use crate::relay::TcpRelay;
+use crate::tlsfragment::FragmentConfig;
 
 const DIRECT_UDP_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
-pub struct DirectOutboundClient;
+pub struct DirectOutboundClient {
+    /// TLS ClientHello fragmentation config (from `[common].tls_fragment`).
+    /// When enabled, the first write to each direct TCP connection is
+    /// inspected; if it is a TLS ClientHello, it is split into multiple
+    /// segments with delays to evade DPI SNI matching.
+    tls_fragment: Option<FragmentConfig>,
+}
+
+impl Default for DirectOutboundClient {
+    fn default() -> Self {
+        Self { tls_fragment: None }
+    }
+}
+
+impl DirectOutboundClient {
+    pub fn new(tls_fragment: Option<FragmentConfig>) -> Self {
+        Self { tls_fragment }
+    }
+}
+
+/// TCP relay with TLS ClientHello fragmentation on the first write.
+///
+/// Wraps [`AsyncFragmentStream`] around a tokio `TcpStream`. The fragment
+/// stream inspects the first write; if it detects a TLS ClientHello it splits
+/// it into multiple segments, otherwise all I/O passes through unchanged.
+struct FragmentTcpRelay(AsyncFragmentStream<tokio::net::TcpStream>);
+
+#[async_trait]
+impl StreamRelay for FragmentTcpRelay {
+    async fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.0.read(buf).await
+    }
+
+    async fn write(&mut self, buf: &[u8]) -> io::Result<()> {
+        self.0.write_all(buf).await
+    }
+
+    async fn shutdown(&mut self) -> io::Result<()> {
+        self.0.shutdown().await
+    }
+
+    async fn reset(&mut self) {
+        // Set SO_LINGER with timeout 0 so close() sends RST instead of FIN.
+        use socket2::SockRef;
+        let sock_ref = SockRef::from(self.0.get_ref());
+        let _ = sock_ref.set_linger(Some(Duration::ZERO));
+        let _ = self.0.shutdown().await;
+    }
+}
 
 struct DirectUdpRelay {
     socket: UdpSocket,
@@ -114,12 +166,17 @@ impl OutboundClient for DirectOutboundClient {
                                 "spawn_blocking join error: {e}"
                             ))
                         })??
-                }
+                },
             }
         };
         let stream = connect_tcp_bypass(addr).await?;
         log::info!("direct outbound connected to {addr}");
-        Ok(Box::new(TcpRelay::new(stream)))
+        if let Some(ref config) = self.tls_fragment {
+            let frag_stream = AsyncFragmentStream::new(stream, Some(config));
+            Ok(Box::new(FragmentTcpRelay(frag_stream)))
+        } else {
+            Ok(Box::new(TcpRelay::new(stream)))
+        }
     }
 
     async fn dial_udp(
@@ -129,30 +186,31 @@ impl OutboundClient for DirectOutboundClient {
         let socket = bind_udp_bypass(bind_addr).await?;
         // connect() the socket to the target so the kernel only accepts
         // packets from that peer — prevents UDP reflection attacks.
-        let peer_addr: std::net::SocketAddr = if let Some(ip) = initial_dest.resolved_ip {
-            std::net::SocketAddr::new(ip, initial_dest.port)
-        } else {
-            match &initial_dest.address {
-                Address::Ipv4(o) => std::net::SocketAddr::new(
-                    std::net::IpAddr::V4(std::net::Ipv4Addr::from(*o)),
-                    initial_dest.port,
-                ),
-                Address::Ipv6(o) => std::net::SocketAddr::new(
-                    std::net::IpAddr::V6(std::net::Ipv6Addr::from(*o)),
-                    initial_dest.port,
-                ),
-                Address::Domain(_) => {
-                    let s = initial_dest.to_string();
-                    tokio::task::spawn_blocking(move || resolve_addr(&s))
-                        .await
-                        .map_err(|e| {
-                            Box::<dyn std::error::Error>::from(format!(
-                                "spawn_blocking join error: {e}"
-                            ))
-                        })??
+        let peer_addr: std::net::SocketAddr =
+            if let Some(ip) = initial_dest.resolved_ip {
+                std::net::SocketAddr::new(ip, initial_dest.port)
+            } else {
+                match &initial_dest.address {
+                    Address::Ipv4(o) => std::net::SocketAddr::new(
+                        std::net::IpAddr::V4(std::net::Ipv4Addr::from(*o)),
+                        initial_dest.port,
+                    ),
+                    Address::Ipv6(o) => std::net::SocketAddr::new(
+                        std::net::IpAddr::V6(std::net::Ipv6Addr::from(*o)),
+                        initial_dest.port,
+                    ),
+                    Address::Domain(_) => {
+                        let s = initial_dest.to_string();
+                        tokio::task::spawn_blocking(move || resolve_addr(&s))
+                            .await
+                            .map_err(|e| {
+                                Box::<dyn std::error::Error>::from(format!(
+                                    "spawn_blocking join error: {e}"
+                                ))
+                            })??
+                    },
                 }
-            }
-        };
+            };
         socket.connect(peer_addr).await?;
         log::debug!("direct udp connected to {peer_addr}");
         Ok(Box::new(DirectUdpRelay::new(
@@ -177,7 +235,8 @@ mod tests {
     async fn direct_udp_read_exits_after_idle_timeout() {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let peer = Destination::new(Address::Ipv4([127, 0, 0, 1]), 0);
-        let mut relay = DirectUdpRelay::new(socket, peer, Duration::from_millis(10));
+        let mut relay =
+            DirectUdpRelay::new(socket, peer, Duration::from_millis(10));
         let mut buf = [0; 64];
 
         let (n, _) = relay.read_packet(&mut buf).await.unwrap();
@@ -202,8 +261,12 @@ mod tests {
             ),
             receiver.local_addr().unwrap().port(),
         );
-        socket.connect(receiver.local_addr().unwrap()).await.unwrap();
-        let mut relay = DirectUdpRelay::new(socket, dest.clone(), Duration::from_millis(40));
+        socket
+            .connect(receiver.local_addr().unwrap())
+            .await
+            .unwrap();
+        let mut relay =
+            DirectUdpRelay::new(socket, dest.clone(), Duration::from_millis(40));
 
         sleep(Duration::from_millis(25)).await;
         relay.write_packet(b"ping", &dest).await.unwrap();

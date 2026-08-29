@@ -41,10 +41,7 @@ impl SniffInfo {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ProtocolMatch {
     /// Match by network type + port range (the classic shorthand).
-    PortRange {
-        network: Network,
-        range: (u16, u16),
-    },
+    PortRange { network: Network, range: (u16, u16) },
     /// Match by sniffed protocol name.
     Sniffed(String),
 }
@@ -203,7 +200,10 @@ fn parse_inline(s: &str) -> Option<Vec<ProtocolMatch>> {
 
     let mut result = Vec::new();
     for &net in nets {
-        result.push(ProtocolMatch::PortRange { network: net, range });
+        result.push(ProtocolMatch::PortRange {
+            network: net,
+            range,
+        });
     }
 
     Some(result)
@@ -211,16 +211,13 @@ fn parse_inline(s: &str) -> Option<Vec<ProtocolMatch>> {
 
 /// Check if any protocol match condition is satisfied.
 pub fn protocol_matches(
-    matches: &[ProtocolMatch],
-    network: Network,
-    port: u16,
+    matches: &[ProtocolMatch], network: Network, port: u16,
     sniff: Option<&SniffInfo>,
 ) -> bool {
     matches.iter().any(|m| match m {
-        ProtocolMatch::PortRange {
-            network: mn,
-            range,
-        } => *mn == network && port >= range.0 && port <= range.1,
+        ProtocolMatch::PortRange { network: mn, range } => {
+            *mn == network && port >= range.0 && port <= range.1
+        },
         ProtocolMatch::Sniffed(name) => {
             sniff.and_then(|s| s.protocol.as_deref()) == Some(name.as_str())
         },
@@ -253,20 +250,26 @@ mod tests {
     fn inline_tcp_port_range() {
         let result = parse_protocol("tcp:80,443");
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0], ProtocolMatch::PortRange {
-            network: Network::Tcp,
-            range: (80, 443)
-        });
+        assert_eq!(
+            result[0],
+            ProtocolMatch::PortRange {
+                network: Network::Tcp,
+                range: (80, 443)
+            }
+        );
     }
 
     #[test]
     fn inline_udp_single_port() {
         let result = parse_protocol("udp:53");
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0], ProtocolMatch::PortRange {
-            network: Network::Udp,
-            range: (53, 53)
-        });
+        assert_eq!(
+            result[0],
+            ProtocolMatch::PortRange {
+                network: Network::Udp,
+                range: (53, 53)
+            }
+        );
     }
 
     #[test]
@@ -308,10 +311,13 @@ mod tests {
     fn inline_reversed_range() {
         let result = parse_protocol("tcp:443,80");
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0], ProtocolMatch::PortRange {
-            network: Network::Tcp,
-            range: (80, 443)
-        });
+        assert_eq!(
+            result[0],
+            ProtocolMatch::PortRange {
+                network: Network::Tcp,
+                range: (80, 443)
+            }
+        );
     }
 
     #[test]
@@ -331,30 +337,10 @@ mod tests {
     #[test]
     fn matches_port_range() {
         let matches = parse_protocol("tcp:80,443");
-        assert!(protocol_matches(
-            &matches,
-            Network::Tcp,
-            80,
-            None
-        ));
-        assert!(protocol_matches(
-            &matches,
-            Network::Tcp,
-            443,
-            None
-        ));
-        assert!(!protocol_matches(
-            &matches,
-            Network::Tcp,
-            8080,
-            None
-        ));
-        assert!(!protocol_matches(
-            &matches,
-            Network::Udp,
-            80,
-            None
-        ));
+        assert!(protocol_matches(&matches, Network::Tcp, 80, None));
+        assert!(protocol_matches(&matches, Network::Tcp, 443, None));
+        assert!(!protocol_matches(&matches, Network::Tcp, 8080, None));
+        assert!(!protocol_matches(&matches, Network::Udp, 80, None));
     }
 
     #[test]
@@ -364,47 +350,22 @@ mod tests {
             protocol: Some("ssh".into()),
             ..Default::default()
         };
-        assert!(protocol_matches(
-            &matches,
-            Network::Tcp,
-            22,
-            Some(&sniff)
-        ));
-        assert!(!protocol_matches(
-            &matches,
-            Network::Tcp,
-            22,
-            None
-        ));
+        assert!(protocol_matches(&matches, Network::Tcp, 22, Some(&sniff)));
+        assert!(!protocol_matches(&matches, Network::Tcp, 22, None));
     }
 
     #[test]
     fn matches_bittorrent_port_or_sniff() {
         let matches = parse_protocol("bittorrent");
         // Port match
-        assert!(protocol_matches(
-            &matches,
-            Network::Tcp,
-            6881,
-            None
-        ));
+        assert!(protocol_matches(&matches, Network::Tcp, 6881, None));
         // Sniff match (BT on port 443)
         let sniff = SniffInfo {
             protocol: Some("bittorrent".into()),
             ..Default::default()
         };
-        assert!(protocol_matches(
-            &matches,
-            Network::Tcp,
-            443,
-            Some(&sniff)
-        ));
+        assert!(protocol_matches(&matches, Network::Tcp, 443, Some(&sniff)));
         // No match
-        assert!(!protocol_matches(
-            &matches,
-            Network::Tcp,
-            443,
-            None
-        ));
+        assert!(!protocol_matches(&matches, Network::Tcp, 443, None));
     }
 }

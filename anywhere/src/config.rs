@@ -180,6 +180,12 @@ pub struct OutboundConfig {
     #[serde(default = "default_true")]
     pub tls_fragment: bool,
 
+    /// Detailed TLS fragmentation parameters (packets, max_split, lengths, delays).
+    /// Only effective when `tls_fragment = true`. If unset, uses
+    /// [`FragmentConfig::default()`] (3-8 segments, 10-500B, 0-100ms delays).
+    #[serde(default)]
+    pub tls_fragment_config: Option<crate::tlsfragment::FragmentConfig>,
+
     // --- shared sub-config fields (urltest / vless) ---
     /// List of outbound tags this urltest node manages.
     #[serde(default)]
@@ -304,7 +310,9 @@ impl Config {
 
     /// Parse config from an inline TOML string (used by Android JNI where
     /// no file system path is available).
-    pub fn from_string(content: &str) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn from_string(
+        content: &str,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let config: Config = toml::from_str(content)?;
         Ok(config)
     }

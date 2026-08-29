@@ -3,9 +3,12 @@
 //! 位置：协议层和传输层之间
 //! 输入：协议层编码后的明文帧
 //! 输出：密文，交给传输层发送
+//!
+//! NOTE: `NoCrypto` is a design-time placeholder, never used.
+//! `CryptoFactory` trait is live (used by mless's `AheadXorFactory`).
 
-use std::io;
 use async_trait::async_trait;
+use std::io;
 
 /// 加密层接口
 #[async_trait]

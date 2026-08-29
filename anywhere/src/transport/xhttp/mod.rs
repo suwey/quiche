@@ -14,16 +14,14 @@
 pub mod config;
 pub mod fallback;
 pub mod h2;
+pub mod h3;
 pub mod padding;
 pub mod placement;
-pub mod download_queue;
-pub mod upload_queue;
 pub mod xmux;
-pub mod h3;
-use std::io;
-use std::sync::Arc;
 use std::future::Future;
+use std::io;
 use std::pin::Pin;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -31,16 +29,43 @@ use http_body::Frame;
 use http_body_util::BodyExt;
 use tokio::sync::mpsc;
 
+use crate::connection::reconnect::ReconnectPolicy;
 use crate::obfuscation::{ObfContext, ObfuscationChain};
 use crate::transport::{DownlinkReader, TransportSession, UplinkWriter};
 
+use crate::transport::seq::SeqChunker;
 use base64::Engine;
-use config::{resolve_http_version, resolve_mode, UplinkDataPlacement, XhttpConfig, XhttpDirectionConfig, HttpVersionPref, XhttpMode};
-use h2::{make_stream_body, H2SendRequest, HttpSendRequest, ReqBody};
+use config::{
+    HttpVersionPref, UplinkDataPlacement, XhttpConfig, XhttpDirectionConfig,
+    XhttpMode, resolve_http_version, resolve_mode,
+};
+use h2::{H2SendRequest, HttpSendRequest, ReqBody, make_stream_body};
 use h3::H3Session;
 use padding::XPaddingMiddleware;
-use upload_queue::UploadQueue;
 use placement::PlacementConfig;
+
+// ---------------------------------------------------------------------------
+// Obfuscation chain builder
+// ---------------------------------------------------------------------------
+
+/// Build an [`ObfuscationChain`] from the XHTTP config.
+///
+/// Returns `None` when no obfuscation is configured (chain would be empty).
+/// Concrete layers are registered here as they are implemented; the chain
+/// architecture allows adding new [`ObfuscationLayer`] implementations
+/// without further transport-layer changes.
+fn build_obfuscation_chain(config: &XhttpConfig) -> Option<ObfuscationChain> {
+    let obf_config = config.obfuscation.as_ref()?;
+    let chain = ObfuscationChain::new();
+
+    for layer_name in &obf_config.layers {
+        // Register concrete layers here as they are implemented.
+        // Unrecognized layer names are logged and skipped.
+        log::warn!("xhttp: unknown obfuscation layer '{layer_name}', skipping");
+    }
+
+    if chain.is_empty() { None } else { Some(chain) }
+}
 
 // ---------------------------------------------------------------------------
 // XhttpSession
@@ -68,7 +93,11 @@ pub struct XhttpSession {
     h3_session: Option<H3Session>,
 
     /// Response future stored between `uplink()` and `downlink()`.
-    response_rx: Option<tokio::sync::oneshot::Receiver<Result<hyper::Response<hyper::body::Incoming>, hyper::Error>>>,
+    response_rx: Option<
+        tokio::sync::oneshot::Receiver<
+            Result<hyper::Response<hyper::body::Incoming>, hyper::Error>,
+        >,
+    >,
 
     /// XPadding middleware (if configured).
     padding: Option<XPaddingMiddleware>,
@@ -80,7 +109,9 @@ pub struct XhttpSession {
 impl XhttpSession {
     /// Create a session from a pre-built H2 `SendRequest` (for testing
     /// or when the connection is managed externally).
-    pub fn from_send_request(config: Arc<XhttpConfig>, send_req: HttpSendRequest) -> Self {
+    pub fn from_send_request(
+        config: Arc<XhttpConfig>, send_req: HttpSendRequest,
+    ) -> Self {
         let padding = config.padding.clone().map(XPaddingMiddleware::new);
         let placement = PlacementConfig {
             session_id_placement: config.session_id_placement,
@@ -123,7 +154,8 @@ impl XhttpSession {
                 match h3::H3Session::connect(config.clone()).await {
                     Ok(h3_session) => {
                         log::debug!("xhttp: connected via H3 to {}", config.host);
-                        let padding = config.padding.clone().map(XPaddingMiddleware::new);
+                        let padding =
+                            config.padding.clone().map(XPaddingMiddleware::new);
                         let placement = PlacementConfig {
                             session_id_placement: config.session_id_placement,
                             session_id_key: config.session_id_key.clone(),
@@ -143,26 +175,36 @@ impl XhttpSession {
                             padding,
                             placement,
                         })
-                    }
+                    },
                     Err(e) => {
-                        log::warn!("xhttp: H3 connect failed, falling back to H2: {}", e);
+                        log::warn!(
+                            "xhttp: H3 connect failed, falling back to H2: {}",
+                            e
+                        );
                         let addr = resolve_addr(&config).await?;
                         let send_req = h2::connect(
                             addr,
                             &config.host,
                             config.insecure,
                             HttpVersionPref::Http2,
-                        ).await?;
+                        )
+                        .await?;
                         Ok(Self::from_send_request(config, send_req))
-                    }
+                    },
                 }
-            }
+            },
             _ => {
                 // H2 / H1 path (original)
                 let addr = resolve_addr(&config).await?;
-                let send_req = h2::connect(addr, &config.host, config.insecure, http_version).await?;
+                let send_req = h2::connect(
+                    addr,
+                    &config.host,
+                    config.insecure,
+                    http_version,
+                )
+                .await?;
                 Ok(Self::from_send_request(config, send_req))
-            }
+            },
         }
     }
 
@@ -172,7 +214,8 @@ impl XhttpSession {
     /// - Downlink: if `downlink_target` is set, creates a separate connection.
     async fn connect_asymmetric(config: Arc<XhttpConfig>) -> io::Result<Self> {
         // Build uplink config by merging base with uplink_target overrides
-        let uplink_config = merge_direction_config(&config, config.uplink_target.as_ref());
+        let uplink_config =
+            merge_direction_config(&config, config.uplink_target.as_ref());
         let uplink_addr = resolve_addr(&uplink_config).await?;
         let uplink_http_version = resolve_http_version(&uplink_config);
         let uplink_send_req = h2::connect(
@@ -209,10 +252,7 @@ impl XhttpSession {
 
     /// Build an HTTP request with the given method, optional seq, and body.
     fn build_request(
-        &self,
-        method: &str,
-        seq: Option<u64>,
-        body: ReqBody,
+        &self, method: &str, seq: Option<u64>, body: ReqBody,
     ) -> io::Result<http::Request<ReqBody>> {
         let (path, extra_headers) = self.placement.build_request_meta(
             &self.config.path,
@@ -290,41 +330,53 @@ impl TransportSession for XhttpSession {
                     // Stream-up: drain response (not used for downlink)
                     tokio::spawn(async move {
                         if let Ok(resp) = response_future.await {
-                            let _ = http_body_util::BodyExt::collect(resp.into_body()).await;
+                            let _ = http_body_util::BodyExt::collect(
+                                resp.into_body(),
+                            )
+                            .await;
                         }
                     });
                 }
 
                 Ok(Box::new(StreamUplinkWriter {
                     body_tx: Some(body_tx),
-                    obf_chain: None,
+                    obf_chain: build_obfuscation_chain(&self.config),
                     is_first_write: true,
                 }))
-            }
+            },
             XhttpMode::PacketUp => {
                 // Packet-up: return a PacketUplinkWriter that chunks data
                 // into separate POSTs with seq
                 let send_req_clone = match self.send_req.as_ref() {
                     Some(HttpSendRequest::H2(sr)) => sr.clone(),
-                    _ => return Err(io::Error::new(
-                        io::ErrorKind::Unsupported,
-                        "packet-up requires HTTP/2",
-                    )),
+                    _ => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::Unsupported,
+                            "packet-up requires HTTP/2",
+                        ));
+                    },
                 };
 
                 // Resolve chunk_size from uplink.chunk_size (default 16KB)
-                let cs = self.config.uplink.chunk_size
+                let cs = self
+                    .config
+                    .uplink
+                    .chunk_size
                     .as_ref()
                     .map(|r| r.rand_usize())
                     .unwrap_or(16 * 1024);
 
                 // Resolve throttle config: max_buffered_posts (default 30)
-                let max_buffered_posts = self.config.throttle.max_buffered_posts
-                    .unwrap_or(30) as usize;
+                let max_buffered_posts =
+                    self.config.throttle.max_buffered_posts.unwrap_or(30)
+                        as usize;
                 let max_buffered = max_buffered_posts * cs;
 
                 // Resolve min_posts_interval_ms (default 30ms)
-                let min_post_interval = self.config.throttle.min_posts_interval_ms
+                let min_post_interval = self
+                    .config
+                    .throttle
+                    .min_posts_interval_ms
                     .as_ref()
                     .map(|r| std::time::Duration::from_millis(r.rand_u64()))
                     .or(Some(std::time::Duration::from_millis(30)));
@@ -335,15 +387,16 @@ impl TransportSession for XhttpSession {
                     session_id: self.session_id.clone(),
                     placement: self.placement.clone(),
                     padding: self.padding.clone(),
-                    upload_queue: UploadQueue::new(cs, max_buffered),
+                    upload_queue: SeqChunker::new(cs, max_buffered),
                     last_post_time: None,
                     min_post_interval,
-                    obf_chain: None,
+                    obf_chain: build_obfuscation_chain(&self.config),
                 }))
-            }
-            XhttpMode::Auto => {
-                Err(io::Error::new(io::ErrorKind::Unsupported, "Auto mode should be resolved"))
-            }
+            },
+            XhttpMode::Auto => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "Auto mode should be resolved",
+            )),
         }
     }
 
@@ -359,7 +412,10 @@ impl TransportSession for XhttpSession {
                 // request body is still being sent - critical for HTTP/1.1
                 // where the server won't respond until it receives body data.
                 let response_rx = self.response_rx.take().ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidInput, "uplink() must be called first")
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "uplink() must be called first",
+                    )
                 })?;
                 Ok(Box::new(StreamDownlinkReader {
                     response_rx: Some(response_rx),
@@ -367,9 +423,10 @@ impl TransportSession for XhttpSession {
                     body: None,
                     read_buf: Vec::new(),
                     padding: self.padding.clone(),
-                    obf_chain: None,
+                    obf_chain: build_obfuscation_chain(&self.config),
+                    reconnect: None,
                 }))
-            }
+            },
             XhttpMode::StreamUp | XhttpMode::PacketUp => {
                 // Stream-up / packet-up: send a separate GET request
                 // In asymmetric mode, use the dedicated downlink connection if available
@@ -377,17 +434,22 @@ impl TransportSession for XhttpSession {
                 // _empty_tx dropped -> empty body = immediate end-of-body
                 let request = self.build_request("GET", None, empty_body)?;
 
-                let send_req = if let Some(ref mut dl_req) = self.downlink_send_req {
-                    dl_req
-                } else {
-                    self.send_req.as_mut().ok_or_else(|| {
-                        io::Error::new(io::ErrorKind::NotConnected, "session closed")
-                    })?
-                };
+                let send_req =
+                    if let Some(ref mut dl_req) = self.downlink_send_req {
+                        dl_req
+                    } else {
+                        self.send_req.as_mut().ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::NotConnected,
+                                "session closed",
+                            )
+                        })?
+                    };
 
-                let response = send_req.send_request(request)
-                    .await
-                    .map_err(|e| io::Error::new(io::ErrorKind::ConnectionReset, e))?;
+                let response =
+                    send_req.send_request(request).await.map_err(|e| {
+                        io::Error::new(io::ErrorKind::ConnectionReset, e)
+                    })?;
 
                 if let Some(pad) = &self.padding {
                     if !pad.validate_response(response.headers()) {
@@ -395,18 +457,44 @@ impl TransportSession for XhttpSession {
                     }
                 }
 
+                // Extract a cloneable H2 send-request for downlink reconnection.
+                // H1 connections cannot be cloned; reconnect is H2-only.
+                let reconnect = match send_req {
+                    HttpSendRequest::H2(h2_sr) => {
+                        let max_age = self
+                            .config
+                            .throttle
+                            .stream_up_server_secs
+                            .as_ref()
+                            .map(|r| {
+                                std::time::Duration::from_secs(r.rand_u64())
+                            });
+                        Some(DownlinkReconnect {
+                            send_req: h2_sr.clone(),
+                            config: self.config.clone(),
+                            session_id: self.session_id.clone(),
+                            placement: self.placement.clone(),
+                            padding: self.padding.clone(),
+                            policy: ReconnectPolicy::new(max_age),
+                        })
+                    },
+                    HttpSendRequest::H1(_) => None,
+                };
+
                 Ok(Box::new(StreamDownlinkReader {
                     response_rx: None,
                     response_fut: None,
                     body: Some(response.into_body()),
                     read_buf: Vec::new(),
                     padding: None,
-                    obf_chain: None,
+                    obf_chain: build_obfuscation_chain(&self.config),
+                    reconnect,
                 }))
-            }
-            XhttpMode::Auto => {
-                Err(io::Error::new(io::ErrorKind::Unsupported, "Auto mode should be resolved"))
-            }
+            },
+            XhttpMode::Auto => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "Auto mode should be resolved",
+            )),
         }
     }
 
@@ -467,7 +555,10 @@ impl UplinkWriter for StreamUplinkWriter {
         tx.send(Ok(Frame::data(Bytes::from(payload))))
             .await
             .map_err(|_| {
-                io::Error::new(io::ErrorKind::ConnectionReset, "body channel closed")
+                io::Error::new(
+                    io::ErrorKind::ConnectionReset,
+                    "body channel closed",
+                )
             })
     }
 
@@ -484,14 +575,102 @@ impl UplinkWriter for StreamUplinkWriter {
 
 /// Reads downlink data from the HTTP response body.
 pub struct StreamDownlinkReader {
-    response_rx: Option<tokio::sync::oneshot::Receiver<Result<hyper::Response<hyper::body::Incoming>, hyper::Error>>>,
+    response_rx: Option<
+        tokio::sync::oneshot::Receiver<
+            Result<hyper::Response<hyper::body::Incoming>, hyper::Error>,
+        >,
+    >,
     /// Cached response future for cancel-safe lazy init.
-    response_fut: Option<Pin<Box<dyn Future<Output = io::Result<hyper::body::Incoming>> + Send>>>,
+    response_fut: Option<
+        Pin<Box<dyn Future<Output = io::Result<hyper::body::Incoming>> + Send>>,
+    >,
     body: Option<hyper::body::Incoming>,
     read_buf: Vec<u8>,
     padding: Option<XPaddingMiddleware>,
     /// Optional obfuscation chain for post_recv processing.
     obf_chain: Option<ObfuscationChain>,
+    /// Reconnection info for stream-up / packet-up downlink.
+    /// When present, the reader re-issues the GET on EOF or timeout.
+    reconnect: Option<DownlinkReconnect>,
+}
+
+/// State needed to re-issue the downlink GET in stream-up / packet-up mode.
+struct DownlinkReconnect {
+    send_req: H2SendRequest,
+    config: Arc<XhttpConfig>,
+    session_id: String,
+    placement: PlacementConfig,
+    padding: Option<XPaddingMiddleware>,
+    /// Reconnection timing policy (from stream_up_server_secs).
+    policy: ReconnectPolicy,
+}
+
+impl StreamDownlinkReader {
+    /// Re-issue the downlink GET and replace the current body.
+    async fn reissue_get(&mut self) -> io::Result<()> {
+        let reconnect = self.reconnect.as_mut().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotConnected, "no reconnect info")
+        })?;
+
+        // Build the same GET request as the original downlink.
+        let (path, extra_headers) = reconnect.placement.build_request_meta(
+            &reconnect.config.path,
+            &reconnect.session_id,
+            None,
+        );
+
+        // Apply padding to the request path.
+        let mut pad_path = path;
+        let mut pad_headers = Vec::new();
+        if let Some(pad) = &reconnect.padding {
+            pad.apply_to_request_mut(&mut pad_path, &mut pad_headers);
+        }
+
+        let mut builder = http::Request::builder()
+            .method("GET")
+            .uri(&pad_path)
+            .header("Host", &reconnect.config.host);
+
+        for (k, v) in &reconnect.config.headers {
+            builder = builder.header(k, v);
+        }
+        for (k, v) in &extra_headers {
+            builder = builder.header(k, v);
+        }
+        if !reconnect.config.no_grpc_header {
+            builder = builder.header("Content-Type", "application/grpc");
+        }
+        for (k, v) in pad_headers {
+            builder = builder.header(k, v);
+        }
+
+        let (_empty_tx, empty_body) = make_stream_body(1);
+        let request = builder
+            .body(empty_body)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+
+        let response = reconnect
+            .send_req
+            .send_request(request)
+            .await
+            .map_err(|e| io::Error::new(io::ErrorKind::ConnectionReset, e))?;
+
+        if let Some(pad) = &reconnect.padding {
+            if !pad.validate_response(response.headers()) {
+                log::warn!(
+                    "xhttp: response XPadding validation failed on reconnect"
+                );
+            }
+        }
+
+        log::debug!(
+            "xhttp: downlink GET re-issued for session {}",
+            reconnect.session_id
+        );
+        reconnect.policy.reset();
+        self.body = Some(response.into_body());
+        Ok(())
+    }
 }
 #[async_trait]
 impl DownlinkReader for StreamDownlinkReader {
@@ -506,14 +685,25 @@ impl DownlinkReader for StreamDownlinkReader {
 
         // Lazy init: await response on first read (cancel-safe via cached future)
         if self.body.is_none() && self.response_fut.is_none() {
-            let response_rx = self.response_rx.take()
-                .ok_or_else(|| io::Error::new(io::ErrorKind::ConnectionReset, "no response available"))?;
+            let response_rx = self.response_rx.take().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::ConnectionReset,
+                    "no response available",
+                )
+            })?;
             let padding = self.padding.clone();
             self.response_fut = Some(Box::pin(async move {
                 let response = response_rx
                     .await
-                    .map_err(|_| io::Error::new(io::ErrorKind::ConnectionReset, "response task dropped"))?
-                    .map_err(|e| io::Error::new(io::ErrorKind::ConnectionReset, e))?;
+                    .map_err(|_| {
+                        io::Error::new(
+                            io::ErrorKind::ConnectionReset,
+                            "response task dropped",
+                        )
+                    })?
+                    .map_err(|e| {
+                        io::Error::new(io::ErrorKind::ConnectionReset, e)
+                    })?;
                 log::debug!("xhttp: response status={}", response.status());
                 if let Some(pad) = &padding {
                     if !pad.validate_response(response.headers()) {
@@ -530,26 +720,59 @@ impl DownlinkReader for StreamDownlinkReader {
             self.response_fut = None;
         }
 
-        // Read the next data frame from the response body
-        let body = self.body.as_mut()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::ConnectionReset, "no body"))?;
         loop {
+            // Take the body out temporarily to avoid borrow conflicts
+            // with reissue_get() (which needs &mut self).
+            let mut body = match self.body.take() {
+                Some(b) => b,
+                None => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::ConnectionReset,
+                        "no body",
+                    ));
+                },
+            };
+
+            // Check stream_up_server_secs: force reconnect if the current
+            // GET has been open longer than the configured server duration.
+            if let Some(reconnect) = &self.reconnect {
+                if reconnect.policy.should_reconnect() {
+                    log::debug!(
+                        "xhttp: downlink GET exceeded stream_up_server_secs, reconnecting"
+                    );
+                    self.body = Some(body);
+                    self.reissue_get().await?;
+                    continue;
+                }
+            }
+
             match body.frame().await {
-                None => return Ok(0), // EOF
+                None => {
+                    // EOF - if we have reconnect info (stream-up / packet-up),
+                    // re-issue the GET and continue reading.
+                    self.body = Some(body);
+                    if self.reconnect.is_some() {
+                        self.reissue_get().await?;
+                        continue;
+                    }
+                    return Ok(0); // true EOF for stream-one
+                },
                 Some(Ok(frame)) => {
+                    self.body = Some(body);
                     if let Some(data) = frame.data_ref() {
                         // Apply post_recv obfuscation chain if present
-                        let processed = if let Some(ref mut chain) = self.obf_chain {
-                            let ctx = ObfContext {
-                                request_url: None,
-                                is_first: false,
-                                seq: None,
-                                response_headers: None,
+                        let processed =
+                            if let Some(ref mut chain) = self.obf_chain {
+                                let ctx = ObfContext {
+                                    request_url: None,
+                                    is_first: false,
+                                    seq: None,
+                                    response_headers: None,
+                                };
+                                chain.post_recv(data, &ctx).await?
+                            } else {
+                                data.to_vec()
                             };
-                            chain.post_recv(data, &ctx).await?
-                        } else {
-                            data.to_vec()
-                        };
 
                         let n = std::cmp::min(processed.len(), buf.len());
                         buf[..n].copy_from_slice(&processed[..n]);
@@ -559,10 +782,14 @@ impl DownlinkReader for StreamDownlinkReader {
                         return Ok(n);
                     }
                     // Skip trailer frames
-                }
+                },
                 Some(Err(e)) => {
-                    return Err(io::Error::new(io::ErrorKind::ConnectionReset, e));
-                }
+                    self.body = Some(body);
+                    return Err(io::Error::new(
+                        io::ErrorKind::ConnectionReset,
+                        e,
+                    ));
+                },
             }
         }
     }
@@ -582,7 +809,7 @@ pub struct PacketUplinkWriter {
     session_id: String,
     placement: PlacementConfig,
     padding: Option<XPaddingMiddleware>,
-    upload_queue: UploadQueue,
+    upload_queue: SeqChunker,
     /// Last time a POST was sent, for throttling.
     last_post_time: Option<tokio::time::Instant>,
     /// Minimum interval between POSTs (from ThrottleConfig.min_posts_interval_ms).
@@ -623,7 +850,9 @@ impl PacketUplinkWriter {
 
         // Build POST request with seq in URL
         let (path, extra_headers) = self.placement.build_request_meta(
-            &self.config.path, &self.session_id, Some(seq),
+            &self.config.path,
+            &self.session_id,
+            Some(seq),
         );
 
         let method_str = match self.config.uplink.method {
@@ -668,19 +897,22 @@ impl PacketUplinkWriter {
                 let _ = body_tx.send(Ok(Frame::data(Bytes::from(data)))).await;
                 drop(body_tx);
                 body
-            }
+            },
             UplinkDataPlacement::Header => {
                 let key = if self.config.uplink.data_key.is_empty() {
                     "X-Data"
                 } else {
                     &self.config.uplink.data_key
                 };
-                let encoded = base64::engine::general_purpose::STANDARD.encode(&data);
+                let encoded =
+                    base64::engine::general_purpose::STANDARD.encode(&data);
                 const MAX_HEADER_CHUNK: usize = 8 * 1024;
                 if encoded.len() <= MAX_HEADER_CHUNK {
                     builder = builder.header(key, &encoded);
                 } else {
-                    for (i, chunk) in encoded.as_bytes().chunks(MAX_HEADER_CHUNK).enumerate() {
+                    for (i, chunk) in
+                        encoded.as_bytes().chunks(MAX_HEADER_CHUNK).enumerate()
+                    {
                         let header_name = format!("{}-{}", key, i);
                         let val = std::str::from_utf8(chunk).unwrap_or("");
                         builder = builder.header(header_name, val);
@@ -688,22 +920,21 @@ impl PacketUplinkWriter {
                 }
                 let (_, body) = make_stream_body(1);
                 body
-            }
+            },
             UplinkDataPlacement::Cookie => {
                 let key = if self.config.uplink.data_key.is_empty() {
                     "data"
                 } else {
                     &self.config.uplink.data_key
                 };
-                let encoded = base64::engine::general_purpose::STANDARD.encode(&data);
+                let encoded =
+                    base64::engine::general_purpose::STANDARD.encode(&data);
                 let cookie_value = urlencoding::encode(&encoded);
-                builder = builder.header(
-                    "Cookie",
-                    format!("{}={}", key, cookie_value),
-                );
+                builder =
+                    builder.header("Cookie", format!("{}={}", key, cookie_value));
                 let (_, body) = make_stream_body(1);
                 body
-            }
+            },
         };
 
         let request = builder
@@ -753,7 +984,12 @@ async fn resolve_addr(config: &XhttpConfig) -> io::Result<std::net::SocketAddr> 
     tokio::net::lookup_host(&addr_str)
         .await?
         .next()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::AddrNotAvailable, "DNS resolution failed"))
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::AddrNotAvailable,
+                "DNS resolution failed",
+            )
+        })
 }
 
 /// Merge per-direction overrides from `XhttpDirectionConfig` into a base `XhttpConfig`.
@@ -763,8 +999,7 @@ async fn resolve_addr(config: &XhttpConfig) -> io::Result<std::net::SocketAddr> 
 /// mode to use different servers/ports/paths for uplink and downlink
 /// while sharing the rest of the configuration (TLS, padding, throttling, etc.).
 fn merge_direction_config(
-    base: &XhttpConfig,
-    direction: Option<&XhttpDirectionConfig>,
+    base: &XhttpConfig, direction: Option<&XhttpDirectionConfig>,
 ) -> Arc<XhttpConfig> {
     let mut merged = base.clone();
     if let Some(dir) = direction {

@@ -147,14 +147,15 @@ impl DomainMatcher {
                 continue;
             }
             match reversed[0] {
-                b'\r' | b'\n' =>
+                b'\r' | b'\n' => {
                     if reversed.len() > 1 {
                         suffixes.push(
                             std::str::from_utf8(&reversed[1..])
                                 .unwrap_or("")
                                 .to_string(),
                         );
-                    },
+                    }
+                },
                 _ => {
                     domains.push(
                         std::str::from_utf8(&reversed).unwrap_or("").to_string(),
@@ -190,12 +191,14 @@ enum GeoMatcherInner {
 impl GeoMatcher {
     pub fn matches(&self, dest: &Destination, _network: Network) -> bool {
         match &self.inner {
-            GeoMatcherInner::Domain(matchers, kw) =>
-                self.match_domain(dest, matchers, kw.as_deref()),
+            GeoMatcherInner::Domain(matchers, kw) => {
+                self.match_domain(dest, matchers, kw.as_deref())
+            },
             GeoMatcherInner::IP(ranges) => self.match_ip(dest, ranges),
-            GeoMatcherInner::Mixed(matchers, kw, ranges) =>
-                self.match_domain(dest, matchers, kw.as_deref()) ||
-                    self.match_ip(dest, ranges),
+            GeoMatcherInner::Mixed(matchers, kw, ranges) => {
+                self.match_domain(dest, matchers, kw.as_deref())
+                    || self.match_ip(dest, ranges)
+            },
         }
     }
 
@@ -382,13 +385,15 @@ pub fn parsed_to_geomatcher(
     };
 
     let inner = match (has_domain, kw, ip) {
-        (true, kw, Some(ip)) =>
-            GeoMatcherInner::Mixed(parsed.domain_matchers, kw, ip),
+        (true, kw, Some(ip)) => {
+            GeoMatcherInner::Mixed(parsed.domain_matchers, kw, ip)
+        },
         (true, kw, None) => GeoMatcherInner::Domain(parsed.domain_matchers, kw),
         (false, None, Some(ip)) => GeoMatcherInner::IP(ip),
         (false, Some(kw), None) => GeoMatcherInner::Domain(vec![], Some(kw)),
-        (false, Some(kw), Some(ip)) =>
-            GeoMatcherInner::Mixed(vec![], Some(kw), ip),
+        (false, Some(kw), Some(ip)) => {
+            GeoMatcherInner::Mixed(vec![], Some(kw), ip)
+        },
         (false, None, None) => return None,
     };
 
@@ -785,8 +790,8 @@ impl GeoRuleSet {
     /// all does this block on a download (first run; on Android the Kotlin
     /// prefetch usually populates the cache before the engine starts).
     pub async fn new(
-        url: &str, update_interval_str: Option<&str>, cache_dir: &std::path::Path,
-        dns_plain: Vec<std::net::SocketAddr>,
+        url: &str, update_interval_str: Option<&str>,
+        cache_dir: &std::path::Path, dns_plain: Vec<std::net::SocketAddr>,
     ) -> Self {
         let source_name = extract_source_name(url);
         let update_interval = update_interval_str
@@ -841,10 +846,19 @@ impl GeoRuleSet {
             if let Some(dir) = cache_path.parent() {
                 let _ = std::fs::create_dir_all(dir);
             }
-            match Self::fetch_and_cache(url, &cache_path, &source_name, &dns_plain).await {
+            match Self::fetch_and_cache(
+                url,
+                &cache_path,
+                &source_name,
+                &dns_plain,
+            )
+            .await
+            {
                 Ok(m) => (Some(m), false),
                 Err(e) => {
-                    log::warn!("Download failed for {url}: {e}; no cache available");
+                    log::warn!(
+                        "Download failed for {url}: {e}; no cache available"
+                    );
                     (None, true)
                 },
             }
@@ -899,20 +913,25 @@ impl GeoRuleSet {
         use std::time::Duration;
 
         use http_body_util::{BodyExt, Empty};
-        use hyper::body::Bytes;
         use hyper::Request;
+        use hyper::body::Bytes;
         use hyper_util::rt::TokioIo;
-        use tokio_rustls::rustls::pki_types::ServerName;
-        use tokio_rustls::rustls::ClientConfig;
         use tokio_rustls::TlsConnector;
+        use tokio_rustls::rustls::ClientConfig;
+        use tokio_rustls::rustls::pki_types::ServerName;
 
         // Parse URL.
-        let parsed = url::Url::parse(url)
-            .map_err(|e| format!("invalid URL: {e}"))?;
-        let host = parsed.host_str()
+        let parsed =
+            url::Url::parse(url).map_err(|e| format!("invalid URL: {e}"))?;
+        let host = parsed
+            .host_str()
             .ok_or_else(|| "URL has no host".to_string())?;
         let port = parsed.port_or_known_default().unwrap_or(443);
-        let path = if parsed.path().is_empty() { "/" } else { parsed.path() };
+        let path = if parsed.path().is_empty() {
+            "/"
+        } else {
+            parsed.path()
+        };
         let query = parsed.query().map(|q| format!("?{q}")).unwrap_or_default();
         let path_query = format!("{path}{query}");
 
@@ -950,11 +969,12 @@ impl GeoRuleSet {
         let provider = tokio_rustls::rustls::crypto::ring::default_provider();
         let mut roots = tokio_rustls::rustls::RootCertStore::empty();
         roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        let mut tls_config = ClientConfig::builder_with_provider(Arc::new(provider))
-            .with_safe_default_protocol_versions()
-            .map_err(|e| format!("TLS config: {e}"))?
-            .with_root_certificates(roots)
-            .with_no_client_auth();
+        let mut tls_config =
+            ClientConfig::builder_with_provider(Arc::new(provider))
+                .with_safe_default_protocol_versions()
+                .map_err(|e| format!("TLS config: {e}"))?
+                .with_root_certificates(roots)
+                .with_no_client_auth();
         tls_config.alpn_protocols = vec![b"http/1.1".to_vec()];
         let connector = TlsConnector::from(Arc::new(tls_config));
 
@@ -1002,7 +1022,8 @@ impl GeoRuleSet {
         }
 
         // Collect body.
-        let body = resp.into_body()
+        let body = resp
+            .into_body()
             .collect()
             .await
             .map_err(|e| format!("read body: {e}"))?;
@@ -1044,11 +1065,9 @@ impl GeoRuleSet {
                 continue;
             }
             let mut buf = vec![0u8; 512];
-            if let Ok(Ok(n)) = timeout(
-                std::time::Duration::from_secs(3),
-                sock.recv(&mut buf),
-            )
-            .await
+            if let Ok(Ok(n)) =
+                timeout(std::time::Duration::from_secs(3), sock.recv(&mut buf))
+                    .await
             {
                 if let Some(ip) = first_a_record(&buf[..n]) {
                     // Reject fake-ip (198.18.0.0/15): the bypass query didn't

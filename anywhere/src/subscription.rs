@@ -27,8 +27,7 @@ const SUPPORTED_TYPES: &[&str] = &["shadowsocks", "ss", "anytls", "vless"];
 
 /// Fetch a subscription URL and return the response (body + selected headers).
 pub async fn fetch_subscription(
-    url: &str,
-    ua: &str,
+    url: &str, ua: &str,
 ) -> Result<crate::http_client::HttpResponse, String> {
     crate::http_client::http_get_with_headers(url, ua).await
 }
@@ -40,8 +39,7 @@ pub async fn fetch_subscription(
 /// sing-box JSON and URI lists produce outbounds only. Unsupported proxy /
 /// rule types are collected into the `skip` list.
 pub fn convert_subscription(
-    body: &[u8],
-    skips: &mut Vec<String>,
+    body: &[u8], skips: &mut Vec<String>,
 ) -> Result<String, String> {
     let body_str = String::from_utf8_lossy(body);
 
@@ -52,9 +50,7 @@ pub fn convert_subscription(
             rules: Vec::new(),
             dns: None,
         }
-    } else if body_str.contains("proxies:")
-        || body_str.contains("proxies :")
-    {
+    } else if body_str.contains("proxies:") || body_str.contains("proxies :") {
         // Clash YAML
         parse_clash_yaml(&body_str, skips)?
     } else {
@@ -171,19 +167,22 @@ fn render_fields(fields: &[(String, TomlValue)]) -> String {
         match v {
             TomlValue::Str(s) => {
                 out.push_str(&format!("{k} = \"{}\"\n", escape_toml_str(s)));
-            }
+            },
             TomlValue::Int(i) => {
                 out.push_str(&format!("{k} = {i}\n"));
-            }
+            },
             TomlValue::Bool(b) => {
                 out.push_str(&format!("{k} = {b}\n"));
-            }
+            },
             TomlValue::List(items) => {
                 if items.is_empty() {
                     continue;
                 }
                 if items.len() == 1 {
-                    out.push_str(&format!("{k} = [\"{}\"]\n", escape_toml_str(&items[0])));
+                    out.push_str(&format!(
+                        "{k} = [\"{}\"]\n",
+                        escape_toml_str(&items[0])
+                    ));
                 } else {
                     out.push_str(&format!(
                         "{k} = [\n{}\n]\n",
@@ -194,7 +193,7 @@ fn render_fields(fields: &[(String, TomlValue)]) -> String {
                             .join(",\n")
                     ));
                 }
-            }
+            },
         }
     }
     out
@@ -282,7 +281,10 @@ fn rules_to_toml(rules: &[TomlRule]) -> String {
     for r in rules {
         out.push_str("[[rules]]\n");
         out.push_str(&render_fields(&r.fields));
-        out.push_str(&format!("outbound = \"{}\"\n", escape_toml_str(&r.outbound)));
+        out.push_str(&format!(
+            "outbound = \"{}\"\n",
+            escape_toml_str(&r.outbound)
+        ));
         out.push('\n');
     }
     out
@@ -311,8 +313,7 @@ fn render_sub_output(sub: &SubOutput) -> String {
 // ---------------------------------------------------------------------------
 
 fn parse_clash_yaml(
-    text: &str,
-    skips: &mut Vec<String>,
+    text: &str, skips: &mut Vec<String>,
 ) -> Result<SubOutput, String> {
     let yaml: noyalib::Value =
         noyalib::from_str(text).map_err(|e| format!("YAML parse error: {e}"))?;
@@ -323,7 +324,8 @@ fn parse_clash_yaml(
         .ok_or("no 'proxies' section found in Clash YAML")?;
 
     let mut outbounds = Vec::new();
-    let mut proxy_tags: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut proxy_tags: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
     for proxy in proxies {
         let ptype = proxy
             .get("type")
@@ -344,7 +346,7 @@ fn parse_clash_yaml(
                     skips.push(other.to_string());
                 }
                 None
-            }
+            },
         };
         if let Some(ob) = ob {
             proxy_tags.insert(ob.tag.clone());
@@ -364,10 +366,17 @@ fn parse_clash_yaml(
             let mut sel = std::collections::HashSet::new();
             for g in gs {
                 let gtype = g.get("type").and_then(|v| v.as_str());
-                let name = g.get("name").and_then(|v| v.as_str()).map(|s| s.to_string());
+                let name = g
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
                 match (gtype, name) {
-                    (Some("url-test") | Some("fallback"), Some(n)) => { ut.insert(n); },
-                    (Some("select"), Some(n)) => { sel.insert(n); },
+                    (Some("url-test") | Some("fallback"), Some(n)) => {
+                        ut.insert(n);
+                    },
+                    (Some("select"), Some(n)) => {
+                        sel.insert(n);
+                    },
                     _ => {},
                 }
             }
@@ -383,7 +392,8 @@ fn parse_clash_yaml(
     if let Some(groups) = yaml.get("proxy-groups").and_then(|v| v.as_sequence()) {
         for g in groups {
             let gtype = g.get("type").and_then(|v| v.as_str()).unwrap_or("");
-            let gname = g.get("name").and_then(|v| v.as_str()).unwrap_or("unnamed");
+            let gname =
+                g.get("name").and_then(|v| v.as_str()).unwrap_or("unnamed");
             if gtype == "url-test" {
                 if let Some(ob) = parse_clash_urltest(g, gname, &valid_refs) {
                     outbounds.push(ob);
@@ -413,13 +423,14 @@ fn parse_clash_yaml(
         .and_then(|v| v.as_mapping())
         .and_then(parse_clash_dns);
 
-    Ok(SubOutput { outbounds, rules, dns })
+    Ok(SubOutput {
+        outbounds,
+        rules,
+        dns,
+    })
 }
 
-fn parse_clash_ss(
-    proxy: &noyalib::Value,
-    name: &str,
-) -> Option<TomlOutbound> {
+fn parse_clash_ss(proxy: &noyalib::Value, name: &str) -> Option<TomlOutbound> {
     let server = proxy.get("server")?.as_str()?;
     let port = proxy.get("port")?.as_u64()? as u16;
     let cipher = proxy.get("cipher").and_then(|v| v.as_str())?;
@@ -434,7 +445,9 @@ fn parse_clash_ss(
     if let Some(plugin) = proxy.get("plugin").and_then(|v| v.as_str()) {
         if plugin == "obfs" || plugin == "v2ray-plugin" {
             ob = ob.field("plugin", "obfs-local");
-            if let Some(opts) = proxy.get("plugin-opts").and_then(|v| v.as_mapping()) {
+            if let Some(opts) =
+                proxy.get("plugin-opts").and_then(|v| v.as_mapping())
+            {
                 let mut parts = Vec::new();
                 if let Some(mode) = opts.get("mode").and_then(|v| v.as_str()) {
                     parts.push(format!("obfs={mode}"));
@@ -453,8 +466,7 @@ fn parse_clash_ss(
 }
 
 fn parse_clash_anytls(
-    proxy: &noyalib::Value,
-    name: &str,
+    proxy: &noyalib::Value, name: &str,
 ) -> Option<TomlOutbound> {
     let server = proxy.get("server")?.as_str()?;
     let port = proxy.get("port")?.as_u64()? as u16;
@@ -475,7 +487,10 @@ fn parse_clash_anytls(
     if let Some(true) = proxy.get("skip-cert-verify").and_then(|v| v.as_bool()) {
         ob = ob.field("insecure", true);
     }
-    if let Some(v) = proxy.get("idle-session-check-interval").and_then(|v| v.as_u64()) {
+    if let Some(v) = proxy
+        .get("idle-session-check-interval")
+        .and_then(|v| v.as_u64())
+    {
         ob = ob.field("idle_session_check_interval", v as i64);
     }
     if let Some(v) = proxy.get("idle-session-timeout").and_then(|v| v.as_u64()) {
@@ -488,10 +503,7 @@ fn parse_clash_anytls(
     Some(ob)
 }
 
-fn parse_clash_vless(
-    proxy: &noyalib::Value,
-    name: &str,
-) -> Option<TomlOutbound> {
+fn parse_clash_vless(proxy: &noyalib::Value, name: &str) -> Option<TomlOutbound> {
     let server = proxy.get("server")?.as_str()?;
     let port = proxy.get("port")?.as_u64()? as u16;
     let uuid = proxy.get("uuid").and_then(|v| v.as_str())?;
@@ -510,7 +522,11 @@ fn parse_clash_vless(
     if let Some(true) = proxy.get("skip-cert-verify").and_then(|v| v.as_bool()) {
         ob = ob.field("insecure", true);
     }
-    if proxy.get("client-fingerprint").and_then(|v| v.as_str()).is_some() {
+    if proxy
+        .get("client-fingerprint")
+        .and_then(|v| v.as_str())
+        .is_some()
+    {
         ob = ob.field("fp", true);
     }
 
@@ -527,7 +543,9 @@ fn parse_clash_vless(
             if let Some(path) = ws_opts.get("path").and_then(|v| v.as_str()) {
                 transport.ws_path = Some(path.to_string());
             }
-            if let Some(headers) = ws_opts.get("headers").and_then(|v| v.as_mapping()) {
+            if let Some(headers) =
+                ws_opts.get("headers").and_then(|v| v.as_mapping())
+            {
                 let mut h = HashMap::new();
                 for (k, v) in headers {
                     if let Some(v) = v.as_str() {
@@ -557,8 +575,7 @@ fn parse_clash_vless(
 /// (proxies + url-test groups) are dropped; if none remain the group is
 /// skipped to avoid an empty `urltest`.
 fn parse_clash_urltest(
-    group: &noyalib::Value,
-    name: &str,
+    group: &noyalib::Value, name: &str,
     valid_refs: &std::collections::HashSet<String>,
 ) -> Option<TomlOutbound> {
     let proxies = group.get("proxies").and_then(|v| v.as_sequence())?;
@@ -607,7 +624,12 @@ fn is_private_cidr(cidr: &str) -> bool {
         for &private in crate::rules::PRIVATE_CIDRS {
             let (p_ip_str, p_prefix_str) = private.split_once('/').unwrap();
             let p_prefix: u8 = p_prefix_str.parse().unwrap();
-            if cidr_contains(p_ip_str.parse::<std::net::IpAddr>().unwrap().into(), p_prefix, ip, prefix) {
+            if cidr_contains(
+                p_ip_str.parse::<std::net::IpAddr>().unwrap().into(),
+                p_prefix,
+                ip,
+                prefix,
+            ) {
                 return true;
             }
         }
@@ -616,7 +638,9 @@ fn is_private_cidr(cidr: &str) -> bool {
 }
 
 /// Returns true if the CIDR (p_ip/p_prefix) fully contains cidr (ip/prefix).
-fn cidr_contains(net_ip: IpNet, net_prefix: u8, ip: std::net::IpAddr, prefix: u8) -> bool {
+fn cidr_contains(
+    net_ip: IpNet, net_prefix: u8, ip: std::net::IpAddr, prefix: u8,
+) -> bool {
     match (net_ip, ip) {
         (IpNet::V4(net), std::net::IpAddr::V4(ip)) => {
             if prefix < net_prefix {
@@ -624,18 +648,26 @@ fn cidr_contains(net_ip: IpNet, net_prefix: u8, ip: std::net::IpAddr, prefix: u8
             }
             let net_u32 = u32::from(net);
             let ip_u32 = u32::from(ip);
-            let mask = if net_prefix == 0 { 0 } else { !0u32 << (32 - net_prefix) };
+            let mask = if net_prefix == 0 {
+                0
+            } else {
+                !0u32 << (32 - net_prefix)
+            };
             (net_u32 & mask) == (ip_u32 & mask)
-        }
+        },
         (IpNet::V6(net), std::net::IpAddr::V6(ip)) => {
             if prefix < net_prefix {
                 return false;
             }
             let net_u128 = u128::from(net);
             let ip_u128 = u128::from(ip);
-            let mask = if net_prefix == 0 { 0 } else { !0u128 << (128 - net_prefix) };
+            let mask = if net_prefix == 0 {
+                0
+            } else {
+                !0u128 << (128 - net_prefix)
+            };
             (net_u128 & mask) == (ip_u128 & mask)
-        }
+        },
         _ => false, // v4 vs v6 mismatch
     }
 }
@@ -663,8 +695,7 @@ impl From<std::net::IpAddr> for IpNet {
 /// IP-CIDR rules for private/internal ranges are skipped because anywhere
 /// automatically adds builtin private-network bypass rules.
 fn parse_clash_rules(
-    rules: &[noyalib::Value],
-    valid_refs: &std::collections::HashSet<String>,
+    rules: &[noyalib::Value], valid_refs: &std::collections::HashSet<String>,
     skips: &mut Vec<String>,
 ) -> Vec<TomlRule> {
     // Accumulator for merging: (field_key, outbound) -> Vec<value>
@@ -714,7 +745,7 @@ fn parse_clash_rules(
                     order.push(key.clone());
                 }
                 merged.entry(key).or_default().push(value.to_string());
-            }
+            },
             "IP-CIDR" | "IP-CIDR6" => {
                 // Skip private/internal CIDRs — anywhere auto-adds bypass rules.
                 if is_private_cidr(value) {
@@ -725,7 +756,7 @@ fn parse_clash_rules(
                     order.push(key.clone());
                 }
                 merged.entry(key).or_default().push(value.to_string());
-            }
+            },
             "DST-PORT" => {
                 let mut rule = TomlRule::new(ob);
                 let ok = if let Some((a, b)) = value.split_once('-') {
@@ -744,13 +775,14 @@ fn parse_clash_rules(
                 if ok {
                     standalone.push(rule);
                 }
-            }
+            },
             "NETWORK" => {
-                standalone.push(TomlRule::new(ob).field("network", value.to_string()));
-            }
+                standalone
+                    .push(TomlRule::new(ob).field("network", value.to_string()));
+            },
             other => {
                 skips.push(format!("rule-type:{other}"));
-            }
+            },
         }
     }
 
@@ -771,8 +803,7 @@ fn parse_clash_rules(
 /// `DIRECT` -> `direct`, `REJECT`/`REJECT-DROP` -> `none`, `PASS` dropped,
 /// proxy/group names must exist in `valid_refs` else recorded in `skips`.
 fn map_rule_target(
-    target: &str,
-    valid_refs: &std::collections::HashSet<String>,
+    target: &str, valid_refs: &std::collections::HashSet<String>,
     skips: &mut Vec<String>,
 ) -> Option<String> {
     match target {
@@ -786,7 +817,7 @@ fn map_rule_target(
                 skips.push(format!("rule-target:{other}"));
                 None
             }
-        }
+        },
     }
 }
 
@@ -818,7 +849,8 @@ fn parse_clash_dns(dns: &noyalib::Mapping) -> Option<TomlDns> {
         fields.push(("fakeip".to_string(), TomlValue::Str(fip.to_string())));
     }
 
-    if let Some(filter) = dns.get("fake-ip-filter").and_then(|v| v.as_sequence()) {
+    if let Some(filter) = dns.get("fake-ip-filter").and_then(|v| v.as_sequence())
+    {
         let list: Vec<String> = filter
             .iter()
             .filter_map(|v| v.as_str().map(|s| s.to_string()))
@@ -840,11 +872,10 @@ fn parse_clash_dns(dns: &noyalib::Mapping) -> Option<TomlDns> {
 // ---------------------------------------------------------------------------
 
 fn parse_singbox_json(
-    text: &str,
-    skips: &mut Vec<String>,
+    text: &str, skips: &mut Vec<String>,
 ) -> Result<Vec<TomlOutbound>, String> {
-    let json: serde_json::Value =
-        serde_json::from_str(text).map_err(|e| format!("JSON parse error: {e}"))?;
+    let json: serde_json::Value = serde_json::from_str(text)
+        .map_err(|e| format!("JSON parse error: {e}"))?;
 
     let outbounds_arr = json
         .get("outbounds")
@@ -854,42 +885,36 @@ fn parse_singbox_json(
     let mut outbounds = Vec::new();
     for ob in outbounds_arr {
         let otype = ob.get("type").and_then(|v| v.as_str()).unwrap_or("unknown");
-        let tag = ob
-            .get("tag")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unnamed");
+        let tag = ob.get("tag").and_then(|v| v.as_str()).unwrap_or("unnamed");
 
         match otype {
             "shadowsocks" => {
                 if let Some(o) = parse_singbox_ss(ob, tag) {
                     outbounds.push(o);
                 }
-            }
+            },
             "anytls" => {
                 if let Some(o) = parse_singbox_anytls(ob, tag) {
                     outbounds.push(o);
                 }
-            }
+            },
             "vless" => {
                 if let Some(o) = parse_singbox_vless(ob, tag) {
                     outbounds.push(o);
                 }
-            }
+            },
             other => {
                 if !SUPPORTED_TYPES.contains(&other) {
                     skips.push(other.to_string());
                 }
-            }
+            },
         }
     }
 
     Ok(outbounds)
 }
 
-fn parse_singbox_ss(
-    ob: &serde_json::Value,
-    tag: &str,
-) -> Option<TomlOutbound> {
+fn parse_singbox_ss(ob: &serde_json::Value, tag: &str) -> Option<TomlOutbound> {
     let server = ob.get("server")?.as_str()?;
     let port = ob.get("server_port")?.as_u64()? as u16;
     let method = ob.get("method").and_then(|v| v.as_str())?;
@@ -913,10 +938,8 @@ fn parse_singbox_ss(
     Some(out)
 }
 
-
 fn parse_singbox_anytls(
-    ob: &serde_json::Value,
-    tag: &str,
+    ob: &serde_json::Value, tag: &str,
 ) -> Option<TomlOutbound> {
     let server = ob.get("server")?.as_str()?;
     let port = ob.get("server_port")?.as_u64()? as u16;
@@ -926,7 +949,11 @@ fn parse_singbox_anytls(
         .field("server", format!("{server}:{port}"))
         .field("password", password);
 
-    if let Some(sni) = ob.get("tls").and_then(|v| v.get("server_name")).and_then(|v| v.as_str()) {
+    if let Some(sni) = ob
+        .get("tls")
+        .and_then(|v| v.get("server_name"))
+        .and_then(|v| v.as_str())
+    {
         out = out.field("sni", sni);
     }
 
@@ -934,8 +961,7 @@ fn parse_singbox_anytls(
 }
 
 fn parse_singbox_vless(
-    ob: &serde_json::Value,
-    tag: &str,
+    ob: &serde_json::Value, tag: &str,
 ) -> Option<TomlOutbound> {
     let server = ob.get("server")?.as_str()?;
     let port = ob.get("server_port")?.as_u64()? as u16;
@@ -962,7 +988,9 @@ fn parse_singbox_vless(
             if let Some(path) = transport.get("path").and_then(|v| v.as_str()) {
                 t.ws_path = Some(path.to_string());
             }
-            if let Some(headers) = transport.get("headers").and_then(|v| v.as_object()) {
+            if let Some(headers) =
+                transport.get("headers").and_then(|v| v.as_object())
+            {
                 let mut h = HashMap::new();
                 for (k, v) in headers {
                     if let Some(v) = v.as_str() {
@@ -985,16 +1013,21 @@ fn parse_singbox_vless(
 // ---------------------------------------------------------------------------
 
 fn parse_uri_list(
-    text: &str,
-    skips: &mut Vec<String>,
+    text: &str, skips: &mut Vec<String>,
 ) -> Result<Vec<TomlOutbound>, String> {
     // Try base64 decode first.
     let decoded = if text.trim().chars().all(|c| {
-        c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '=' || c == '\n' || c == '\r'
+        c.is_ascii_alphanumeric()
+            || c == '+'
+            || c == '/'
+            || c == '='
+            || c == '\n'
+            || c == '\r'
     }) && !text.contains("://")
     {
         // Looks like base64.
-        let cleaned: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+        let cleaned: String =
+            text.chars().filter(|c| !c.is_whitespace()).collect();
         base64::engine::general_purpose::STANDARD
             .decode(&cleaned)
             .ok()
@@ -1055,8 +1088,7 @@ fn parse_ss_uri(uri: &str, idx: &mut usize) -> Option<TomlOutbound> {
         base64::engine::general_purpose::STANDARD
             .decode(userinfo)
             .or_else(|_| {
-                base64::engine::general_purpose::URL_SAFE
-                    .decode(userinfo)
+                base64::engine::general_purpose::URL_SAFE.decode(userinfo)
             })
             .ok()
             .and_then(|b| String::from_utf8(b).ok())
@@ -1066,9 +1098,15 @@ fn parse_ss_uri(uri: &str, idx: &mut usize) -> Option<TomlOutbound> {
     let (method, password) = userinfo_decoded.split_once(':')?;
 
     // Split off name fragment
-    let (rest, name) = rest.split_once('#').map(|(r, n)| (r, n)).unwrap_or((rest, ""));
+    let (rest, name) = rest
+        .split_once('#')
+        .map(|(r, n)| (r, n))
+        .unwrap_or((rest, ""));
     // Split off query params
-    let (hostport, query) = rest.split_once('?').map(|(r, q)| (r, Some(q))).unwrap_or((rest, None));
+    let (hostport, query) = rest
+        .split_once('?')
+        .map(|(r, q)| (r, Some(q)))
+        .unwrap_or((rest, None));
 
     let hostport = hostport.trim();
     let name = name.trim();
@@ -1076,7 +1114,9 @@ fn parse_ss_uri(uri: &str, idx: &mut usize) -> Option<TomlOutbound> {
         *idx += 1;
         format!("ss-{}", idx)
     } else {
-        urlencoding::decode(name).map(|s| s.into_owned()).unwrap_or_else(|_| name.to_string())
+        urlencoding::decode(name)
+            .map(|s| s.into_owned())
+            .unwrap_or_else(|_| name.to_string())
     };
 
     let mut ob = TomlOutbound::new("shadowsocks", &name)
@@ -1108,9 +1148,15 @@ fn parse_ss_uri(uri: &str, idx: &mut usize) -> Option<TomlOutbound> {
 fn parse_vless_uri(uri: &str, idx: &mut usize) -> Option<TomlOutbound> {
     let (uuid, rest) = uri.split_once('@')?;
     // Split off name fragment
-    let (rest, name) = rest.split_once('#').map(|(r, n)| (r, n)).unwrap_or((rest, ""));
+    let (rest, name) = rest
+        .split_once('#')
+        .map(|(r, n)| (r, n))
+        .unwrap_or((rest, ""));
     // Split off query params
-    let (hostport, query) = rest.split_once('?').map(|(r, q)| (r, Some(q))).unwrap_or((rest, None));
+    let (hostport, query) = rest
+        .split_once('?')
+        .map(|(r, q)| (r, Some(q)))
+        .unwrap_or((rest, None));
 
     let hostport = hostport.trim();
     let name = name.trim();
@@ -1118,7 +1164,9 @@ fn parse_vless_uri(uri: &str, idx: &mut usize) -> Option<TomlOutbound> {
         *idx += 1;
         format!("vless-{}", idx)
     } else {
-        urlencoding::decode(name).map(|s| s.into_owned()).unwrap_or_else(|_| name.to_string())
+        urlencoding::decode(name)
+            .map(|s| s.into_owned())
+            .unwrap_or_else(|_| name.to_string())
     };
 
     let mut ob = TomlOutbound::new("vless", &name)
@@ -1139,7 +1187,11 @@ fn parse_vless_uri(uri: &str, idx: &mut usize) -> Option<TomlOutbound> {
                     has_ws = true;
                 }
             } else if let Some(val) = param.strip_prefix("path=") {
-                transport.ws_path = Some(urlencoding::decode(val).map(|s| s.into_owned()).unwrap_or_else(|_| val.to_string()));
+                transport.ws_path = Some(
+                    urlencoding::decode(val)
+                        .map(|s| s.into_owned())
+                        .unwrap_or_else(|_| val.to_string()),
+                );
             } else if let Some(val) = param.strip_prefix("host=") {
                 let mut h = HashMap::new();
                 h.insert("Host".to_string(), val.to_string());
@@ -1172,7 +1224,9 @@ fn is_html_response(content_type: Option<&str>, body: &[u8]) -> bool {
     // Some airports return `content-type: text/html` even for valid YAML/JSON
     // subscriptions, so content-type alone is not reliable.
     let prefix: Vec<u8> = body.iter().take(32).copied().collect();
-    let s = String::from_utf8_lossy(&prefix).trim_start().to_ascii_lowercase();
+    let s = String::from_utf8_lossy(&prefix)
+        .trim_start()
+        .to_ascii_lowercase();
     let body_is_html = s.starts_with("<!doctype") || s.starts_with("<html");
     if body_is_html {
         return true;
@@ -1198,7 +1252,7 @@ fn print_subscription_info(header: &str) {
                 "download" => download = val,
                 "total" => total = val,
                 "expire" => expire = val,
-                _ => {}
+                _ => {},
             }
         }
     }
@@ -1212,15 +1266,15 @@ fn print_subscription_info(header: &str) {
             used * 100 / total
         );
     }
-    if let Some(dt) = chrono::DateTime::from_timestamp(expire as i64, 0).filter(|_| expire > 0) {
+    if let Some(dt) =
+        chrono::DateTime::from_timestamp(expire as i64, 0).filter(|_| expire > 0)
+    {
         eprintln!("expire: {}", dt.format("%Y-%m-%d %H:%M:%S"));
     }
 }
 
 pub async fn run_subscription(
-    url: &str,
-    ua: &str,
-    output_path: &str,
+    url: &str, ua: &str, output_path: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("Fetching subscription: {url}");
     eprintln!("User-Agent: {ua}");
@@ -1231,21 +1285,16 @@ pub async fn run_subscription(
         let save_path = std::path::Path::new("sub_error.html");
         let saved = std::fs::write(&save_path, &resp.body).is_ok();
         let saved_msg = if saved {
-            format!(
-                "，响应内容已保存到 {}",
-                save_path.display()
-            )
+            format!("，响应内容已保存到 {}", save_path.display())
         } else {
             String::new()
         };
-        return Err(
-            format!(
-                "订阅返回了 HTML 页面（多为\"请升级客户端\"提示）。\
+        return Err(format!(
+            "订阅返回了 HTML 页面（多为\"请升级客户端\"提示）。\
                  可用 --sub-ua 指定一个被机场识别的 UA 后重试{}",
-                saved_msg
-            )
-            .into(),
-        );
+            saved_msg
+        )
+        .into());
     }
 
     if let Some(info) = resp.subscription_userinfo.as_deref() {

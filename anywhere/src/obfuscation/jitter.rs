@@ -4,6 +4,10 @@
 //! - `SizeJitter`: random chunk sizes for splitting payloads
 //! - `ConnBehaviorJitter`: randomized connection lifecycle parameters
 //! - `ConnLifecycle`: runtime state derived from `ConnBehaviorJitter`
+//!
+//! NOTE: These primitives are designed but not currently wired into any
+//! transport path. XHTTP packet-up implements its own interval logic in
+//! `upload_queue.rs`, and xmux reads `XmuxConfig` directly.
 
 use std::time::{Duration, Instant};
 
@@ -125,7 +129,10 @@ impl ConnBehaviorJitter {
             max_connections: self.max_connections.as_ref().map(|r| r.rand_u32()),
             max_concurrency: self.max_concurrency.as_ref().map(|r| r.rand_u32()),
             left_reuses: self.c_max_reuse_times.as_ref().map(|r| r.rand_u32()),
-            left_requests: self.h_max_request_times.as_ref().map(|r| r.rand_u32()),
+            left_requests: self
+                .h_max_request_times
+                .as_ref()
+                .map(|r| r.rand_u32()),
             reusable_until: self
                 .h_max_reusable_secs
                 .as_ref()
@@ -192,7 +199,11 @@ mod tests {
         let start = Instant::now();
         tj.wait().await;
         let elapsed = start.elapsed();
-        assert!(elapsed >= Duration::from_millis(40), "wait took {:?}", elapsed);
+        assert!(
+            elapsed >= Duration::from_millis(40),
+            "wait took {:?}",
+            elapsed
+        );
     }
 
     #[tokio::test]
@@ -203,7 +214,11 @@ mod tests {
         tj.wait().await;
         let elapsed = start.elapsed();
         // Should return almost immediately since 10ms already elapsed.
-        assert!(elapsed < Duration::from_millis(10), "should not sleep, took {:?}", elapsed);
+        assert!(
+            elapsed < Duration::from_millis(10),
+            "should not sleep, took {:?}",
+            elapsed
+        );
     }
 
     #[tokio::test]
@@ -215,7 +230,11 @@ mod tests {
         tj.wait().await;
         // After reset, should sleep the full 100ms.
         let elapsed = start.elapsed();
-        assert!(elapsed >= Duration::from_millis(90), "after reset took {:?}", elapsed);
+        assert!(
+            elapsed >= Duration::from_millis(90),
+            "after reset took {:?}",
+            elapsed
+        );
     }
 
     #[test]
@@ -250,10 +269,16 @@ mod tests {
             h_keep_alive_period: Some(Range::new(15, 60)),
         };
         let lc = cb.roll();
-        assert!(lc.max_connections.unwrap() >= 1 && lc.max_connections.unwrap() <= 5);
-        assert!(lc.max_concurrency.unwrap() >= 2 && lc.max_concurrency.unwrap() <= 10);
+        assert!(
+            lc.max_connections.unwrap() >= 1 && lc.max_connections.unwrap() <= 5
+        );
+        assert!(
+            lc.max_concurrency.unwrap() >= 2 && lc.max_concurrency.unwrap() <= 10
+        );
         assert!(lc.left_reuses.unwrap() >= 3 && lc.left_reuses.unwrap() <= 8);
-        assert!(lc.left_requests.unwrap() >= 10 && lc.left_requests.unwrap() <= 100);
+        assert!(
+            lc.left_requests.unwrap() >= 10 && lc.left_requests.unwrap() <= 100
+        );
         assert!(lc.reusable_until.is_some());
         assert!(lc.keep_alive_period.is_some());
         assert!(lc.is_reusable());
@@ -279,7 +304,10 @@ mod tests {
         };
         assert!(lc.is_reusable());
         lc.record_use();
-        assert!(!lc.is_reusable(), "should not be reusable after depleting left_reuses");
+        assert!(
+            !lc.is_reusable(),
+            "should not be reusable after depleting left_reuses"
+        );
     }
 
     #[test]
@@ -293,7 +321,10 @@ mod tests {
             keep_alive_period: None,
         };
         lc.record_use();
-        assert!(!lc.is_reusable(), "should not be reusable after depleting left_requests");
+        assert!(
+            !lc.is_reusable(),
+            "should not be reusable after depleting left_requests"
+        );
     }
 
     #[test]
@@ -306,7 +337,10 @@ mod tests {
             reusable_until: Some(Instant::now() - Duration::from_secs(1)),
             keep_alive_period: None,
         };
-        assert!(!lc.is_reusable(), "expired connection should not be reusable");
+        assert!(
+            !lc.is_reusable(),
+            "expired connection should not be reusable"
+        );
     }
 
     #[test]
