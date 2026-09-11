@@ -1,3 +1,4 @@
+use base64::Engine as _;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -43,6 +44,43 @@ impl OutboundRegistry {
         Ok(())
     }
 
+    /// Resolve `ech = true` into a concrete ECHConfigList for the TLS
+    /// outbounds that anywhere itself is the TLS client of (quic / anytls /
+    /// vless-over-ws-tls). Explicit `ech_config` (base64) always wins; with
+    /// only `ech = true` the config is acquired from the outbound host's DNS
+    /// HTTPS record through the `[dns].direct` upstreams (DoH first).
+    /// Acquisition failure disables ECH for that outbound with a warning —
+    /// the handshake path remains fail-closed on ECH rejection regardless
+    /// (see `ech::ensure_ech_accepted`). REALITY outbounds are skipped:
+    /// their borrowed-target SNI is the camouflage, and
+    /// `vless::validate_vless_config` rejects the combination anyway.
+    async fn resolve_outbound_ech(cfg: &OutboundConfig, config: &Config) -> OutboundConfig {
+        if !cfg.ech || cfg.ech_config.is_some() || cfg.reality.is_some() {
+            return cfg.clone();
+        }
+        if cfg.type_ != "vless" && cfg.type_ != "anytls" && cfg.type_ != "quic" {
+            return cfg.clone();
+        }
+        let host = match crate::outbound::common::resolve_sni(cfg) {
+            Ok(host) => host,
+            Err(_) => return cfg.clone(),
+        };
+        match crate::ech::acquire_outbound_config(
+            &host, true, None, &config.dns.direct,
+        )
+        .await
+        {
+            Some(bytes) => {
+                let mut resolved = cfg.clone();
+                resolved.ech_config = Some(
+                    base64::engine::general_purpose::STANDARD.encode(bytes),
+                );
+                resolved
+            },
+            None => cfg.clone(),
+        }
+    }
+
     fn clients_from_direct_configs(
         configs: &[OutboundConfig],
         tls_fragment: Option<crate::tlsfragment::FragmentConfig>,
@@ -82,32 +120,35 @@ impl OutboundRegistry {
             )?;
 
         for cfg in config.outbounds.iter().filter(|o| o.type_ == "quic") {
-            let client = QuicOutboundClient::from_config(vec![cfg]).await?;
-            clients.insert(Self::tag(cfg)?.to_string(), Arc::new(client));
+            let cfg = Self::resolve_outbound_ech(cfg, config).await;
+            let client = QuicOutboundClient::from_config(vec![&cfg]).await?;
+            clients.insert(Self::tag(&cfg)?.to_string(), Arc::new(client));
         }
 
         for cfg in config.outbounds.iter().filter(|o| o.type_ == "anytls") {
-            match AnyTlsOutboundClient::from_config(vec![cfg]).await {
+            let cfg = Self::resolve_outbound_ech(cfg, config).await;
+            match AnyTlsOutboundClient::from_config(vec![&cfg]).await {
                 Ok(client) => {
-                    clients.insert(Self::tag(cfg)?.to_string(), Arc::new(client));
+                    clients.insert(Self::tag(&cfg)?.to_string(), Arc::new(client));
                 },
                 Err(e) => {
                     log::error!(
                         "failed to init anytls outbound '{}': {e}",
-                        Self::tag(cfg).unwrap_or("?"),
+                        Self::tag(&cfg).unwrap_or("?"),
                     );
                 },
             }
         }
         for cfg in config.outbounds.iter().filter(|o| o.type_ == "vless") {
-            match VlessOutboundClient::from_config(vec![cfg]).await {
+            let cfg = Self::resolve_outbound_ech(cfg, config).await;
+            match VlessOutboundClient::from_config(vec![&cfg]).await {
                 Ok(client) => {
-                    clients.insert(Self::tag(cfg)?.to_string(), Arc::new(client));
+                    clients.insert(Self::tag(&cfg)?.to_string(), Arc::new(client));
                 },
                 Err(e) => {
                     log::error!(
                         "failed to init vless outbound '{}': {e}",
-                        Self::tag(cfg).unwrap_or("?"),
+                        Self::tag(&cfg).unwrap_or("?"),
                     );
                 },
             }
@@ -116,12 +157,12 @@ impl OutboundRegistry {
         for cfg in config.outbounds.iter().filter(|o| o.type_ == "ssh") {
             match SshOutboundClient::from_config(cfg).await {
                 Ok(client) => {
-                    clients.insert(Self::tag(cfg)?.to_string(), Arc::new(client));
+                    clients.insert(Self::tag(&cfg)?.to_string(), Arc::new(client));
                 },
                 Err(e) => {
                     log::error!(
                         "failed to init ssh outbound '{}': {e}",
-                        Self::tag(cfg).unwrap_or("?"),
+                        Self::tag(&cfg).unwrap_or("?"),
                     );
                 },
             }
@@ -130,12 +171,12 @@ impl OutboundRegistry {
         for cfg in config.outbounds.iter().filter(|o| o.type_ == "mless") {
             match MlessOutboundClient::from_config(vec![cfg]).await {
                 Ok(client) => {
-                    clients.insert(Self::tag(cfg)?.to_string(), Arc::new(client));
+                    clients.insert(Self::tag(&cfg)?.to_string(), Arc::new(client));
                 },
                 Err(e) => {
                     log::error!(
                         "failed to init mless outbound '{}': {e}",
-                        Self::tag(cfg).unwrap_or("?"),
+                        Self::tag(&cfg).unwrap_or("?"),
                     );
                 },
             }
@@ -144,12 +185,12 @@ impl OutboundRegistry {
         for cfg in config.outbounds.iter().filter(|o| o.type_ == "shadowsocks") {
             match ShadowsocksOutboundClient::from_config(cfg).await {
                 Ok(client) => {
-                    clients.insert(Self::tag(cfg)?.to_string(), Arc::new(client));
+                    clients.insert(Self::tag(&cfg)?.to_string(), Arc::new(client));
                 },
                 Err(e) => {
                     log::error!(
                         "failed to init shadowsocks outbound '{}': {e}",
-                        Self::tag(cfg).unwrap_or("?"),
+                        Self::tag(&cfg).unwrap_or("?"),
                     );
                 },
             }
@@ -378,6 +419,9 @@ mod tests {
             min_idle_session: None,
             xmux: None,
             transport: None,
+            flow: None,
+            reality: None,
+            ech: false,
             tls_fragment: false,
             tls_fragment_config: None,
             uot: false,

@@ -20,12 +20,15 @@ use crate::outbound::common::apply_fingerprint_to_ctx;
 pub struct FingerprintHook {
     /// Optional base64-encoded ECH config list for the server.
     pub ech_config: Option<Vec<u8>>,
+    /// Offer a GREASE ECH extension when no real config is available, so
+    /// "carries an ECH extension" is not a client distinguisher.
+    pub ech_grease: bool,
 }
 
 impl FingerprintHook {
     /// Creates a new [`FingerprintHook`], optionally decoding a base64 ECH
     /// config.
-    pub fn new(ech_config_b64: Option<String>) -> Self {
+    pub fn new(ech_config_b64: Option<String>, ech_grease: bool) -> Self {
         let ech_config = ech_config_b64.and_then(|s| {
             use base64::Engine as _;
             base64::engine::general_purpose::STANDARD
@@ -34,16 +37,16 @@ impl FingerprintHook {
                 .ok()
         });
 
-        Self { ech_config }
+        Self { ech_config, ech_grease }
     }
 
     /// Boxes this hook into an optional [`Arc`] suitable for
     /// [`Hooks`](tokio_quiche::settings::Hooks).
     pub fn into_arc_option(
-        fp: bool, ech_config: Option<String>,
+        fp: bool, ech_config: Option<String>, ech: bool,
     ) -> Option<Arc<dyn ConnectionHook + Send + Sync + 'static>> {
-        if fp {
-            Some(Arc::new(Self::new(ech_config)))
+        if fp || ech {
+            Some(Arc::new(Self::new(ech_config, ech)))
         } else {
             None
         }
@@ -76,6 +79,11 @@ impl ConnectionHook for FingerprintHook {
         }
 
         // ECH (Encrypted Client Hello).
+        if self.ech_grease && self.ech_config.is_none() {
+            // No published config: send a grease offer so "carries ECH" is
+            // not a client distinguisher (Chrome does the same).
+            ssl.set_enable_ech_grease(true);
+        }
         if let Some(ref ech) = self.ech_config {
             if let Err(e) = ssl.set_ech_config_list(ech) {
                 log::warn!("Failed to set ECH config list: {e:?}");

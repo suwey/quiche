@@ -73,6 +73,8 @@ pub struct QuicOutboundClient {
     fp: bool,
     /// Optional ECH config (base64) for reconnect.
     ech_config: Option<String>,
+    /// Offer a GREASE ECH extension when no real config is published.
+    ech: bool,
 }
 
 impl QuicOutboundClient {
@@ -123,6 +125,7 @@ impl QuicOutboundClient {
             connection_hook: FingerprintHook::into_arc_option(
                 config.fp,
                 config.ech_config.clone(),
+                config.ech,
             ),
         };
         let params = ConnectionParams::new_client(quic_settings, None, hooks);
@@ -159,6 +162,7 @@ impl QuicOutboundClient {
             server_host: server_host.to_string(),
             fp: config.fp,
             ech_config: config.ech_config.clone(),
+            ech: config.ech,
         })
     }
 
@@ -254,6 +258,7 @@ impl QuicOutboundClient {
             connection_hook: FingerprintHook::into_arc_option(
                 self.fp,
                 self.ech_config.clone(),
+                self.ech,
             ),
         };
         let params = ConnectionParams::new_client(quic_settings, None, hooks);

@@ -1,0 +1,346 @@
+diff --git a/src/include/openssl/ssl.h b/src/include/openssl/ssl.h
+index f9683f4..0564793 100644
+--- a/src/include/openssl/ssl.h
++++ b/src/include/openssl/ssl.h
+@@ -232,6 +232,57 @@ OPENSSL_EXPORT SSL_CTX *SSL_get_SSL_CTX(const SSL *ssl);
+ // SSL_set_connect_state configures |ssl| to be a client.
+ OPENSSL_EXPORT void SSL_set_connect_state(SSL *ssl);
+ 
++// SSL_set_client_session_id_override configures |ssl|, a client, to send |id|
++// as the legacy session_id of its ClientHello instead of a random value.
++// REALITY-style transports carry authentication data in this field. The
++// override is applied before the ClientHello enters the handshake transcript,
++// so the handshake remains verifiable. |id_len| must be at most
++// |SSL_MAX_SSL_SESSION_ID_LENGTH|; a zero |id_len| clears any override. Call
++// it before starting the handshake.
++OPENSSL_EXPORT void SSL_set_client_session_id_override(SSL *ssl,
++                                                       const uint8_t *id,
++                                                       size_t id_len);
++
++// SSL_client_key_share_x25519 computes the X25519 shared secret between the
++// bare X25519 key share this client generated for its ClientHello and
++// |peer_pub| (32 bytes), writing 32 bytes to |out_shared|. The private key is
++// captured when the ClientHello is built, so the call works at any point
++// during or after the handshake (e.g. from the certificate verification
++// callback). REALITY-style transports use it to derive their authentication
++// key. Returns 1 on success and 0 on failure (no X25519 key share).
++OPENSSL_EXPORT int SSL_client_key_share_x25519(SSL *ssl,
++                                               const uint8_t *peer_pub,
++                                               uint8_t *out_shared);
++
++// SSL_set_reality_client_hello_params configures |ssl|, a client, to derive
++// its ClientHello legacy session_id at handshake time the way XTLS REALITY
++// does: the 16-byte plaintext |client_ver| (3 bytes) || 0x00 ||
++// big-endian |timestamp| || |short_id| (8 bytes) is AES-256-GCM-sealed under
++// AuthKey = HKDF-SHA256(ikm = X25519(client X25519 key share private,
++// |reality_pub|), salt = ClientRandom[:20], info = "REALITY"), and the
++// resulting 16-byte ciphertext plus 16-byte tag fills the 32-byte session_id.
++// The rewrite happens in ssl_add_client_hello once every ClientHello byte is
++// final but before the message enters the handshake transcript; the AEAD acts
++// as if the session_id field were zeroed (it is zeroed in the AAD). Because
++// the ClientRandom and key share only exist once the hello is built, the
++// derivation must happen inside the library — a fixed override (see
++// SSL_set_client_session_id_override) cannot express it. Takes precedence
++// over SSL_set_client_session_id_override. Requires a TLS 1.3 connection that
++// carries the 32-byte middlebox-compatibility session_id (non-QUIC); the
++// handshake fails otherwise. REALITY-style certificate verification then uses
++// SSL_client_key_share_x25519 in the certificate callback. Returns 1 on
++// success and 0 on invalid arguments. Call it before starting the handshake.
++//
++// Note on HelloRetryRequest: ssl_add_client_hello is also the second-ClientHello
++// path after an HRR, and ssl_setup_key_shares has re-captured the (possibly
++// new) key share private by then, so the rederived session_id always matches
++// the key share of the hello it is embedded in. Xray's REALITY server prefers
++// the bare X25519 share, and boring's client always offers one, so in practice
++// an HRR never invalidates a session_id the server has already authenticated.
++OPENSSL_EXPORT int SSL_set_reality_client_hello_params(
++    SSL *ssl, const uint8_t *reality_pub, const uint8_t *short_id,
++    uint32_t timestamp, const uint8_t *client_ver);
++
+ // SSL_set_accept_state configures |ssl| to be a server.
+ OPENSSL_EXPORT void SSL_set_accept_state(SSL *ssl);
+ 
+diff --git a/src/ssl/extensions.cc b/src/ssl/extensions.cc
+index aae3e6a..a592132 100644
+--- a/src/ssl/extensions.cc
++++ b/src/ssl/extensions.cc
+@@ -2327,6 +2327,18 @@ bool ssl_setup_key_shares(SSL_HANDSHAKE *hs, uint16_t override_group_id) {
+       !hs->key_shares[0]->Generate(&key_exchange)) {
+     return false;
+   }
++  if (hs->key_shares[0]->GroupID() == SSL_CURVE_X25519) {
++    // Keep the ephemeral private for REALITY-style post-ServerHello use
++    // (hs->key_shares is reset once the ServerHello is processed).
++    bssl::ScopedCBB priv_cbb;
++    if (CBB_init(priv_cbb.get(), 32) &&
++        hs->key_shares[0]->SerializePrivateKey(priv_cbb.get()) &&
++        CBB_len(priv_cbb.get()) == sizeof(ssl->client_x25519_priv)) {
++      OPENSSL_memcpy(ssl->client_x25519_priv, CBB_data(priv_cbb.get()),
++                     sizeof(ssl->client_x25519_priv));
++      ssl->has_client_x25519_priv = 1;
++    }
++  }
+ 
+   if (second_group_id != 0) {
+     hs->key_shares[1] = SSLKeyShare::Create(second_group_id);
+@@ -2336,6 +2348,16 @@ bool ssl_setup_key_shares(SSL_HANDSHAKE *hs, uint16_t override_group_id) {
+         !hs->key_shares[1]->Generate(&key_exchange)) {
+       return false;
+     }
++    if (hs->key_shares[1]->GroupID() == SSL_CURVE_X25519) {
++      bssl::ScopedCBB priv_cbb;
++      if (CBB_init(priv_cbb.get(), 32) &&
++          hs->key_shares[1]->SerializePrivateKey(priv_cbb.get()) &&
++          CBB_len(priv_cbb.get()) == sizeof(ssl->client_x25519_priv)) {
++        OPENSSL_memcpy(ssl->client_x25519_priv, CBB_data(priv_cbb.get()),
++                       sizeof(ssl->client_x25519_priv));
++        ssl->has_client_x25519_priv = 1;
++      }
++    }
+   }
+ 
+   return CBBFinishArray(cbb.get(), &hs->key_share_bytes);
+diff --git a/src/ssl/handshake_client.cc b/src/ssl/handshake_client.cc
+index 971ebd0..ca1ed6a 100644
+--- a/src/ssl/handshake_client.cc
++++ b/src/ssl/handshake_client.cc
+@@ -162,6 +162,7 @@
+ #include <openssl/ecdsa.h>
+ #include <openssl/err.h>
+ #include <openssl/evp.h>
++#include <openssl/hkdf.h>
+ #include <openssl/hpke.h>
+ #include <openssl/md5.h>
+ #include <openssl/mem.h>
+@@ -335,6 +336,97 @@ bool ssl_write_client_hello_without_extensions(const SSL_HANDSHAKE *hs,
+   return true;
+ }
+ 
++// ssl_apply_reality_session_id rewrites the legacy session_id of the finished
++// ClientHello |msg| with the XTLS REALITY authentication payload (see
++// SSL_set_reality_client_hello_params in ssl.h).
++//
++// Layout (offsets within the handshake message): the 1-byte session_id length
++// sits at 38 and the session_id at 39 (4-byte handshake header + 2-byte
++// legacy_version + 32-byte random). The plaintext is 16 bytes: client version
++// (3) || 0x00 || big-endian unix timestamp (4) || short_id (8). It is sealed
++// with AES-256-GCM under AuthKey = HKDF-SHA256(ikm = X25519(client key share
++// private, REALITY public), salt = ClientRandom[:20], info = "REALITY"), the
++// nonce is ClientRandom[20..32], and the AAD is the full ClientHello with the
++// session_id field zeroed. The 16-byte ciphertext plus the 16-byte tag
++// exactly fills the 32-byte session_id field.
++//
++// This must run after all ClientHello bytes are final (the AAD covers every
++// extension, key share included — hence the loop: ClientRandom and the key
++// share private only exist inside the library) and before the message enters
++// the handshake transcript, which ssl_add_client_hello satisfies by calling
++// it between finish_message() and add_message(). ssl_add_client_hello is also
++// the HelloRetryRequest second-ClientHello path: ssl_setup_key_shares() has
++// already re-captured the (possibly new) key share private by then, so the
++// session_id is rederived from the key share actually being sent.
++static bool ssl_apply_reality_session_id(SSL_HANDSHAKE *hs,
++                                         bssl::Span<uint8_t> msg) {
++  SSL *const ssl = hs->ssl;
++  // REALITY needs the TLS 1.3 middlebox-compatibility 32-byte session_id,
++  // which is absent on QUIC and renegotiation; fail loudly rather than send
++  // an unauthenticated hello.
++  if (msg.size() < 39 + 32 || msg[38] != 32) {
++    return false;
++  }
++  if (!ssl->has_client_x25519_priv) {
++    return false;
++  }
++  uint8_t shared[32];
++  if (!X25519(shared, ssl->client_x25519_priv, ssl->reality_pub)) {
++    return false;
++  }
++  uint8_t auth_key[32];
++  if (!HKDF(auth_key, sizeof(auth_key), EVP_sha256(), shared, sizeof(shared),
++            ssl->s3->client_random, 20,
++            reinterpret_cast<const uint8_t *>("REALITY"), 7)) {
++    return false;
++  }
++
++  uint8_t plaintext[16];
++  plaintext[0] = ssl->reality_client_ver[0];
++  plaintext[1] = ssl->reality_client_ver[1];
++  plaintext[2] = ssl->reality_client_ver[2];
++  plaintext[3] = 0;
++  plaintext[4] = static_cast<uint8_t>(ssl->reality_timestamp >> 24);
++  plaintext[5] = static_cast<uint8_t>(ssl->reality_timestamp >> 16);
++  plaintext[6] = static_cast<uint8_t>(ssl->reality_timestamp >> 8);
++  plaintext[7] = static_cast<uint8_t>(ssl->reality_timestamp);
++  OPENSSL_memcpy(plaintext + 8, ssl->reality_short_id,
++                 sizeof(ssl->reality_short_id));
++
++  // AAD: the full ClientHello with the session_id field zeroed.
++  bssl::Array<uint8_t> aad;
++  if (!aad.CopyFrom(msg)) {
++    return false;
++  }
++  OPENSSL_memset(aad.data() + 39, 0, 32);
++
++  uint8_t nonce[12];
++  OPENSSL_memcpy(nonce, ssl->s3->client_random + 20, sizeof(nonce));
++  EVP_AEAD_CTX aead;
++  EVP_AEAD_CTX_zero(&aead);
++  if (!EVP_AEAD_CTX_init(&aead, EVP_aead_aes_256_gcm(), auth_key,
++                         sizeof(auth_key), EVP_AEAD_DEFAULT_TAG_LENGTH,
++                         nullptr)) {
++    return false;
++  }
++  size_t out_len = 0;
++  const bool ok =
++      EVP_AEAD_CTX_seal(&aead, msg.data() + 39, &out_len, 32, nonce,
++                        sizeof(nonce), plaintext, sizeof(plaintext),
++                        aad.data(), aad.size()) == 1 &&
++      out_len == 32;
++  EVP_AEAD_CTX_cleanup(&aead);
++  if (!ok) {
++    return false;
++  }
++
++  // Keep hs->session_id consistent with the bytes actually sent (the hello
++  // may be rebuilt, e.g. after a HelloRetryRequest).
++  OPENSSL_memcpy(hs->session_id, msg.data() + 39, 32);
++  hs->session_id_len = 32;
++  return true;
++}
++
+ bool ssl_add_client_hello(SSL_HANDSHAKE *hs) {
+   SSL *const ssl = hs->ssl;
+   ScopedCBB cbb;
+@@ -353,6 +445,16 @@ bool ssl_add_client_hello(SSL_HANDSHAKE *hs) {
+     return false;
+   }
+ 
++  // REALITY-style transports derive the session_id from this connection's
++  // ClientRandom and key share, so it can only be written once every hello
++  // byte is final. Rewrite it here — before the PSK binder (which must cover
++  // the final bytes) and before add_message() updates the transcript / sends.
++  if (ssl->has_reality_params && type != ssl_client_hello_inner) {
++    if (!ssl_apply_reality_session_id(hs, MakeSpan(msg))) {
++      return false;
++    }
++  }
++
+   // Now that the length prefixes have been computed, fill in the placeholder
+   // PSK binder.
+   if (needs_psk_binder) {
+@@ -516,7 +618,13 @@ static enum ssl_hs_wait_t do_start_connect(SSL_HANDSHAKE *hs) {
+                                 ssl->session->ticket.empty();
+     const bool has_ticket_session =
+         ssl->session != nullptr && !ssl->session->ticket.empty();
+-    if (has_id_session) {
++    if (ssl->client_session_id_len > 0) {
++      // Caller-provided legacy session_id (REALITY-style auth carrier),
++      // applied before the ClientHello enters the handshake transcript.
++      hs->session_id_len = ssl->client_session_id_len;
++      OPENSSL_memcpy(hs->session_id, ssl->client_session_id,
++                     hs->session_id_len);
++    } else if (has_id_session) {
+       hs->session_id_len = ssl->session->session_id_length;
+       OPENSSL_memcpy(hs->session_id, ssl->session->session_id,
+                      hs->session_id_len);
+diff --git a/src/ssl/internal.h b/src/ssl/internal.h
+index 1e6da21..268d2c0 100644
+--- a/src/ssl/internal.h
++++ b/src/ssl/internal.h
+@@ -3826,6 +3826,37 @@ struct ssl_st {
+   // quic_method is the method table corresponding to the QUIC hooks.
+   const SSL_QUIC_METHOD *quic_method = nullptr;
+ 
++  // client_session_id, when client_session_id_len is non-zero, overrides the
++  // legacy session_id the client sends in its ClientHello (the TLS 1.3
++  // middlebox-compatibility field). REALITY-style transports use it to carry
++  // authentication data. It must be set before the handshake starts and is
++  // consumed before the ClientHello enters the handshake transcript. See
++  // SSL_set_client_session_id_override().
++  uint8_t client_session_id[SSL_MAX_SSL_SESSION_ID_LENGTH] = {0};
++  uint8_t client_session_id_len = 0;
++
++  // client_x25519_priv captures the private key of the bare X25519 key share
++  // generated for the ClientHello (see ssl_setup_key_shares). hs->key_shares
++  // is reset once the ServerHello is processed, but REALITY-style transports
++  // need the ephemeral private later (certificate verification callback), so
++  // it is kept here for the lifetime of the SSL object. See
++  // SSL_client_key_share_x25519().
++  uint8_t client_x25519_priv[32] = {0};
++  int has_client_x25519_priv = 0;
++
++  // REALITY-style ClientHello session_id derivation parameters, set via
++  // SSL_set_reality_client_hello_params(). When |has_reality_params| is set,
++  // ssl_add_client_hello() rewrites the legacy session_id of the finished
++  // ClientHello (before it enters the transcript) with the REALITY
++  // authentication payload sealed under a key derived from this connection's
++  // X25519 key share. See ssl_apply_reality_session_id() in
++  // handshake_client.cc.
++  uint8_t reality_pub[32] = {0};
++  uint8_t reality_short_id[8] = {0};
++  uint32_t reality_timestamp = 0;
++  uint8_t reality_client_ver[3] = {0};
++  int has_reality_params = 0;
++
+   // renegotiate_mode controls how peer renegotiation attempts are handled.
+   ssl_renegotiate_mode_t renegotiate_mode = ssl_renegotiate_never;
+ 
+diff --git a/src/ssl/ssl_lib.cc b/src/ssl/ssl_lib.cc
+index 9eb201d..f85fdc3 100644
+--- a/src/ssl/ssl_lib.cc
++++ b/src/ssl/ssl_lib.cc
+@@ -148,6 +148,7 @@
+ #include <string.h>
+ 
+ #include <openssl/bytestring.h>
++#include <openssl/curve25519.h>
+ #include <openssl/crypto.h>
+ #include <openssl/err.h>
+ #include <openssl/lhash.h>
+@@ -726,6 +727,47 @@ void SSL_set_connect_state(SSL *ssl) {
+   ssl->do_handshake = ssl_client_handshake;
+ }
+ 
++void SSL_set_client_session_id_override(SSL *ssl, const uint8_t *id,
++                                        size_t id_len) {
++  if (ssl == nullptr || (id == nullptr && id_len != 0) ||
++      id_len > sizeof(ssl->client_session_id)) {
++    return;
++  }
++  if (id_len == 0) {
++    ssl->client_session_id_len = 0;
++    return;
++  }
++  OPENSSL_memcpy(ssl->client_session_id, id, id_len);
++  ssl->client_session_id_len = static_cast<uint8_t>(id_len);
++}
++
++int SSL_client_key_share_x25519(SSL *ssl, const uint8_t *peer_pub,
++                                uint8_t *out_shared) {
++  if (ssl == nullptr || peer_pub == nullptr || out_shared == nullptr ||
++      !ssl->has_client_x25519_priv) {
++    return 0;
++  }
++  return X25519(out_shared, ssl->client_x25519_priv, peer_pub) == 1;
++}
++
++int SSL_set_reality_client_hello_params(SSL *ssl, const uint8_t *reality_pub,
++                                        const uint8_t *short_id,
++                                        uint32_t timestamp,
++                                        const uint8_t *client_ver) {
++  if (ssl == nullptr || reality_pub == nullptr || short_id == nullptr ||
++      client_ver == nullptr) {
++    return 0;
++  }
++  OPENSSL_memcpy(ssl->reality_pub, reality_pub, sizeof(ssl->reality_pub));
++  OPENSSL_memcpy(ssl->reality_short_id, short_id,
++                 sizeof(ssl->reality_short_id));
++  ssl->reality_timestamp = timestamp;
++  OPENSSL_memcpy(ssl->reality_client_ver, client_ver,
++                 sizeof(ssl->reality_client_ver));
++  ssl->has_reality_params = 1;
++  return 1;
++}
++
+ void SSL_set_accept_state(SSL *ssl) {
+   ssl->server = true;
+   ssl->do_handshake = ssl_server_handshake;

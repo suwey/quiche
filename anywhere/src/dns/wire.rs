@@ -207,6 +207,13 @@ pub fn build_refused_response(query: &[u8]) -> Option<Vec<u8>> {
 /// Build a minimal A-record DNS query (txn id 0, RD=1) for `name`. Used for
 /// bootstrap resolution of DoH hostnames via plain UDP.
 pub fn build_a_query(name: &str) -> Vec<u8> {
+    build_dns_query(name, 1)
+}
+
+/// Build a minimal DNS query (txn id 0, RD=1, QDCOUNT=1) for `name`/`qtype`/
+/// IN. Used by the bootstrap path (A) and by `ech` (HTTPS/type 65 for ECH
+/// config bootstrap).
+pub fn build_dns_query(name: &str, qtype: u16) -> Vec<u8> {
     let mut v = vec![0u8; 12];
     v[2] = 0x01;
     v[3] = 0x00; // RD=1
@@ -220,7 +227,7 @@ pub fn build_a_query(name: &str) -> Vec<u8> {
         v.extend_from_slice(label.as_bytes());
     }
     v.push(0); // root label
-    v.extend_from_slice(&1u16.to_be_bytes()); // QTYPE = A
+    v.extend_from_slice(&qtype.to_be_bytes()); // QTYPE
     v.extend_from_slice(&1u16.to_be_bytes()); // QCLASS = IN
     v
 }

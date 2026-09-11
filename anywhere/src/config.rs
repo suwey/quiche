@@ -125,7 +125,7 @@ pub struct WsConfig {
 }
 
 /// Nested transport configuration.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct TransportConfig {
     #[serde(rename = "type")]
     pub type_: String,
@@ -133,7 +133,7 @@ pub struct TransportConfig {
     pub xhttp: Option<crate::transport::xhttp::config::XhttpConfig>,
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Default)]
 pub struct OutboundConfig {
     #[serde(rename = "type")]
     pub type_: String,
@@ -174,6 +174,16 @@ pub struct OutboundConfig {
 
     pub ech_config: Option<String>,
 
+    /// Offer ECH (Encrypted Client Hello) on this outbound's TLS handshakes.
+    /// The ECHConfigList is acquired from the outbound host's DNS HTTPS
+    /// record (type 65) through anywhere's DNS upstreams; an explicit
+    /// `ech_config` value overrides the DNS lookup. When the server rejects
+    /// the offer the connection fails closed (no plaintext-SNI fallback).
+    /// Default: false. Not valid on REALITY outbounds (their borrowed-target
+    /// SNI is the camouflage itself).
+    #[serde(default)]
+    pub ech: bool,
+
     /// Enable TLS ClientHello fragmentation with jitter to evade DPI SNI matching.
     /// Default: true. Fragments the first TLS write across multiple TCP
     /// segments with random sizes and delays.
@@ -209,6 +219,14 @@ pub struct OutboundConfig {
     /// Nested transport config.
     #[serde(default)]
     pub transport: Option<TransportConfig>,
+    /// VLESS flow control ("xtls-rprx-vision"). Only sent on TCP requests;
+    /// requires the `reality` section.
+    #[serde(default)]
+    pub flow: Option<String>,
+    /// REALITY transport section — its presence enables the REALITY transport
+    /// for this outbound (replaces the WS transport; no `[transport]` needed).
+    #[serde(default)]
+    pub reality: Option<crate::transport::reality::RealityConfig>,
 
     // --- anytls session pool ---
     /// How often the pool cleanup task runs (seconds, default: 60).

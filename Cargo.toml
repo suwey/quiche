@@ -13,7 +13,7 @@ members = [
   "task-killswitch",
   "tokio-quiche",
 ]
-exclude = ["fuzz", "tools/http3_test"]
+exclude = ["fuzz", "tools/http3_test", "third_party/boring-sys"]
 resolver = "2"
 
 [workspace.package]
@@ -90,3 +90,13 @@ debug = true
 
 [profile.release]
 strip = true
+
+# Vendored boring-sys 4.22.0 (crates.io package contents) carrying the REALITY
+# client session-id-override patch:
+#   third_party/boring-sys/patches/reality-session-id.patch
+# Adds SSL_set_client_session_id_override() so a TLS client can supply the
+# ClientHello legacy session_id (REALITY's auth carrier) before the handshake
+# transcript is hashed. Purely additive — behavior changes only when the new
+# API is explicitly called; see anywhere/docs/vless-reality-wire-notes.md §S0.
+[patch.crates-io]
+boring-sys = { path = "third_party/boring-sys" }

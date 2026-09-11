@@ -14,6 +14,7 @@
 
 pub mod doh;
 pub mod fakeip_filter;
+pub mod https_record;
 pub mod upstream;
 pub mod wire;
 
@@ -309,23 +310,13 @@ impl DnsHijack {
         writer: TunWriter, reverse_cache: Arc<ReverseDnsCache>,
         shutdown: CancellationToken,
     ) -> Result<Self, String> {
-        let mut direct_upstreams = parse_upstreams_ordered(&config.direct)?;
-
-        // DoH needs a plain UDP bootstrap resolver (to resolve the DoH server
-        // hostname itself without recursing into DoH). If the direct group
-        // has no plain IP upstream, inject the default (223.5.5.5) so the
-        // bootstrap path always works. The injected upstream also serves as
-        // the plain UDP fallback when DoH fails or is disabled.
-        if !direct_upstreams
-            .iter()
-            .any(|u| matches!(u, Upstream::Plain(_)))
-        {
-            log::info!(
-                "DNS: no plain IP upstream in `direct`, injecting 223.5.5.5 \
-                 as DoH bootstrap + fallback"
-            );
-            direct_upstreams.push(parse_upstream("223.5.5.5")?);
-        }
+        // Bootstrap rule shared with the ECH config lookup
+        // (dns::https_record::with_plain_bootstrap): DoH needs a plain UDP
+        // resolver for its own hostname, and the same address doubles as the
+        // plain fallback when DoH fails or is disabled.
+        let direct_upstreams = crate::dns::https_record::with_plain_bootstrap(
+            parse_upstreams_ordered(&config.direct)?,
+        );
 
         // remote group: DoH over the proxy outbound is not supported, but
         // we reuse the `direct` DoH upstreams to resolve remote domains via

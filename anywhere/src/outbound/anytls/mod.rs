@@ -778,6 +778,9 @@ pub struct AnyTlsOutboundClient {
     fp: bool,
     insecure: bool,
     fragment: Option<FragmentConfig>,
+    /// ECH offer for TLS handshakes (config / grease / none, derived from
+    /// `ech` + registry-resolved `ech_config`).
+    ech: crate::ech::EchOffer<'static>,
     tcp_pool: Arc<SessionPool>,
     udp_pool: Arc<SessionPool>,
     /// Cached padding scheme shared across TCP and UDP sessions.
@@ -805,6 +808,10 @@ impl AnyTlsOutboundClient {
         let pool_config = SessionPoolConfig::from_outbound_config(config);
         let tcp_pool = SessionPool::new(pool_config.clone());
         let udp_pool = SessionPool::new(pool_config);
+        let ech = crate::ech::EchOffer::for_outbound(
+            config.ech,
+            config.ech_config.as_deref(),
+        );
 
         // Eagerly create one TLS session before TUN comes up, so the
         // initial TCP connection uses normal routing (not TUN). If this
@@ -816,6 +823,7 @@ impl AnyTlsOutboundClient {
             config.fp,
             config.insecure,
             fragment.as_ref(),
+            &ech,
             padding_cache.clone(),
         ) {
             tcp_pool.entries.lock().unwrap().push(SessionPoolEntry {
@@ -832,6 +840,7 @@ impl AnyTlsOutboundClient {
             fp: config.fp,
             insecure: config.insecure,
             fragment,
+            ech,
             tcp_pool,
             udp_pool,
             padding_cache,
@@ -851,6 +860,7 @@ impl AnyTlsOutboundClient {
         let fp = self.fp;
         let insecure = self.insecure;
         let frag = self.fragment.clone();
+        let ech = self.ech.clone();
         let pc = self.padding_cache.clone();
         self.tcp_pool.spawn_cleanup(move || {
             Self::create_session_inner(
@@ -860,6 +870,7 @@ impl AnyTlsOutboundClient {
                 fp,
                 insecure,
                 frag.as_ref(),
+                &ech,
                 pc.clone(),
             )
         });
@@ -870,6 +881,7 @@ impl AnyTlsOutboundClient {
         let fp = self.fp;
         let insecure = self.insecure;
         let frag = self.fragment.clone();
+        let ech = self.ech.clone();
         let pc = self.padding_cache.clone();
         self.udp_pool.spawn_cleanup(move || {
             Self::create_session_inner(
@@ -879,6 +891,7 @@ impl AnyTlsOutboundClient {
                 fp,
                 insecure,
                 frag.as_ref(),
+                &ech,
                 pc.clone(),
             )
         });
@@ -894,6 +907,7 @@ impl AnyTlsOutboundClient {
             self.fp,
             self.insecure,
             self.fragment.as_ref(),
+            &self.ech,
             self.padding_cache.clone(),
         )
     }
@@ -903,6 +917,7 @@ impl AnyTlsOutboundClient {
     fn create_session_inner(
         addr: std::net::SocketAddr, sni: &str, password: &str, fp: bool,
         insecure: bool, fragment: Option<&FragmentConfig>,
+        ech: &crate::ech::EchOffer<'static>,
         padding_cache: Arc<StdMutex<PaddingCache>>,
     ) -> std::io::Result<SessionHandle> {
         let (control_tx, control_rx) = mpsc::unbounded_channel();
@@ -928,6 +943,7 @@ impl AnyTlsOutboundClient {
         let sni = sni.to_string();
         let password = password.to_string();
         let frag = fragment.cloned();
+        let ech = ech.clone();
 
         tokio::task::spawn_blocking(move || {
             let tcp = match connect_tcp_bypass_sync(addr) {
@@ -939,7 +955,7 @@ impl AnyTlsOutboundClient {
                 },
             };
             let mut stream =
-                match create_tls_stream(tcp, &sni, fp, insecure, frag.as_ref()) {
+                match create_tls_stream(tcp, &sni, fp, insecure, frag.as_ref(), &ech) {
                     Ok(s) => s,
                     Err(e) => {
                         log::error!("anytls tls: {e}");

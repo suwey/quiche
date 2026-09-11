@@ -10,6 +10,7 @@ pub mod jitter;
 pub mod noise;
 pub mod padding;
 pub mod range;
+pub mod vision;
 
 /// 混淆层接口
 #[async_trait]

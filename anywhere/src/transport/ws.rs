@@ -1404,6 +1404,7 @@ impl TransportFactory for WsTransportFactory {
             ctx.insecure,
             ctx.tls_fp,
             ctx.fragment.as_ref(),
+            &crate::ech::EchOffer::None,
             &ctx.path,
             &ctx.headers,
         )

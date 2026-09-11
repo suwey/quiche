@@ -914,7 +914,7 @@ pub type TlsStream = SslStream<FragmentTcpStream<std::net::TcpStream>>;
 /// split across multiple TCP segments to evade DPI SNI matching.
 pub fn create_tls_stream(
     tcp: std::net::TcpStream, sni: &str, fp: bool, insecure: bool,
-    fragment: Option<&FragmentConfig>,
+    fragment: Option<&FragmentConfig>, ech: &crate::ech::EchOffer<'_>,
 ) -> io::Result<TlsStream> {
     let mut builder = SslContextBuilder::new(SslMethod::tls())
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
@@ -931,6 +931,8 @@ pub fn create_tls_stream(
         ssl.set_hostname(sni)
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
     }
+    crate::ech::apply_ech_offer(&mut ssl, ech)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
     // Always wrap with FragmentTcpStream.  When fragment is None,
     // fragment_enabled is false and all writes pass through unchanged.
     #[cfg(unix)]
@@ -941,6 +943,8 @@ pub fn create_tls_stream(
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
     stream
         .connect()
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    crate::ech::verify_ech_outcome(stream.ssl(), ech)
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
     Ok(stream)
 }
@@ -960,7 +964,7 @@ pub type AsyncTlsStream = tokio_boring::SslStream<
 /// WebSocket I/O. TLS fragment splitting is supported via `AsyncFragmentStream`.
 pub async fn create_tls_stream_async(
     tcp: tokio::net::TcpStream, sni: &str, fp: bool, insecure: bool,
-    fragment: Option<&FragmentConfig>,
+    fragment: Option<&FragmentConfig>, ech: &crate::ech::EchOffer<'_>,
 ) -> io::Result<AsyncTlsStream> {
     use crate::obfuscation::fragment::AsyncFragmentStream;
     use boring::ssl::SslConnector;
@@ -973,13 +977,18 @@ pub async fn create_tls_stream_async(
         builder.set_verify(SslVerifyMode::NONE);
     }
     let connector = builder.build();
-    let config = connector
+    let mut config = connector
         .configure()
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    crate::ech::apply_ech_offer(&mut config, ech)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
     let frag_stream = AsyncFragmentStream::new(tcp, fragment);
-    tokio_boring::connect(config, sni, frag_stream)
+    let tls = tokio_boring::connect(config, sni, frag_stream)
         .await
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    crate::ech::verify_ech_outcome(tls.ssl(), ech)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    Ok(tls)
 }
 
 /// Resolve a `server` string (IP:port or domain:port) to a `SocketAddr`.
@@ -1012,4 +1021,91 @@ pub fn resolve_addr(server: &str) -> Result<std::net::SocketAddr, String> {
     Err(format!(
         "failed to resolve server '{server}' after 5 attempts: {last_err}"
     ))
+}
+
+#[cfg(test)]
+mod ech_offer_tests {
+    use super::*;
+    use crate::ech::EchOffer;
+
+    const CERT_PEM: &str = include_str!(
+        "../../spikes/reality-session-id/certs/cert.pem"
+    );
+    const KEY_PEM: &str = include_str!(
+        "../../spikes/reality-session-id/certs/key.pem"
+    );
+
+    /// A plain tokio-boring TLS server with NO ECH support — the stand-in
+    /// for any ordinary proxy-node TLS endpoint.
+    async fn spawn_non_ech_tls_server() -> std::net::SocketAddr {
+        let cert =
+            boring::x509::X509::from_pem(CERT_PEM.as_bytes()).unwrap();
+        let pkey = boring::pkey::PKey::private_key_from_pem(
+            KEY_PEM.as_bytes(),
+        )
+        .unwrap();
+        let mut acceptor = boring::ssl::SslAcceptor::mozilla_intermediate_v5(
+            boring::ssl::SslMethod::tls(),
+        )
+        .unwrap();
+        acceptor.set_certificate(&cert).unwrap();
+        acceptor.set_private_key(&pkey).unwrap();
+        let acceptor = acceptor.build();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    // Ordinary server: an ECH extension it does not know is
+                    // simply ignored.
+                    let _ = tokio_boring::accept(&acceptor, stream).await;
+                });
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn grease_offer_handshakes_with_non_ech_server() {
+        let addr = spawn_non_ech_tls_server().await;
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let stream = create_tls_stream_async(
+            tcp,
+            "localhost",
+            false,
+            true,
+            None,
+            &EchOffer::Grease,
+        )
+        .await
+        .expect("grease offer must not break an ordinary TLS server");
+        // Grease offers are meant to be rejected: the check is informational.
+        assert!(!stream.ssl().ech_accepted());
+    }
+
+    #[tokio::test]
+    async fn real_ech_offer_fails_closed_against_non_ech_server() {
+        let addr = spawn_non_ech_tls_server().await;
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let offer = EchOffer::Config(std::borrow::Cow::Borrowed(
+            crate::ech::OPENRUNG_CLOUDFLARE_ECH_CONFIG_LIST,
+        ));
+        assert!(
+            create_tls_stream_async(
+                tcp,
+                "localhost",
+                false,
+                true,
+                None,
+                &offer
+            )
+            .await
+            .is_err(),
+            "a real ECH offer against a non-ECH server must fail closed"
+        );
+    }
 }

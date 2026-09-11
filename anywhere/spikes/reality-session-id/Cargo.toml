@@ -1,0 +1,28 @@
+[package]
+name = "reality-session-id-spike"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Standalone workspace: keeps this spike out of the quiche root workspace.
+[workspace]
+
+[dependencies]
+aes-gcm = "0.10"      # server-side REALITY session_id open (reality-handshake mode)
+boring = { version = "4.22.0", features = ["pq-experimental"] }
+boring-sys = "4.22.0"
+foreign-types = "0.5" # for Ssl::as_ptr (same version boring uses → trait unification)
+hkdf = "0.12"         # REALITY AuthKey derivation (authkey mode)
+hmac = "0.12"         # REALITY certificate HMAC-SHA512 check (reality-handshake mode)
+sha2 = "0.10"
+x25519-dalek = { version = "2", features = ["static_secrets"] } # server-side reality keypair (authkey mode)
+
+# boring-sys is patched in the quiche root workspace
+# (third_party/boring-sys + [patch.crates-io] in quiche/Cargo.toml). This spike
+# is a standalone workspace, so it points at the same vendored copy itself.
+[patch.crates-io]
+boring-sys = { path = "../../../third_party/boring-sys" }
+
+[profile.dev]
+debug = false
+incremental = false

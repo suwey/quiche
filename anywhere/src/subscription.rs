@@ -10,7 +10,10 @@
 //! Supported outbound types (converted to anywhere TOML):
 //! - `ss` / `shadowsocks`  → `[[outbounds]] type = "shadowsocks"`
 //! - `anytls`              → `[[outbounds]] type = "anytls"`
-//! - `vless`               → `[[outbounds]] type = "vless"`
+//! - `vless`               → `[[outbounds]] type = "vless"` (WS transport, or
+//!   the REALITY transport when the source carries REALITY params:
+//!   `security=reality&pbk=&sid=` in URIs, Clash `reality-opts`, sing-box
+//!   `tls.reality`)
 //!
 //! Unsupported types are printed as `skip: <type>...` and omitted from output.
 
@@ -77,6 +80,8 @@ pub struct TomlOutbound {
     pub fields: Vec<(String, TomlValue)>,
     /// Optional nested `[outbounds.transport]` section.
     pub transport: Option<TransportConfig>,
+    /// Optional nested `[outbounds.reality]` section (REALITY transport).
+    pub reality: Option<RealitySection>,
 }
 
 pub enum TomlValue {
@@ -92,6 +97,14 @@ pub struct TransportConfig {
     pub ws_headers: Option<HashMap<String, String>>,
 }
 
+/// `[outbounds.reality]` section — its presence enables the REALITY transport.
+pub struct RealitySection {
+    pub public_key: String,
+    /// Always rendered: sources that omit short_id mean the zero short id,
+    /// and anywhere's `RealityConfig` requires the field.
+    pub short_id: String,
+}
+
 impl TomlOutbound {
     pub fn new(type_: &str, tag: &str) -> Self {
         Self {
@@ -99,6 +112,7 @@ impl TomlOutbound {
             tag: tag.to_string(),
             fields: Vec::new(),
             transport: None,
+            reality: None,
         }
     }
 
@@ -109,6 +123,10 @@ impl TomlOutbound {
 
     pub fn set_transport(&mut self, transport: TransportConfig) {
         self.transport = Some(transport);
+    }
+
+    pub fn set_reality(&mut self, reality: RealitySection) {
+        self.reality = Some(reality);
     }
 }
 
@@ -230,9 +248,27 @@ fn outbounds_to_toml(outbounds: &[TomlOutbound]) -> String {
                 }
             }
         }
+        if let Some(r) = &ob.reality {
+            out.push_str("\n[outbounds.reality]\n");
+            out.push_str(&format!(
+                "public_key = \"{}\"\n",
+                escape_toml_str(&r.public_key)
+            ));
+            out.push_str(&format!(
+                "short_id = \"{}\"\n",
+                escape_toml_str(&r.short_id)
+            ));
+        }
         out.push('\n');
     }
     out
+}
+
+/// Public renderer for `TomlOutbound` lists — shared with the OpenRung
+/// directory import (`--sub-openrung`), which emits the same `[[outbounds]]`
+/// shape from a signed relay list instead of a subscription payload.
+pub fn render_outbounds(outbounds: &[TomlOutbound]) -> String {
+    outbounds_to_toml(outbounds)
 }
 
 fn escape_toml_str(s: &str) -> String {
@@ -503,10 +539,69 @@ fn parse_clash_anytls(
     Some(ob)
 }
 
+/// Build a validated `[outbounds.reality]` section from subscription fields.
+///
+/// `public_key` must base64-decode to exactly 32 bytes and `short_id` must be
+/// hex of at most 8 bytes — the same rules anywhere applies to handwritten
+/// configs (`RealityConfig::parse`). Returns `None` when the values are
+/// missing or invalid, so callers can skip the node (the existing skip
+/// strategy for unrepresentable nodes).
+fn validated_reality_section(
+    public_key: Option<&str>, short_id: Option<&str>,
+) -> Option<RealitySection> {
+    let public_key = public_key?;
+    let cfg = crate::transport::reality::RealityConfig {
+        public_key: public_key.to_string(),
+        short_id: short_id.unwrap_or("").to_string(),
+    };
+    // Empty short_id is valid (zero-padded on the wire, §S1.1).
+    cfg.parse().ok()?;
+    Some(RealitySection {
+        public_key: public_key.to_string(),
+        short_id: short_id.unwrap_or("").to_string(),
+    })
+}
+
+/// Resolve flow + reality for a vless node into (optional flow field,
+/// optional reality section). Shared by the Clash / sing-box / URI parsers.
+///
+/// anywhere's vless validator requires `flow` to come with a `reality`
+/// section and rejects `reality` + `insecure` — nodes that would produce a
+/// config failing those rules are skipped (`None`) instead of emitted.
+/// `insecure` is the parsed `insecure` / `skip-cert-verify` flag.
+fn resolve_vless_reality(
+    flow: Option<&str>, reality_key: Option<&str>, reality_sid: Option<&str>,
+    insecure: bool,
+) -> Option<(Option<String>, Option<RealitySection>)> {
+    let flow = flow.filter(|f| !f.is_empty());
+    match reality_key {
+        Some(_) => {
+            if insecure {
+                // REALITY's certificate check is a custom algorithm;
+                // "skip verification" is undefined for it and anywhere
+                // rejects the combination at load time.
+                return None;
+            }
+            let section = validated_reality_section(reality_key, reality_sid)?;
+            Some((flow.map(str::to_string), Some(section)))
+        },
+        None => {
+            // flow without REALITY is unrepresentable (only TLS/REALITY
+            // transports support flow, §S2.7) — skip rather than emit a
+            // config the validator rejects.
+            if flow.is_some() {
+                return None;
+            }
+            Some((None, None))
+        },
+    }
+}
+
 fn parse_clash_vless(proxy: &noyalib::Value, name: &str) -> Option<TomlOutbound> {
     let server = proxy.get("server")?.as_str()?;
     let port = proxy.get("port")?.as_u64()? as u16;
     let uuid = proxy.get("uuid").and_then(|v| v.as_str())?;
+    let network = proxy.get("network").and_then(|v| v.as_str());
 
     let mut ob = TomlOutbound::new("vless", name)
         .field("server", format!("{server}:{port}"))
@@ -519,7 +614,11 @@ fn parse_clash_vless(proxy: &noyalib::Value, name: &str) -> Option<TomlOutbound>
     {
         ob = ob.field("sni", sni);
     }
-    if let Some(true) = proxy.get("skip-cert-verify").and_then(|v| v.as_bool()) {
+    let insecure = matches!(
+        proxy.get("skip-cert-verify").and_then(|v| v.as_bool()),
+        Some(true)
+    );
+    if insecure {
         ob = ob.field("insecure", true);
     }
     if proxy
@@ -530,8 +629,35 @@ fn parse_clash_vless(proxy: &noyalib::Value, name: &str) -> Option<TomlOutbound>
         ob = ob.field("fp", true);
     }
 
+    // REALITY transport (Clash.Meta `reality-opts`) + flow.
+    let reality_opts = proxy.get("reality-opts").and_then(|v| v.as_mapping());
+    let reality_pk = reality_opts
+        .and_then(|o| o.get("public-key"))
+        .and_then(|v| v.as_str());
+    if reality_opts.is_some() && reality_pk.is_none() {
+        // reality declared without a public key — unusable node.
+        return None;
+    }
+    let (flow, reality) = resolve_vless_reality(
+        proxy.get("flow").and_then(|v| v.as_str()),
+        reality_pk,
+        reality_opts
+            .and_then(|o| o.get("short-id"))
+            .and_then(|v| v.as_str()),
+        insecure,
+    )?;
+    // reality over WS is not supported (validator rejects the combination).
+    if reality.is_some() && network == Some("ws") {
+        return None;
+    }
+    if let Some(flow) = flow {
+        ob = ob.field("flow", flow);
+    }
+    if let Some(reality) = reality {
+        ob.set_reality(reality);
+    }
+
     // WS transport
-    let network = proxy.get("network").and_then(|v| v.as_str());
     if network == Some("ws") {
         let mut transport = TransportConfig {
             type_: "ws".to_string(),
@@ -971,10 +1097,57 @@ fn parse_singbox_vless(
         .field("server", format!("{server}:{port}"))
         .field("password", uuid);
 
-    if let Some(tls) = ob.get("tls") {
-        if let Some(sni) = tls.get("server_name").and_then(|v| v.as_str()) {
-            out = out.field("sni", sni);
-        }
+    let tls = ob.get("tls").filter(|t| !t.is_null());
+    if let Some(sni) = tls
+        .and_then(|t| t.get("server_name"))
+        .and_then(|v| v.as_str())
+    {
+        out = out.field("sni", sni);
+    }
+    let insecure = matches!(
+        tls.and_then(|t| t.get("insecure")).and_then(|v| v.as_bool()),
+        Some(true)
+    );
+    if insecure {
+        out = out.field("insecure", true);
+    }
+
+    // REALITY transport (`tls.reality`) + flow. `enabled` defaults to true
+    // when the object is present (sing-box only writes it explicitly).
+    let reality_obj = tls
+        .and_then(|t| t.get("reality"))
+        .filter(|r| !r.is_null())
+        .filter(|r| {
+            r.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true)
+        });
+    let reality_pk = reality_obj
+        .and_then(|r| r.get("public_key"))
+        .and_then(|v| v.as_str());
+    if reality_obj.is_some() && reality_pk.is_none() {
+        // reality declared without a public key — unusable node.
+        return None;
+    }
+    let (flow, reality) = resolve_vless_reality(
+        ob.get("flow").and_then(|v| v.as_str()),
+        reality_pk,
+        reality_obj
+            .and_then(|r| r.get("short_id"))
+            .and_then(|v| v.as_str()),
+        insecure,
+    )?;
+    // reality over WS is not supported (validator rejects the combination).
+    let network = ob
+        .get("transport")
+        .and_then(|t| t.get("type"))
+        .and_then(|v| v.as_str());
+    if reality.is_some() && network == Some("ws") {
+        return None;
+    }
+    if let Some(flow) = flow {
+        out = out.field("flow", flow);
+    }
+    if let Some(reality) = reality {
+        out.set_reality(reality);
     }
 
     // WS transport
@@ -1145,6 +1318,12 @@ fn parse_ss_uri(uri: &str, idx: &mut usize) -> Option<TomlOutbound> {
 
 /// Parse `vless://` URI.
 /// Format: `vless://<uuid>@<host:port>?<params>#<name>`
+///
+/// REALITY params (`security=reality&pbk=<base64>&sid=<hex>&flow=...`) are
+/// only applicable with `type=tcp` (or no type at all); nodes whose params
+/// are invalid (bad `pbk` base64 / `sid` hex) or that anywhere cannot
+/// represent (`flow` without `security=reality`, reality over `type=ws`) are
+/// skipped by returning `None`.
 fn parse_vless_uri(uri: &str, idx: &mut usize) -> Option<TomlOutbound> {
     let (uuid, rest) = uri.split_once('@')?;
     // Split off name fragment
@@ -1178,14 +1357,22 @@ fn parse_vless_uri(uri: &str, idx: &mut usize) -> Option<TomlOutbound> {
         ws_path: None,
         ws_headers: None,
     };
-    let mut has_ws = false;
+    // Query params collected in one pass; applied afterwards because `type=`
+    // may appear before or after the reality params.
+    let mut type_val: Option<String> = None;
+    let mut security_reality = false;
+    let mut pbk: Option<String> = None;
+    let mut sid: Option<String> = None;
+    let mut flow: Option<String> = None;
 
     if let Some(q) = query {
         for param in q.split('&') {
             if let Some(val) = param.strip_prefix("type=") {
-                if val == "ws" {
-                    has_ws = true;
-                }
+                type_val = Some(
+                    urlencoding::decode(val)
+                        .map(|s| s.into_owned())
+                        .unwrap_or_else(|_| val.to_string()),
+                );
             } else if let Some(val) = param.strip_prefix("path=") {
                 transport.ws_path = Some(
                     urlencoding::decode(val)
@@ -1201,9 +1388,50 @@ fn parse_vless_uri(uri: &str, idx: &mut usize) -> Option<TomlOutbound> {
             } else if let Some(val) = param.strip_prefix("security=") {
                 if val == "tls" {
                     // TLS is implicit in anywhere vless
+                } else if val == "reality" {
+                    security_reality = true;
                 }
+            } else if let Some(val) = param.strip_prefix("pbk=") {
+                pbk = Some(
+                    urlencoding::decode(val)
+                        .map(|s| s.into_owned())
+                        .unwrap_or_else(|_| val.to_string()),
+                );
+            } else if let Some(val) = param.strip_prefix("sid=") {
+                sid = Some(
+                    urlencoding::decode(val)
+                        .map(|s| s.into_owned())
+                        .unwrap_or_else(|_| val.to_string()),
+                );
+            } else if let Some(val) = param.strip_prefix("flow=") {
+                flow = Some(
+                    urlencoding::decode(val)
+                        .map(|s| s.into_owned())
+                        .unwrap_or_else(|_| val.to_string()),
+                );
             }
         }
+    }
+
+    let has_ws = type_val.as_deref() == Some("ws");
+
+    if security_reality {
+        // REALITY is a raw TLS byte stream: only plain TCP is supported.
+        if matches!(type_val.as_deref(), Some(t) if t != "tcp") {
+            return None;
+        }
+        let (flow, reality) =
+            resolve_vless_reality(flow.as_deref(), pbk.as_deref(), sid.as_deref(), false)?;
+        if let Some(flow) = flow {
+            ob = ob.field("flow", flow);
+        }
+        if let Some(reality) = reality {
+            ob.set_reality(reality);
+        }
+    } else if flow.is_some() {
+        // flow without REALITY is unrepresentable in anywhere (§S2.7) —
+        // skip the node instead of emitting a config the validator rejects.
+        return None;
     }
 
     if has_ws {
