@@ -360,7 +360,7 @@ impl OutboundClient for QuicOutboundClient {
         }
     }
 
-    async fn test_latency(&self, _host: &str, _port: u16) -> Option<u64> {
+    async fn test_latency(&self, _url: &str) -> Option<u64> {
         None
     }
 }

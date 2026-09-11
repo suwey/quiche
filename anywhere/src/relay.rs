@@ -24,6 +24,13 @@ pub const DEFAULT_UDP_TIMEOUT: std::time::Duration =
 const HALF_CLOSE_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(15);
 
+/// If the remote side of a TCP relay sends nothing within this window after
+/// the relay starts, the connection is torn down (client gets a RST) instead
+/// of hanging forever. Covers dead upstream proxy sessions and unreachable
+/// targets that never answer.
+const FIRST_BYTE_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(15);
+
 /// Returns the UDP idle timeout for a given sniffed protocol.
 ///
 /// Short-lived query protocols (DNS, NTP, STUN) get a short timeout
@@ -371,6 +378,68 @@ async fn copy_one_way(src: &mut dyn StreamRelay, dst: &mut dyn StreamRelay) {
     }
 }
 
+/// Wraps the outbound (remote) side of a TCP relay and enforces
+/// [`FIRST_BYTE_TIMEOUT`]: if the remote's first `read` does not complete
+/// in time, it fails with `TimedOut` so the relay tears both sides down.
+///
+/// Only the first read is guarded. Once any byte (or EOF/error) arrives the
+/// wrapper disarms and passes through untouched — long-lived connections
+/// with later idle gaps are unaffected.
+pub struct FirstByteTimeoutRelay {
+    inner: Box<dyn StreamRelay>,
+    /// Still waiting for the first byte from the remote.
+    armed: bool,
+}
+
+impl FirstByteTimeoutRelay {
+    pub fn new(inner: Box<dyn StreamRelay>) -> Self {
+        Self { inner, armed: true }
+    }
+}
+
+#[async_trait]
+impl StreamRelay for FirstByteTimeoutRelay {
+    async fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if !self.armed {
+            return self.inner.read(buf).await;
+        }
+        // Disarm before awaiting: if this read is cancelled (e.g. the other
+        // relay direction won the select), the half-close drain timeout
+        // already bounds the remaining lifetime — no need to re-arm.
+        self.armed = false;
+        match tokio::time::timeout(FIRST_BYTE_TIMEOUT, self.inner.read(buf))
+            .await
+        {
+            Ok(res) => res,
+            Err(_) => {
+                log::debug!(
+                    "relay: first-byte timeout ({FIRST_BYTE_TIMEOUT:?}), remote did not answer"
+                );
+                Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "first-byte timeout",
+                ))
+            },
+        }
+    }
+
+    async fn write(&mut self, buf: &[u8]) -> io::Result<()> {
+        self.inner.write(buf).await
+    }
+
+    async fn shutdown(&mut self) -> io::Result<()> {
+        self.inner.shutdown().await
+    }
+
+    async fn reset(&mut self) {
+        self.inner.reset().await;
+    }
+
+    async fn finish(&mut self) {
+        self.inner.finish().await;
+    }
+}
+
 /// Runs two concurrent datagram copy tasks.
 ///
 /// When one direction terminates (idle timeout / error / EOF), the other
@@ -666,5 +735,65 @@ impl PacketRelay for CountedPacketRelay {
 
     async fn send_port_unreachable(&mut self) -> io::Result<()> {
         self.inner.send_port_unreachable().await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// A relay whose reads sleep for `delay`, then return `data`.
+    struct SlowRelay {
+        delay: Duration,
+        data: Vec<u8>,
+    }
+
+    #[async_trait]
+    impl StreamRelay for SlowRelay {
+        async fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            tokio::time::sleep(self.delay).await;
+            let n = self.data.len().min(buf.len());
+            buf[..n].copy_from_slice(&self.data[..n]);
+            Ok(n)
+        }
+
+        async fn write(&mut self, _buf: &[u8]) -> io::Result<()> {
+            Ok(())
+        }
+
+        async fn shutdown(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn first_byte_timeout_fires_then_disarms() {
+        let mut relay = FirstByteTimeoutRelay::new(Box::new(SlowRelay {
+            delay: Duration::from_secs(60),
+            data: vec![1, 2, 3],
+        }));
+        let mut buf = [0u8; 16];
+
+        // First read hits the timeout — remote never answered in time.
+        let err = relay.read(&mut buf).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+
+        // Disarmed after the first read: subsequent reads pass through and
+        // eventually return the delayed data.
+        let n = relay.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], &[1, 2, 3]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn first_byte_timeout_passes_through_when_remote_answers() {
+        let mut relay = FirstByteTimeoutRelay::new(Box::new(SlowRelay {
+            delay: Duration::from_secs(1),
+            data: vec![9],
+        }));
+        let mut buf = [0u8; 16];
+        let n = relay.read(&mut buf).await.unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(buf[0], 9);
     }
 }

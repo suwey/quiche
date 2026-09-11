@@ -1593,7 +1593,7 @@ mod tests {
 
         // Through the trait object — exactly what the UI delay endpoints do.
         let client: Box<dyn OutboundClient> = Box::new(client);
-        let latency = client.test_latency("www.example.com", 443).await;
+        let latency = client.test_latency("https://www.example.com").await;
         assert!(
             latency.is_none(),
             "dial against a non-REALITY endpoint must fail, got {latency:?}"

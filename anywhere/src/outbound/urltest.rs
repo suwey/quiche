@@ -360,7 +360,7 @@ impl OutboundClient for UrlTestOutboundClient {
         Err("all urltest children unavailable".into())
     }
 
-    async fn test_latency(&self, host: &str, port: u16) -> Option<u64> {
+    async fn test_latency(&self, url: &str) -> Option<u64> {
         // Clear all failed marks — latency test is the recovery signal.
         for f in &self.state.failed {
             f.store(false, Ordering::Relaxed);
@@ -372,7 +372,7 @@ impl OutboundClient for UrlTestOutboundClient {
             if self.state.children[idx] == "direct" {
                 return None;
             }
-            let latency = self.children[idx].test_latency(host, port).await;
+            let latency = self.children[idx].test_latency(url).await;
             let record = latency.map(|d| LatencyRecord {
                 time: Utc::now(),
                 delay: d,
@@ -396,7 +396,7 @@ impl OutboundClient for UrlTestOutboundClient {
                 continue;
             }
 
-            let latency = child.test_latency(host, port).await;
+            let latency = child.test_latency(url).await;
 
             let record = latency.map(|d| LatencyRecord {
                 time: Utc::now(),
@@ -476,7 +476,7 @@ pub fn spawn_test_loop(
     tokio::spawn(async move {
         // Test immediately, then every interval.
         loop {
-            client.test_latency(&test_url, 443).await;
+            client.test_latency(&test_url).await;
             tokio::time::sleep(Duration::from_secs(interval_secs)).await;
         }
     })

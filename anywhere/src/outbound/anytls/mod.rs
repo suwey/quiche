@@ -10,6 +10,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU32;
 use std::sync::atomic::Ordering::SeqCst;
 use std::time::Duration;
+use std::time::Instant;
 
 use async_trait::async_trait;
 use tokio::sync::mpsc;
@@ -30,6 +31,24 @@ use crate::protocol::uot;
 use uot::UotPacketRelay;
 use uot::encode_request;
 use uot::uot_magic_address_with_port as magic_address_with_port;
+
+/// A session is dead once a HEART_REQUEST goes unanswered for this long.
+/// The io loop reads with a 3 s timeout and heartbeats on every idle tick,
+/// so this budget allows several missed heartbeat round-trips. Without it,
+/// a black-holed TCP connection (sleep/wake, NAT expiry, silent drops)
+/// keeps serving new streams until the OS retransmission timeout (minutes).
+const HEART_DEAD_AFTER: Duration = Duration::from_secs(15);
+
+/// How long a session that has not finished TCP+TLS+auth is still worth
+/// handing out. `create_session_inner` connects in the background with a
+/// 5 s TCP connect timeout, so an un-ready session older than this will
+/// never come up.
+const CONNECT_GRACE: Duration = Duration::from_secs(15);
+
+/// Sessions that never sent packet #1 (settings + first SYN) produce no
+/// heartbeat traffic, so their liveness cannot be probed. Presume them
+/// stale after this long and let the pool recreate on demand.
+const UNSTARTED_FRESH_WINDOW: Duration = Duration::from_secs(120);
 
 // Re-import shared protocol primitives.
 use proto::CHECK_MARK;
@@ -118,6 +137,84 @@ struct SessionInner {
     active_streams: AtomicU32,
     closed: AtomicBool,
     padding: StdMutex<PaddingFactory>,
+    /// Set once TCP+TLS+auth completed (the spawn_blocking task connects in
+    /// the background, so a freshly created session is not usable yet).
+    ready: AtomicBool,
+    /// Set once packet #1 (settings + first SYN) went out — heartbeat
+    /// traffic only starts after this.
+    started: AtomicBool,
+    /// Last time any frame was received from the server. Drives the
+    /// heartbeat dead-detection in the io loop and the pool's liveness gate.
+    last_server_frame: StdMutex<Option<Instant>>,
+    /// Monotonic creation time; used to expire never-started sessions.
+    created_at: Instant,
+}
+
+impl SessionInner {
+    fn touch_server_frame(&self) {
+        *self.last_server_frame.lock().unwrap() = Some(Instant::now());
+    }
+
+    /// Error out every open stream and close their channels. Called when a
+    /// session dies so relays blocked in `read()` get an error immediately
+    /// instead of hanging forever on a dead connection.
+    fn fail_all_streams(&self, msg: &str) {
+        let mut map = self.streams.lock().unwrap();
+        if map.is_empty() {
+            return;
+        }
+        let n = map.len();
+        for (_, entry) in map.drain() {
+            *entry.error.lock().unwrap() = Some(msg.to_string());
+            // Dropping data_tx closes the channel: the stream's next
+            // read() returns None and surfaces the error above.
+            drop(entry.data_tx);
+        }
+        self.active_streams.fetch_sub(n as u32, SeqCst);
+    }
+
+    /// Mark the session dead: stop the io thread and fail every stream.
+    fn mark_dead(&self, reason: &str) {
+        log::debug!("{reason}");
+        self.closed.store(true, SeqCst);
+        self.fail_all_streams(reason);
+    }
+
+    /// Pool-side liveness gate. Returns false for sessions that are closed,
+    /// still connecting past [`CONNECT_GRACE`], heartbeat-dead, or never
+    /// started and older than [`UNSTARTED_FRESH_WINDOW`]. Detected-dead
+    /// sessions are marked dead as a side effect so their io threads exit
+    /// and their streams get errors instead of hanging.
+    fn check_usable(&self, now: Instant) -> bool {
+        if self.closed.load(SeqCst) {
+            return false;
+        }
+        if !self.ready.load(SeqCst) {
+            if now.duration_since(self.created_at) >= CONNECT_GRACE {
+                self.mark_dead("anytls session: connect never finished");
+                return false;
+            }
+            return true;
+        }
+        if self.started.load(SeqCst) {
+            // Heartbeats are flowing — the server must keep answering.
+            let last = *self.last_server_frame.lock().unwrap();
+            match last {
+                Some(t) if now.duration_since(t) < HEART_DEAD_AFTER => true,
+                _ => {
+                    self.mark_dead("anytls session: heartbeat timeout");
+                    false
+                },
+            }
+        } else if now.duration_since(self.created_at)
+            >= UNSTARTED_FRESH_WINDOW
+        {
+            self.mark_dead("anytls session: stale, never started");
+            false
+        } else {
+            true
+        }
+    }
 }
 
 /// A handle to one TLS connection (one session). Holds the Arc-shared inner
@@ -183,10 +280,6 @@ impl SessionHandle {
             inner: self.inner.clone(),
             error,
         })
-    }
-
-    fn is_closed(&self) -> bool {
-        self.inner.closed.load(SeqCst)
     }
 }
 
@@ -345,8 +438,11 @@ impl SessionPool {
     ) -> std::io::Result<SessionHandle> {
         let mut entries = self.entries.lock().unwrap();
 
-        // Remove dead sessions.
-        entries.retain(|e| !e.handle.is_closed());
+        // Remove dead/stale sessions. check_usable also marks freshly
+        // detected corpses (heartbeat timeout, connect never finished) so
+        // their io threads exit and their streams get errors.
+        let now = std::time::Instant::now();
+        entries.retain(|e| e.handle.inner.check_usable(now));
 
         // Prefer the highest-Seq live session that still has headroom.
         let mut best: Option<usize> = None;
@@ -395,14 +491,17 @@ impl SessionPool {
 
         let mut to_remove = Vec::new();
         let now = std::time::Instant::now();
-        let mut alive = entries.len();
+        // Only healthy sessions count toward min_idle, so dead ones (closed,
+        // heartbeat-dead, connect never finished) are evicted unconditionally
+        // and the replenish below can actually replace them.
+        let mut alive = 0usize;
 
         for (i, entry) in entries.iter().enumerate() {
-            if entry.handle.is_closed() {
+            if !entry.handle.inner.check_usable(now) {
                 to_remove.push(i);
-                alive = alive.saturating_sub(1);
                 continue;
             }
+            alive += 1;
             if let Some(idle) = entry.idle_since {
                 if now.duration_since(idle) >= self.config.idle_timeout
                     && alive > self.config.min_idle
@@ -417,10 +516,12 @@ impl SessionPool {
             }
         }
 
-        // Remove in reverse to keep indices valid.
+        // Remove in reverse to keep indices valid. mark_dead is a no-op for
+        // already-dead sessions and closes idle-evicted ones (their io
+        // threads exit within one read timeout).
         for i in to_remove.into_iter().rev() {
             let entry = entries.remove(i);
-            entry.handle.inner.closed.store(true, SeqCst);
+            entry.handle.inner.mark_dead("anytls pool: session evicted");
         }
 
         // Replenish if below min_idle (or empty).
@@ -478,7 +579,7 @@ impl SessionPool {
     fn shutdown(&self) {
         let mut entries = self.entries.lock().unwrap();
         for entry in entries.drain(..) {
-            entry.handle.inner.closed.store(true, SeqCst);
+            entry.handle.inner.mark_dead("anytls pool shutdown");
         }
         if let Some(abort) = self.cleanup_abort.lock().unwrap().take() {
             abort.abort();
@@ -610,8 +711,9 @@ fn handle_blocking_frame(
             log::debug!("anytls settings: {}", String::from_utf8_lossy(&data))
         },
         CMD_ALERT => {
-            log::warn!("anytls ALERT: {}", String::from_utf8_lossy(&data));
-            inner.closed.store(true, SeqCst);
+            let msg = String::from_utf8_lossy(&data).to_string();
+            log::warn!("anytls ALERT: {msg}");
+            inner.mark_dead(&format!("server alert: {msg}"));
         },
         _ => {},
     }
@@ -637,6 +739,10 @@ fn run_io_loop(
     // packet #0 (sent raw, no padding). The first write inside the loop
     // (settings + first SYN+PSH) is packet #1.
     let mut pkt_counter = 1u32;
+    // Set when a HEART_REQUEST goes out; cleared on any frame from the
+    // server. If it stays set past HEART_DEAD_AFTER the connection is
+    // black-holed and the session is killed (see the WouldBlock arm).
+    let mut heart_outstanding: Option<Instant> = None;
     log::debug!("io thread started");
     loop {
         if inner.closed.load(SeqCst) {
@@ -649,8 +755,13 @@ fn run_io_loop(
                     if let Ok(frame) = encode_frame(CMD_FIN, sid, &[]) {
                         let pkt = pkt_counter;
                         pkt_counter += 1;
-                        let _ =
-                            write_padded(&mut stream, frame, &inner.padding, pkt);
+                        if write_padded(&mut stream, frame, &inner.padding, pkt)
+                            .is_err()
+                        {
+                            // Socket is dead — stop instead of spinning on
+                            // failed FIN writes until the heartbeat check.
+                            break;
+                        }
                     }
                 },
                 Err(mpsc::error::TryRecvError::Empty) => break,
@@ -675,6 +786,9 @@ fn run_io_loop(
                             // Protocol: packet #1 must carry cmdSettings AND
                             // the first stream's SYN+PSH in one TLS write.
                             if let Some(settings) = initial_settings.take() {
+                                // Packet #1 is going out — heartbeat traffic
+                                // (and heartbeat dead-detection) starts here.
+                                inner.started.store(true, SeqCst);
                                 combined.extend_from_slice(&settings);
                             }
                             combined.extend_from_slice(&syn);
@@ -724,6 +838,8 @@ fn run_io_loop(
         }
         match read_frame_blocking(&mut stream) {
             Ok((cmd, sid, data)) => {
+                heart_outstanding = None;
+                inner.touch_server_frame();
                 log::debug!(
                     "io: recv cmd={} sid={sid} len={}",
                     cmd_name(cmd),
@@ -752,10 +868,42 @@ fn run_io_loop(
                 if initial_settings.is_some() {
                     continue;
                 }
-                if let Ok(frame) = encode_frame(CMD_HEART_REQUEST, 0, &[]) {
-                    let pkt = pkt_counter;
-                    pkt_counter += 1;
-                    let _ = write_padded(&mut stream, frame, &inner.padding, pkt);
+                let now = std::time::Instant::now();
+                match heart_outstanding {
+                    // A heartbeat is in flight and nothing came back within
+                    // HEART_DEAD_AFTER — the connection is black-holed. Kill
+                    // the session now instead of handing out dead streams
+                    // until the TCP retransmission timeout (minutes).
+                    Some(sent)
+                        if now.duration_since(sent) >= HEART_DEAD_AFTER =>
+                    {
+                        log::debug!(
+                            "anytls io: heartbeat unanswered for {HEART_DEAD_AFTER:?}, killing session"
+                        );
+                        break;
+                    },
+                    // Heartbeat already in flight — wait for it (or the
+                    // deadline) instead of stacking up more.
+                    Some(_) => {},
+                    None => {
+                        if let Ok(frame) =
+                            encode_frame(CMD_HEART_REQUEST, 0, &[])
+                        {
+                            let pkt = pkt_counter;
+                            pkt_counter += 1;
+                            if write_padded(
+                                &mut stream,
+                                frame,
+                                &inner.padding,
+                                pkt,
+                            )
+                            .is_err()
+                            {
+                                break;
+                            }
+                            heart_outstanding = Some(now);
+                        }
+                    },
                 }
             },
             Err(e) => {
@@ -765,7 +913,9 @@ fn run_io_loop(
         }
     }
     let _ = stream.get_mut().get_mut().shutdown(Shutdown::Both);
-    inner.closed.store(true, SeqCst);
+    // Wake every stream blocked on this session so their relays fail fast
+    // instead of hanging forever after the connection died.
+    inner.mark_dead("anytls session closed");
     log::debug!("io thread ended");
 }
 
@@ -937,6 +1087,10 @@ impl AnyTlsOutboundClient {
             active_streams: AtomicU32::new(0),
             closed: AtomicBool::new(false),
             padding: StdMutex::new(initial_padding),
+            ready: AtomicBool::new(false),
+            started: AtomicBool::new(false),
+            last_server_frame: StdMutex::new(None),
+            created_at: std::time::Instant::now(),
         });
 
         let inner_clone = inner.clone();
@@ -951,6 +1105,7 @@ impl AnyTlsOutboundClient {
                 Err(e) => {
                     log::error!("anytls tcp: {e}");
                     inner_clone.closed.store(true, SeqCst);
+                    inner_clone.fail_all_streams(&format!("anytls tcp: {e}"));
                     return;
                 },
             };
@@ -960,6 +1115,7 @@ impl AnyTlsOutboundClient {
                     Err(e) => {
                         log::error!("anytls tls: {e}");
                         inner_clone.closed.store(true, SeqCst);
+                        inner_clone.fail_all_streams(&format!("anytls tls: {e}"));
                         return;
                     },
                 };
@@ -971,6 +1127,7 @@ impl AnyTlsOutboundClient {
                 Err(e) => {
                     log::error!("anytls hash: {e}");
                     inner_clone.closed.store(true, SeqCst);
+                    inner_clone.fail_all_streams(&format!("anytls hash: {e}"));
                     return;
                 },
             };
@@ -983,9 +1140,12 @@ impl AnyTlsOutboundClient {
             if let Err(e) = stream.write_all(&auth) {
                 log::error!("anytls auth: {e}");
                 inner_clone.closed.store(true, SeqCst);
+                inner_clone.fail_all_streams(&format!("anytls auth: {e}"));
                 return;
             }
             stream.flush().ok();
+            // TCP+TLS+auth done — the session may now be handed out.
+            inner_clone.ready.store(true, SeqCst);
 
             // Build the settings frame (sent once per session). Per protocol,
             // packet #1 must carry cmdSettings AND the first stream's SYN+PSH
@@ -1095,5 +1255,98 @@ impl StreamRelay for AnyTlsStreamRelay {
             h.close().await;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Returns the channel receivers too: `open_stream` sends into them, so
+    /// they must outlive the session for the duration of each test.
+    #[allow(clippy::type_complexity)]
+    fn test_inner(
+        created_at: Instant, ready: bool, started: bool,
+    ) -> (
+        Arc<SessionInner>,
+        mpsc::UnboundedReceiver<OutboundMsg>,
+        mpsc::UnboundedReceiver<ControlFrame>,
+    ) {
+        let (outbound_tx, outbound_rx) = mpsc::unbounded_channel();
+        let (control_tx, control_rx) = mpsc::unbounded_channel();
+        let inner = Arc::new(SessionInner {
+            outbound_tx,
+            control_tx,
+            streams: StdMutex::new(HashMap::new()),
+            next_sid: AtomicU32::new(0),
+            active_streams: AtomicU32::new(0),
+            closed: AtomicBool::new(false),
+            padding: StdMutex::new(PaddingFactory::default_factory()),
+            ready: AtomicBool::new(ready),
+            started: AtomicBool::new(started),
+            last_server_frame: StdMutex::new(None),
+            created_at,
+        });
+        (inner, outbound_rx, control_rx)
+    }
+
+    /// A session that died must wake every stream blocked in read() with an
+    /// error instead of leaving them hanging forever.
+    #[tokio::test]
+    async fn fail_all_streams_errors_blocked_readers() {
+        let (inner, _out_rx, _ctl_rx) =
+            test_inner(Instant::now(), true, false);
+        let handle = SessionHandle { inner: inner.clone() };
+        let mut stream = handle.open_stream("example.com:443").unwrap();
+
+        inner.fail_all_streams("session died");
+        assert_eq!(inner.active_streams.load(SeqCst), 0);
+        assert!(inner.streams.lock().unwrap().is_empty());
+
+        let err = stream
+            .read(&mut [0u8; 16])
+            .await
+            .expect_err("blocked reader must get an error");
+        assert_eq!(err.kind(), std::io::ErrorKind::ConnectionRefused);
+        assert!(err.to_string().contains("session died"));
+    }
+
+    #[test]
+    fn usable_gate_transitions() {
+        let now = Instant::now();
+        let back = |secs: u64| {
+            now.checked_sub(Duration::from_secs(secs)).unwrap()
+        };
+
+        // Fresh session still connecting in the background — usable.
+        let (s, _o, _c) = test_inner(now, false, false);
+        assert!(s.check_usable(now));
+
+        // Connecting but the 5 s connect timeout long past — dead.
+        let (s, _o, _c) = test_inner(back(CONNECT_GRACE.as_secs() + 10), false, false);
+        assert!(!s.check_usable(now));
+        assert!(s.closed.load(SeqCst));
+
+        // Ready + started + recent server frame — usable.
+        let (s, _o, _c) = test_inner(back(3600), true, true);
+        s.touch_server_frame();
+        assert!(s.check_usable(now));
+
+        // Ready + started but no server frame within HEART_DEAD_AFTER —
+        // heartbeat dead, streams failed.
+        let (s, _o, _c) = test_inner(back(3600), true, true);
+        let handle = SessionHandle { inner: s.clone() };
+        let _stream = handle.open_stream("example.com:443").unwrap();
+        *s.last_server_frame.lock().unwrap() =
+            Some(back(HEART_DEAD_AFTER.as_secs() + 1));
+        assert!(!s.check_usable(now));
+        assert!(s.closed.load(SeqCst));
+        assert!(s.streams.lock().unwrap().is_empty());
+
+        // Ready but never started and stale — presumed dead.
+        let (s, _o, _c) =
+            test_inner(back(UNSTARTED_FRESH_WINDOW.as_secs() + 10), true, false);
+        assert!(!s.check_usable(now));
+        assert!(s.closed.load(SeqCst));
     }
 }

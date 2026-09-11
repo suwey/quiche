@@ -668,26 +668,13 @@ async fn group_delay_handler(
     State(state): State<Arc<UiState>>, Path(tag): Path<String>,
     Query(params): Query<GroupDelayParams>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    // Parse URL to extract host and port.
-    let rest = params
-        .url
-        .strip_prefix("https://")
-        .or_else(|| params.url.strip_prefix("http://"))
-        .ok_or(StatusCode::BAD_REQUEST)?;
-
-    let (host, port) = if let Some((h, rest)) = rest.split_once(':') {
-        let port_str = rest.split('/').next().unwrap_or(rest);
-        let port: u16 = port_str.parse().map_err(|_| StatusCode::BAD_REQUEST)?;
-        (h.to_string(), port)
-    } else {
-        let host = rest.split('/').next().unwrap_or(rest).to_string();
-        let port = if params.url.starts_with("https") {
-            443
-        } else {
-            80
-        };
-        (host, port)
-    };
+    // The probe parses the URL itself (scheme/host/port/path); only require
+    // that it is an http(s) URL.
+    if !params.url.starts_with("https://")
+        && !params.url.starts_with("http://")
+    {
+        return Err(StatusCode::BAD_REQUEST);
+    }
     let timeout_dur = std::time::Duration::from_millis(params.timeout);
 
     // Collect children for the group (urltest or select).
@@ -711,12 +698,12 @@ async fn group_delay_handler(
             continue;
         };
         let client = client.clone();
-        let host = host.clone();
+        let url = params.url.clone();
         let child_tag = child_tag.clone();
         join_set.spawn(async move {
             let delay = tokio::time::timeout(
                 timeout_dur,
-                client.test_latency(&host, port),
+                client.test_latency(&url),
             )
             .await
             .ok()
@@ -744,31 +731,17 @@ async fn proxy_delay_handler(
     State(state): State<Arc<UiState>>, Path(tag): Path<String>,
     Query(params): Query<GroupDelayParams>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let rest = params
-        .url
-        .strip_prefix("https://")
-        .or_else(|| params.url.strip_prefix("http://"))
-        .ok_or(StatusCode::BAD_REQUEST)?;
-
-    let (host, port) = if let Some((h, rest)) = rest.split_once(':') {
-        let port_str = rest.split('/').next().unwrap_or(rest);
-        let port: u16 = port_str.parse().map_err(|_| StatusCode::BAD_REQUEST)?;
-        (h.to_string(), port)
-    } else {
-        let host = rest.split('/').next().unwrap_or(rest).to_string();
-        let port = if params.url.starts_with("https") {
-            443
-        } else {
-            80
-        };
-        (host, port)
-    };
+    if !params.url.starts_with("https://")
+        && !params.url.starts_with("http://")
+    {
+        return Err(StatusCode::BAD_REQUEST);
+    }
 
     let client = state.ctx.registry.get(&tag).ok_or(StatusCode::NOT_FOUND)?;
 
     let delay = tokio::time::timeout(
         std::time::Duration::from_millis(params.timeout),
-        client.test_latency(&host, port),
+        client.test_latency(&params.url),
     )
     .await
     .ok()

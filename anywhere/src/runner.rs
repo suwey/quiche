@@ -26,6 +26,7 @@ use crate::inbound::socks5::Socks5Inbound;
 use crate::outbound::registry::OutboundRegistry;
 use crate::relay::CountedPacketRelay;
 use crate::relay::CountedStreamRelay;
+use crate::relay::FirstByteTimeoutRelay;
 use crate::relay::PrependPacketRelay;
 use crate::relay::PrependStreamRelay;
 use crate::relay::bidirectional_packet_relay;
@@ -1393,7 +1394,10 @@ async fn run_inbound(mut inbound: impl Inbound + 'static, ctx: AppContext) {
             };
 
             let mut counted_out = CountedStreamRelay {
-                inner: out,
+                // First-byte timeout: if the remote never answers (dead proxy
+                // session, unreachable target) tear the relay down instead of
+                // hanging until the client gives up.
+                inner: Box::new(FirstByteTimeoutRelay::new(out)),
                 stats: Arc::clone(&ctx.stats),
                 conn_counters: Arc::clone(&counters),
                 tag_stats: Arc::clone(&tag_stats),

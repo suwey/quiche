@@ -64,6 +64,11 @@ blake3 = "1"
 chacha20poly1305 = "0.11"
 noyalib = "0.0.18"
 
+[dev-dependencies]
+# `#[tokio::test(start_paused = true)]` needs tokio's test-util feature,
+# which is not part of "full" (relay first-byte timeout tests rely on it).
+tokio = { workspace = true, features = ["full", "test-util"] }
+
 [target.'cfg(target_os = "macos")'.dependencies]
 mach2 = "0.6"
 
