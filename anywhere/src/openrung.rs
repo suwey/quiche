@@ -29,11 +29,22 @@
 //!   local file for offline/debugging. The `channel == "api"` check inside the
 //!   signed body is still enforced, so a mirror/inventory artifact can never
 //!   be replayed into this path.
-//! - Backup broker fronts (CloudFront/Azure) are not tried in v1; only the
-//!   main Cloudflare front (`broker.openrung.org`) plus `file://`/local paths.
+//! - Broker fetches fail over across fronts in [`broker_candidates`] order:
+//!   a genuine custom primary is tried first, then the built-ins — the
+//!   Cloudflare front (fetched with the ECH offer), then the CloudFront and
+//!   Azure Front Door CDN fronts (plain TLS). The first front to return the
+//!   directory wins and its resolved URL becomes the authenticated endpoint;
+//!   if every front fails, the error lists each front with its own reason.
+//!   `file://`/local paths skip the network entirely (wire validation only).
 //! - Local files are the same development channel as Go's loopback exemption:
 //!   wire-schema validation only, no signature (a file has no HTTP response
 //!   to carry one).
+//! - Advertised `wss_fronts` are carried on the decoded relay and emitted
+//!   into the generated TOML for relays passing the Go eligibility gate
+//!   (`wssfront::supported_wss_fronts`); the broker base URL the directory
+//!   was fetched from is recorded as the ticket endpoint
+//!   (`[outbounds.wss_fallback]`). The WSS/CDN fallback itself lives in
+//!   [`crate::wssfront`] and the vless outbound.
 
 use base64::Engine;
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
@@ -569,6 +580,18 @@ pub struct OpenrungRelay {
     pub short_id: String,
     pub server_name: String,
     pub flow: String,
+    /// Broker-attested operator class ("foundation"/"volunteer"; missing ==
+    /// volunteer). Gates WSS-front eligibility (`supported_wss_fronts`).
+    pub node_class: String,
+    /// `exit_mode` ("direct"/"dedicated"; required by the wire check).
+    pub exit_mode: String,
+    /// `transport` ("direct"/"tunnel"; absent == "direct", like Go).
+    pub transport: String,
+    /// Advertised WSS CDN fronts, verbatim from the signed descriptor (each
+    /// front already strict-decoded by [`RelayWssFront`]). Usability is
+    /// decided by [`crate::wssfront::supported_wss_fronts`], matching Go's
+    /// use-time check — never repaired.
+    pub wss_fronts: Vec<crate::wssfront::WssFront>,
 }
 
 /// Decode verified relay-list bytes into the model (Go decodes the same
@@ -592,6 +615,19 @@ pub fn decode_relay_list(body: &[u8]) -> Result<Vec<OpenrungRelay>, String> {
             short_id: r.short_id.unwrap_or_default(),
             server_name: r.server_name.unwrap_or_default(),
             flow: r.flow.unwrap_or_default(),
+            node_class: r.node_class.unwrap_or_default(),
+            exit_mode: r.exit_mode.unwrap_or_default(),
+            transport: r.transport.unwrap_or_default(),
+            wss_fronts: r
+                .wss_fronts
+                .unwrap_or_default()
+                .into_iter()
+                .map(|f| crate::wssfront::WssFront {
+                    id: f.id,
+                    url: f.url,
+                    protocol_version: f.protocol_version,
+                })
+                .collect(),
         })
         .collect())
 }
@@ -609,6 +645,11 @@ pub struct ImportMeta {
     pub key_id: String,
     /// The signed body's not_after (RFC3339), or "none" when unsigned.
     pub not_after: String,
+    /// Broker base URL the directory was fetched from (e.g.
+    /// `https://broker.openrung.org/`), recorded on every WSS-capable node as
+    /// the ticket endpoint. Empty for local-file imports — fronts are still
+    /// emitted, but the fallback cannot run without a broker to mint tickets.
+    pub broker_base_url: String,
 }
 
 /// Outcome of the conversion: rendered TOML plus import/skip accounting
@@ -643,6 +684,14 @@ fn render_server(host: &str, port: u16) -> String {
 ///   `sni = server_name` (only when non-empty), `flow` only when non-empty;
 /// - `[outbounds.reality] public_key/short_id` validated through
 ///   `RealityConfig::parse` (invalid nodes are skipped and counted);
+/// - for relays whose advertised WSS fronts pass the Go eligibility gate
+///   (`wssfront::supported_wss_fronts`: direct-mode Foundation relay on 443
+///   with a canonical front set), the fronts are emitted as
+///   `[[outbounds.wss_fronts]]` entries; when a broker base URL is known
+///   (non-empty [`ImportMeta::broker_base_url`]), a `[outbounds.wss_fallback]`
+///   section records it as the ticket endpoint. Non-canonical front sets are
+///   silently omitted (treated as "no fronts"), exactly like Go's
+///   `supportedWSSFronts` returning nil;
 /// - every imported node aggregated into one `urltest` group tagged
 ///   `openrung` (mode/interval/url left at anywhere's defaults);
 /// - a catch-all `[[rules]] outbound = "openrung"`.
@@ -729,6 +778,35 @@ pub fn convert_relays(
             public_key: relay.reality_public_key.clone(),
             short_id: relay.short_id.clone(),
         });
+
+        // WSS fronts: only a direct-mode Foundation relay on 443 with an
+        // already-canonical front set carries usable fronts (Go
+        // connectcore.supportedWSSFronts); anything else silently means "no
+        // fronts" — the direct REALITY path is untouched either way.
+        let fronts = crate::wssfront::supported_wss_fronts(
+            &relay.node_class,
+            &relay.exit_mode,
+            &relay.transport,
+            relay.public_port,
+            &relay.wss_fronts,
+        );
+        if !fronts.is_empty() {
+            ob.wss_fronts = fronts
+                .iter()
+                .map(|f| crate::subscription::WssFrontSection {
+                    id: f.id.clone(),
+                    url: f.url.clone(),
+                    protocol_version: f.protocol_version,
+                })
+                .collect();
+            if !meta.broker_base_url.is_empty() {
+                ob.wss_fallback = Some(crate::subscription::WssFallbackSection {
+                    broker: meta.broker_base_url.clone(),
+                    relay_id: relay.id.clone(),
+                });
+            }
+        }
+
         tags.push(tag);
         outbounds.push(ob);
     }
@@ -841,7 +919,7 @@ fn classify_source(source: &str) -> Result<SourceKind, String> {
 
 /// `EnforceSecureBrokerURL` (url.go:16): HTTPS everywhere; plain HTTP only
 /// for loopback development; no user info.
-fn enforce_secure_broker_url(base_url: &str) -> Result<url::Url, String> {
+pub(crate) fn enforce_secure_broker_url(base_url: &str) -> Result<url::Url, String> {
     let trimmed = base_url.trim();
     if trimmed.is_empty() {
         return Err("broker URL is required".into());
@@ -910,7 +988,25 @@ fn format_front_failures(failures: &[(String, String)]) -> String {
 async fn fetch_broker_with_failover(
     base: &str, ua: &str,
 ) -> Result<BrokerFetch, String> {
-    let candidates = broker_candidates(base);
+    fetch_broker_fronts(&broker_candidates(base), ua).await
+}
+
+/// Whether this front is fetched with the embedded ECH offer. Only the
+/// Cloudflare front needs it: its identity leaks through the ClientHello SNI
+/// ("broker.openrung.org" is a project fingerprint) and is hidden behind the
+/// ECH config's neutral public_name. The CloudFront/Azure fronts present
+/// neutral, unguessable CDN names, so they take the plain-TLS path.
+fn front_uses_ech(front: &str) -> bool {
+    front == DEFAULT_BROKER_URL
+}
+
+/// Try each front in `candidates` order, returning the first successful
+/// `(body, signature header, endpoint)`; the successful front's resolved
+/// request URL becomes the [`RelayEndpoint::Broker`] endpoint. If every
+/// candidate fails, the error lists each front with its own reason.
+async fn fetch_broker_fronts(
+    candidates: &[String], ua: &str,
+) -> Result<BrokerFetch, String> {
     let mut failures: Vec<(String, String)> = Vec::new();
     for (index, front) in candidates.iter().enumerate() {
         let request_url = relay_list_url(front, REQUESTED_RELAY_LIMIT)?;
@@ -920,13 +1016,9 @@ async fn fetch_broker_with_failover(
             eprintln!("Fetching OpenRung relay directory: {request_url}");
         }
         eprintln!("User-Agent: {ua}");
-        // The Cloudflare front is the only one whose identity leaks through
-        // the ClientHello SNI ("broker.openrung.org" is a project
-        // fingerprint); hide it behind the embedded ECH config. The
-        // CloudFront/Azure fronts present neutral, unguessable CDN names, so
-        // they need no ECH. On ECH rejection this fetch fails closed and the
-        // failover chain continues on a neutral-SNI front.
-        let fetch = if front == DEFAULT_BROKER_URL {
+        // On ECH rejection this fetch fails closed and the failover chain
+        // continues on a neutral-SNI front (see [`front_uses_ech`]).
+        let fetch = if front_uses_ech(front) {
             crate::http_client::http_get_with_headers_ech(
                 &request_url,
                 ua,
@@ -952,6 +1044,38 @@ async fn fetch_broker_with_failover(
         }
     }
     Err(format_front_failures(&failures))
+}
+
+/// Derive the broker base URL (for WSS ticket requests) from the endpoint the
+/// directory was fetched from: `https://host/api/v1/relays?limit=20` ->
+/// `https://host/`. Local files have no broker.
+fn broker_base_from_endpoint(endpoint: &RelayEndpoint) -> String {
+    match endpoint {
+        RelayEndpoint::LocalFile(_) => String::new(),
+        RelayEndpoint::Broker(url) => {
+            // The successful request URL is "{base}/api/v1/relays?limit=N";
+            // strip everything from "/api/v1/relays" on (relay_list_url's
+            // inverse, minus its query) and keep any custom base path prefix.
+            match url::Url::parse(url) {
+                Ok(mut parsed) => {
+                    let base_path = match parsed.path().find("/api/v1/relays") {
+                        Some(idx) => parsed.path()[..idx].to_string(),
+                        None => parsed.path().to_string(),
+                    };
+                    parsed.set_path(&base_path);
+                    parsed.set_query(None);
+                    parsed.set_fragment(None);
+                    // Keep a trailing slash so appending "/api/v1/wss/tickets"
+                    // below is a plain concatenation.
+                    if !parsed.path().ends_with('/') {
+                        parsed.set_path(&format!("{}/", parsed.path()));
+                    }
+                    parsed.to_string()
+                },
+                Err(_) => String::new(),
+            }
+        },
+    }
 }
 
 /// Fetch a URL/local file, verify, convert and write the anywhere config.
@@ -999,6 +1123,7 @@ pub async fn run_openrung_import(
         .and_then(|v| v.as_str())
         .unwrap_or("none")
         .to_string(),
+        broker_base_url: broker_base_from_endpoint(&endpoint),
     };
     let result = convert_relays(&relays, &meta)?;
 
@@ -1482,6 +1607,10 @@ mod tests {
             short_id: sid.to_string(),
             server_name: "www.cloudflare.com".to_string(),
             flow: "xtls-rprx-vision".to_string(),
+            node_class: "foundation".to_string(),
+            exit_mode: "direct".to_string(),
+            transport: "direct".to_string(),
+            wss_fronts: Vec::new(),
         }
     }
 
@@ -1502,6 +1631,7 @@ mod tests {
             fetched_at_utc: "2026-09-06T02:44:00+00:00".to_string(),
             key_id: "627405615601c589".to_string(),
             not_after: "2026-09-06T03:13:09Z".to_string(),
+            broker_base_url: String::new(),
         };
         let result = convert_relays(&relays, &meta).unwrap();
         assert_eq!(result.imported, 3);
@@ -1621,6 +1751,172 @@ mod tests {
         assert!(convert_relays(&relays, &ImportMeta::default()).is_err());
     }
 
+    // -- wss fronts: decode / eligibility / TOML emission --------------------
+
+    #[test]
+    fn test_production_fixture_decodes_fronts() {
+        let relays = decode_relay_list(FIXTURE_BODY).unwrap();
+        let first = &relays[0];
+        assert_eq!(first.node_class, "foundation");
+        assert_eq!(first.exit_mode, "direct");
+        assert_eq!(first.transport, "direct");
+        assert_eq!(first.wss_fronts.len(), 1);
+        assert_eq!(first.wss_fronts[0].id, "breezy-yak-bunny-a");
+        assert_eq!(
+            first.wss_fronts[0].url,
+            "wss://edgefe20d6ac5ec5b414a3a8.b-cdn.net/api/v1/wss-bridge"
+        );
+        assert_eq!(first.wss_fronts[0].protocol_version, 1);
+        // The fourth fixture relay advertises no fronts.
+        assert!(relays[3].wss_fronts.is_empty());
+    }
+
+    #[test]
+    fn test_convert_emits_fronts_and_fallback() {
+        let mut relay = sample_relay("relay_wss1", "wssnode", VALID_PBK, "01");
+        relay.wss_fronts = vec![
+            crate::wssfront::WssFront::new(
+                "a-front",
+                "wss://a.b-cdn.net/api/v1/wss-bridge",
+            ),
+            crate::wssfront::WssFront::new(
+                "b-front",
+                "wss://b.b-cdn.net/api/v1/wss-bridge",
+            ),
+        ];
+        let meta = ImportMeta {
+            broker_base_url: "https://broker.openrung.org/".to_string(),
+            ..Default::default()
+        };
+        let result = convert_relays(&[relay], &meta).unwrap();
+        let toml = &result.toml;
+        assert!(toml.contains("[[outbounds.wss_fronts]]"), "{toml}");
+        assert!(toml.contains("id = \"a-front\""));
+        assert!(toml.contains("id = \"b-front\""));
+        assert!(toml.contains(
+            "url = \"wss://a.b-cdn.net/api/v1/wss-bridge\""
+        ));
+        assert!(toml.contains("protocol_version = 1"));
+        assert!(toml.contains("[outbounds.wss_fallback]"));
+        assert!(toml.contains("broker = \"https://broker.openrung.org/\""));
+
+        // Round-trip through anywhere's config parser.
+        let cfg = crate::config::Config::from_string(toml).unwrap();
+        let ob = &cfg.outbounds[0];
+        let fronts = ob.wss_fronts.as_ref().unwrap();
+        assert_eq!(fronts.len(), 2);
+        assert_eq!(fronts[0].id, "a-front");
+        assert_eq!(fronts[1].url, "wss://b.b-cdn.net/api/v1/wss-bridge");
+        assert_eq!(fronts[1].protocol_version, 1);
+        let fb = ob.wss_fallback.as_ref().unwrap();
+        assert_eq!(fb.broker.as_deref(), Some("https://broker.openrung.org/"));
+    }
+
+    #[test]
+    fn test_convert_fronts_without_broker_keeps_fronts_drops_fallback() {
+        let mut relay = sample_relay("relay_wss2", "wssnode2", VALID_PBK, "01");
+        relay.wss_fronts = vec![crate::wssfront::WssFront::new(
+            "a-front",
+            "wss://a.b-cdn.net/api/v1/wss-bridge",
+        )];
+        let result =
+            convert_relays(std::slice::from_ref(&relay), &ImportMeta::default())
+                .unwrap();
+        assert!(result.toml.contains("[[outbounds.wss_fronts]]"));
+        assert!(!result.toml.contains("[outbounds.wss_fallback]"));
+    }
+
+    #[test]
+    fn test_convert_omits_unusable_front_sets() {
+        // Volunteer class → fronts unusable (Go supportedWSSFronts).
+        let mut relay = sample_relay("relay_vol", "vol", VALID_PBK, "01");
+        relay.node_class = "volunteer".to_string();
+        relay.wss_fronts = vec![crate::wssfront::WssFront::new(
+            "a-front",
+            "wss://a.b-cdn.net/api/v1/wss-bridge",
+        )];
+        let result =
+            convert_relays(std::slice::from_ref(&relay), &ImportMeta::default())
+                .unwrap();
+        assert!(!result.toml.contains("[[outbounds.wss_fronts]]"));
+
+        // Non-canonical front URL → silently no fronts (never repaired).
+        let mut relay = sample_relay("relay_badurl", "badurl", VALID_PBK, "01");
+        relay.wss_fronts = vec![crate::wssfront::WssFront::new(
+            "a-front",
+            "wss://a.b-cdn.net:8443/api/v1/wss-bridge",
+        )];
+        let result =
+            convert_relays(std::slice::from_ref(&relay), &ImportMeta::default())
+                .unwrap();
+        assert!(!result.toml.contains("[[outbounds.wss_fronts]]"));
+
+        // More than four fronts → no fronts.
+        let mut relay = sample_relay("relay_many", "many", VALID_PBK, "01");
+        relay.wss_fronts = (0..5)
+            .map(|i| {
+                crate::wssfront::WssFront::new(
+                    &format!("f{i}"),
+                    &format!("wss://f{i}.b-cdn.net/api/v1/wss-bridge"),
+                )
+            })
+            .collect();
+        let result =
+            convert_relays(std::slice::from_ref(&relay), &ImportMeta::default())
+                .unwrap();
+        assert!(!result.toml.contains("[[outbounds.wss_fronts]]"));
+
+        // Unsorted front set → no fronts (Go: !slices.Equal → nil).
+        let mut relay =
+            sample_relay("relay_unsorted", "unsorted", VALID_PBK, "01");
+        relay.wss_fronts = vec![
+            crate::wssfront::WssFront::new(
+                "b-front",
+                "wss://b.b-cdn.net/api/v1/wss-bridge",
+            ),
+            crate::wssfront::WssFront::new(
+                "a-front",
+                "wss://a.b-cdn.net/api/v1/wss-bridge",
+            ),
+        ];
+        let result =
+            convert_relays(std::slice::from_ref(&relay), &ImportMeta::default())
+                .unwrap();
+        assert!(!result.toml.contains("[[outbounds.wss_fronts]]"));
+    }
+
+    #[test]
+    fn test_wire_decode_front_missing_field_rejected() {
+        // The strict front decode (Go relayWSSFront.UnmarshalJSON) requires
+        // all three fields: dropping the URL must fail the wire check.
+        let with_front = br#"{"count":1,"server_time":"2026-07-10T00:00:00Z","not_after":"2026-07-10T00:30:00Z","channel":"api","limit":1,"relays":[{"id":"r","public_host":"192.0.2.1","public_port":443,"protocol":"vless-reality-vision","client_id":"c","reality_public_key":"key","short_id":"01","server_name":"example.com","flow":"xtls-rprx-vision","exit_mode":"direct","max_sessions":1,"max_mbps":10,"volunteer_version":"1.0.0","registered_at":"2026-07-10T00:00:00Z","last_heartbeat_at":"2026-07-10T00:00:00Z","expires_at":"2026-07-10T00:10:00Z","wss_fronts":[{"id":"front","protocol_version":1}]}]}"#;
+        let err = validate_relay_list_wire(with_front).unwrap_err();
+        assert!(err.contains("wire schema") || err.contains("decode"), "{err}");
+    }
+
+    #[test]
+    fn test_broker_base_from_endpoint() {
+        assert_eq!(
+            broker_base_from_endpoint(&RelayEndpoint::Broker(
+                "https://broker.openrung.org/api/v1/relays?limit=20".to_string()
+            )),
+            "https://broker.openrung.org/"
+        );
+        // Custom base path is preserved.
+        assert_eq!(
+            broker_base_from_endpoint(&RelayEndpoint::Broker(
+                "https://cdn.example.com/or/api/v1/relays?limit=20".to_string()
+            )),
+            "https://cdn.example.com/or/"
+        );
+        assert_eq!(
+            broker_base_from_endpoint(&RelayEndpoint::LocalFile(
+                "/tmp/relays.json".to_string()
+            )),
+            ""
+        );
+    }
+
     // -- source classification / URL building --------------------------------
 
     #[test]
@@ -1713,5 +2009,148 @@ mod tests {
         assert!(text.contains("2 tried"));
         assert!(text.contains("https://a.example/api/v1/relays?limit=20: connect refused"));
         assert!(text.contains("https://b.example/api/v1/relays?limit=20: timeout"));
+    }
+
+    // -- broker front failover (local loopback servers, no network) ----------
+
+    /// Bind and immediately drop a loopback listener; its port now refuses
+    /// connections deterministically (ECONNREFUSED on loopback, no packets
+    /// leave the machine).
+    fn refused_port() -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        port
+    }
+
+    const HEAD_END: &[u8] = b"\r\n\r\n";
+
+    /// Build an HTTP/1.1 response with extra headers and a fixed body.
+    fn http_response(extra_headers: &[(&str, &str)], body: &[u8]) -> Vec<u8> {
+        let mut head = String::from("HTTP/1.1 200 OK\r\n");
+        for (name, value) in extra_headers {
+            head.push_str(&format!("{name}: {value}\r\n"));
+        }
+        head.push_str(&format!("content-length: {}\r\n", body.len()));
+        head.push_str("connection: close\r\n\r\n");
+        let mut out = head.into_bytes();
+        out.extend_from_slice(body);
+        out
+    }
+
+    /// A minimal loopback HTTP front answering every connection with
+    /// `response` until dropped. Returns its base URL
+    /// (`http://127.0.0.1:PORT/` — loopback cleartext is allowed by
+    /// [`enforce_secure_broker_url`]).
+    async fn spawn_local_front(response: Vec<u8>) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener =
+            tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let response = response.clone();
+                tokio::spawn(async move {
+                    // Drain the request head before answering; the client is
+                    // hyper with Connection: close, one request per socket.
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 1024];
+                    while buf.windows(HEAD_END.len()).all(|w| w != HEAD_END) {
+                        match sock.read(&mut chunk).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                        }
+                    }
+                    let _ = sock.write_all(&response).await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+        format!("http://{addr}/")
+    }
+
+    #[test]
+    fn ech_offer_only_on_the_default_front() {
+        // The Cloudflare front's SNI is a project fingerprint, so it is the
+        // only front fetched with the ECH offer; the CDN fronts present
+        // neutral, unguessable names and take the plain-TLS path.
+        assert!(front_uses_ech(DEFAULT_BROKER_URL));
+        assert!(!front_uses_ech(CLOUDFRONT_BROKER_URL));
+        assert!(!front_uses_ech(AZURE_BROKER_URL));
+        assert!(!front_uses_ech("http://127.0.0.1:8080/"));
+    }
+
+    #[tokio::test]
+    async fn fetch_failover_serves_from_next_front_with_its_url() {
+        let (_, signer) = test_signer();
+        let body = FIXTURE_BODY.to_vec();
+        let sig = signer.sign_header(&signer.key_id(), &body);
+        let dead = format!("http://127.0.0.1:{}/", refused_port());
+        let live = spawn_local_front(http_response(
+            &[("X-OpenRung-Relays-Signature", &sig)],
+            &body,
+        ))
+        .await;
+
+        // Dead primary first, live front second: the chain must move on.
+        let candidates = vec![dead, live.clone()];
+        let (fetched, fetched_sig, endpoint) =
+            fetch_broker_fronts(&candidates, "anywhere-test").await.unwrap();
+
+        // The live front's bytes and its relayed signature header came
+        // through verbatim (the header is what verification binds to).
+        assert_eq!(fetched, body);
+        assert_eq!(fetched_sig.as_deref(), Some(sig.as_str()));
+        // The successful front's URL is the authenticated endpoint.
+        assert_eq!(
+            endpoint,
+            RelayEndpoint::Broker(format!("{live}api/v1/relays?limit=20"))
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_first_success_wins_over_later_fronts() {
+        let (_, signer) = test_signer();
+        let body = FIXTURE_BODY.to_vec();
+        let sig = signer.sign_header(&signer.key_id(), &body);
+        let response =
+            http_response(&[("X-OpenRung-Relays-Signature", &sig)], &body);
+        let first = spawn_local_front(response.clone()).await;
+        let second = spawn_local_front(response).await;
+        assert_ne!(first, second);
+
+        // Both fronts work: the first candidate (a working custom primary
+        // sitting ahead of the built-ins) must be used, not skipped.
+        let candidates = vec![first.clone(), second];
+        let (_, _, endpoint) =
+            fetch_broker_fronts(&candidates, "anywhere-test").await.unwrap();
+        assert_eq!(
+            endpoint,
+            RelayEndpoint::Broker(format!("{first}api/v1/relays?limit=20"))
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_all_fronts_failure_lists_each_front_reason() {
+        let dead1 = format!("http://127.0.0.1:{}/", refused_port());
+        let dead2 = format!("http://127.0.0.1:{}/", refused_port());
+        let candidates = vec![dead1, dead2];
+        let err = fetch_broker_fronts(&candidates, "anywhere-test")
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.contains("all OpenRung broker fronts failed (2 tried)"),
+            "{err}"
+        );
+        // Every front is listed with its own reason line.
+        for base in &candidates {
+            let url = relay_list_url(base, REQUESTED_RELAY_LIMIT).unwrap();
+            assert!(err.contains(&format!("- {url}: ")), "{err}");
+        }
+        assert_eq!(err.matches("Connection refused").count(), 2, "{err}");
     }
 }

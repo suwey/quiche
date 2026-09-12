@@ -82,6 +82,12 @@ pub struct TomlOutbound {
     pub transport: Option<TransportConfig>,
     /// Optional nested `[outbounds.reality]` section (REALITY transport).
     pub reality: Option<RealitySection>,
+    /// OpenRung WSS CDN fronts, rendered as `[[outbounds.wss_fronts]]`
+    /// array-of-tables entries (OpenRung directory import only).
+    pub wss_fronts: Vec<WssFrontSection>,
+    /// Optional `[outbounds.wss_fallback]` section (OpenRung directory import
+    /// only) — carries the broker base URL used for WSS ticket requests.
+    pub wss_fallback: Option<WssFallbackSection>,
 }
 
 pub enum TomlValue {
@@ -105,6 +111,23 @@ pub struct RealitySection {
     pub short_id: String,
 }
 
+/// One `[[outbounds.wss_fronts]]` entry — a signed, relay-specific OpenRung
+/// WSS CDN front (crate::wssfront::WssFront on the wire).
+pub struct WssFrontSection {
+    pub id: String,
+    pub url: String,
+    pub protocol_version: i64,
+}
+
+/// `[outbounds.wss_fallback]` section — direct-first WSS/CDN fallback knobs.
+pub struct WssFallbackSection {
+    /// Broker base URL for WSS session ticket requests
+    /// (POST {broker}/api/v1/wss/tickets).
+    pub broker: String,
+    /// The OpenRung relay ID (`relay_...`) bound into tickets.
+    pub relay_id: String,
+}
+
 impl TomlOutbound {
     pub fn new(type_: &str, tag: &str) -> Self {
         Self {
@@ -113,6 +136,8 @@ impl TomlOutbound {
             fields: Vec::new(),
             transport: None,
             reality: None,
+            wss_fronts: Vec::new(),
+            wss_fallback: None,
         }
     }
 
@@ -257,6 +282,26 @@ fn outbounds_to_toml(outbounds: &[TomlOutbound]) -> String {
             out.push_str(&format!(
                 "short_id = \"{}\"\n",
                 escape_toml_str(&r.short_id)
+            ));
+        }
+        for f in &ob.wss_fronts {
+            out.push_str("\n[[outbounds.wss_fronts]]\n");
+            out.push_str(&format!("id = \"{}\"\n", escape_toml_str(&f.id)));
+            out.push_str(&format!("url = \"{}\"\n", escape_toml_str(&f.url)));
+            out.push_str(&format!(
+                "protocol_version = {}\n",
+                f.protocol_version
+            ));
+        }
+        if let Some(fb) = &ob.wss_fallback {
+            out.push_str("\n[outbounds.wss_fallback]\n");
+            out.push_str(&format!(
+                "broker = \"{}\"\n",
+                escape_toml_str(&fb.broker)
+            ));
+            out.push_str(&format!(
+                "relay_id = \"{}\"\n",
+                escape_toml_str(&fb.relay_id)
             ));
         }
         out.push('\n');

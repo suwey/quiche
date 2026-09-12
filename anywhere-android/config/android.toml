@@ -4,28 +4,30 @@ secret = "admin"
 [[inbounds]]
 type = "tun"
 tag = "tun-in"
-mtu = 8096
 
 [[outbounds]]
 type = "mless"
-tag = "CF"
-server = "REDACTED:2087"
-password = "REDACTED"
+tag = "ml"
+server = "REDACTED"
+password = ""
 sni = "REDACTED"
-fp = true
-transport_type = "ws"
-transport_path = "/"
-transport_headers.Host = "REDACTED"
+
+[outbounds.transport]
+type = "ws"
+
+[outbounds.transport.ws]
+path = "/"
+headers = { Host = "REDACTED" }
 
 [[outbounds]]
 type = "urltest"
 tag = "auto"
-outbounds = ["CF"]
+outbounds = ["ml"]
 
 [[rules]]
 # protocol examples: "both:1232" "tcp:123,1132" "udp:123,2222"
 protocol = "stun"  # both:3748,3749
-outbound = "none" # drop the traffic
+outbound = "reject" # drop the traffic
 
 [[rules]]
 # some software use other ports such as Xunlei, recommend set direct mode in ui when download.

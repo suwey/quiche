@@ -232,12 +232,33 @@ fn bind_to_physical_iface(fd: std::os::fd::RawFd) -> io::Result<()> {
     Ok(())
 }
 
+/// Connect timeout for the bypass TCP dial helpers. Bounds the connect's
+/// poll budget so a blackholed destination (SYN dropped) fails fast instead
+/// of hanging for the OS-level connect timeout (75s+ on macOS).
+const TCP_CONNECT_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(5);
+
 /// Connect a TCP socket, applying SO_MARK on Linux so it bypasses TUN routing.
 /// The address MUST be a resolved `SocketAddr` (IP:port), not a domain.
 
 pub async fn connect_tcp_bypass(
     addr: std::net::SocketAddr,
 ) -> io::Result<TcpStream> {
+    // Loopback destinations never enter the TUN — no mark/interface binding
+    // is needed, and forcing them out the physical interface (the WSS
+    // bridge listener case) blackholes the SYN entirely.
+    if addr.ip().is_loopback() {
+        #[cfg(not(target_os = "windows"))]
+        {
+            let stream = TcpStream::connect(addr).await?;
+            let _ = stream.set_nodelay(true);
+            return Ok(stream);
+        }
+        #[cfg(target_os = "windows")]
+        {
+            return TcpStream::connect(addr).await;
+        }
+    }
     #[cfg(target_os = "linux")]
     {
         use crate::inbound::tun::BYPASS_FWMARK;
@@ -245,9 +266,6 @@ pub async fn connect_tcp_bypass(
         use socket2::Protocol;
         use socket2::Socket;
         use socket2::Type;
-
-        const TCP_CONNECT_TIMEOUT: std::time::Duration =
-            std::time::Duration::from_secs(5);
 
         let domain = if addr.is_ipv4() {
             Domain::IPV4
@@ -382,6 +400,12 @@ pub async fn connect_tcp_bypass(
         use socket2::Type;
         use std::os::windows::io::AsRawSocket;
 
+        // Loopback: never enter the TUN, never bind IP_UNICAST_IF (see the
+        // macOS branch for the blackhole rationale).
+        if addr.ip().is_loopback() {
+            return TcpStream::connect(addr).await;
+        }
+
         // Windows: bind the socket to the physical interface via IP_UNICAST_IF
         // so outbound traffic bypasses the TUN split routes.
         let domain = if addr.is_ipv4() {
@@ -402,11 +426,14 @@ pub async fn connect_tcp_bypass(
         let ipv4 = addr.is_ipv4();
         set_unicast_if_raw(socket.as_raw_socket() as libc::SOCKET, ipv4);
 
-        // Blocking connect on a cloned handle; the original retains the
+        // Bounded connect on a cloned handle; the original retains the
         // IP_UNICAST_IF setting (duplicated sockets share the same state).
+        // connect_timeout runs a nonblocking connect + WSAPoll internally and
+        // returns TimedOut on expiry, so a blackholed destination can't wedge
+        // a blocking-pool thread for the OS-level connect timeout.
         let socket_clone = socket.try_clone()?;
         let connect_result = tokio::task::spawn_blocking(move || {
-            socket_clone.connect(&addr.into())
+            socket_clone.connect_timeout(&addr.into(), TCP_CONNECT_TIMEOUT)
         })
         .await;
         match connect_result {
@@ -450,6 +477,18 @@ async fn connect_tcp_bypass_macos(
     use socket2::Socket;
     use socket2::Type;
     use std::os::fd::AsRawFd;
+
+    // Loopback destinations must NOT be bound to the physical interface:
+    // the WSS bridge listener lives on 127.0.0.1, and a loopback SYN forced
+    // out en0 (physical-iface source bind + IP_BOUND_IF, while the TUN's
+    // pf ruleset and split routes are active) blackholes — every bridge
+    // transport build then times out and all proxied dials die. Loopback
+    // traffic never enters the TUN, so the bypass is pointless for it.
+    if addr.ip().is_loopback() {
+        let stream = TcpStream::connect(addr).await?;
+        let _ = stream.set_nodelay(true);
+        return Ok(stream);
+    }
 
     let domain = if addr.is_ipv4() {
         Domain::IPV4
@@ -507,12 +546,71 @@ async fn connect_tcp_bypass_macos(
         }
     }
 
-    let socket_clone = socket.try_clone()?;
+    // Non-blocking connect + poll (mirrors the Android path): a blackholed
+    // destination (SYN dropped) must fail within TCP_CONNECT_TIMEOUT instead
+    // of hanging for the OS-level connect timeout (75s+ on macOS) while
+    // leaking a blocking-pool thread.
+    socket.set_nonblocking(true)?;
+    let fd = socket.as_raw_fd();
     let connect_result =
-        tokio::task::spawn_blocking(move || socket_clone.connect(&addr.into()))
-            .await;
+        tokio::task::spawn_blocking(move || -> io::Result<std::net::TcpStream> {
+            match socket.connect(&addr.into()) {
+                Ok(()) => {},
+                Err(e)
+                    if e.raw_os_error() == Some(libc::EINPROGRESS)
+                        || e.raw_os_error() == Some(libc::EWOULDBLOCK) =>
+                {
+                    // Connect in progress: poll for writability with a bounded
+                    // budget, then fetch the connect result via SO_ERROR.
+                    let mut pfd = libc::pollfd {
+                        fd,
+                        events: libc::POLLOUT,
+                        revents: 0,
+                    };
+                    let ret = unsafe {
+                        libc::poll(
+                            &mut pfd,
+                            1,
+                            TCP_CONNECT_TIMEOUT.as_millis() as libc::c_int,
+                        )
+                    };
+                    if ret < 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    if ret == 0 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "connect poll timeout",
+                        ));
+                    }
+                    // Writable: check SO_ERROR for the connect result.
+                    let mut err: i32 = 0;
+                    let mut len = std::mem::size_of::<i32>() as libc::socklen_t;
+                    let ret = unsafe {
+                        libc::getsockopt(
+                            fd,
+                            libc::SOL_SOCKET,
+                            libc::SO_ERROR,
+                            &mut err as *mut _ as *mut _,
+                            &mut len,
+                        )
+                    };
+                    if ret < 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    if err != 0 {
+                        return Err(io::Error::from_raw_os_error(err));
+                    }
+                },
+                Err(e) => return Err(e),
+            }
+            // Non-blocking mode was set before connect and is preserved for
+            // the tokio registration below.
+            Ok(socket.into())
+        })
+        .await;
     match connect_result {
-        Ok(Ok(())) => {},
+        Ok(Ok(std_stream)) => Ok(TcpStream::from_std(std_stream)?),
         Ok(Err(e)) => {
             log::warn!("macOS TCP bypass: connect to {addr} failed: {e}");
             if e.kind() == io::ErrorKind::NetworkUnreachable {
@@ -524,14 +622,10 @@ async fn connect_tcp_bypass_macos(
                 })
                 .await;
             }
-            return Err(e);
+            Err(e)
         },
-        Err(e) => return Err(io::Error::new(io::ErrorKind::Other, e)),
+        Err(e) => Err(io::Error::new(io::ErrorKind::Other, e)),
     }
-
-    socket.set_nonblocking(true)?;
-    let std_stream: std::net::TcpStream = socket.into();
-    Ok(TcpStream::from_std(std_stream)?)
 }
 
 /// Bind a UDP socket, applying SO_MARK on Linux so it bypasses TUN routing.
@@ -1023,6 +1117,156 @@ pub fn resolve_addr(server: &str) -> Result<std::net::SocketAddr, String> {
     ))
 }
 
+/// Plain-UDP upstreams used by [`resolve_bypass`] when the engine's own DNS
+/// upstreams are not reachable from this call site. Mirrors the DNS engine's
+/// injected direct default (dns::DnsConfig: `223.5.5.5` auto-appended) plus
+/// the classic secondary.
+const BYPASS_RESOLVER_UPSTREAMS: [std::net::SocketAddr; 2] = [
+    std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::new(
+        223, 5, 5, 5,
+    )), 53),
+    std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::new(
+        114, 114, 114, 114,
+    )), 53),
+];
+
+/// Per-upstream receive budget for [`resolve_bypass`]. Bounded so a silent
+/// upstream cannot stall the caller past its own attempt budget.
+const BYPASS_RESOLVE_RECV_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(3);
+
+/// Is `ip` inside the engine's default fake-ip space (198.18.0.0/15)?
+///
+/// The system stub resolver answers with fake-ip while the TUN DNS hijack is
+/// active, so a bypass dial must never use system-resolver answers from that
+/// range — the packet would leave the physical interface toward a bogon and
+/// blackhole. A custom `[dns] fakeip` CIDR is not detected here; the system
+/// fallback only runs after both direct upstreams failed, in which case the
+/// hijack itself is unlikely to be answering.
+fn is_default_fake_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        // 198.18.0.0/15 = 198.18.0.0 – 198.19.255.255.
+        std::net::IpAddr::V4(v4) => {
+            v4.octets()[0] == 198
+                && matches!(v4.octets()[1], 18 | 19)
+        },
+        std::net::IpAddr::V6(_) => false,
+    }
+}
+
+/// Resolve `host:port` for a connection that must **not** enter the TUN.
+///
+/// The engine's DNS hijack rewrites the system resolver's answers to fake-ip
+/// for non-CN names (`198.18.0.0/15`), so any `lookup_host`/`ToSocketAddrs`
+/// call made by anywhere itself resolves to a bogon while the TUN is up, and
+/// a plain `TcpStream::connect` to the real address is routed back into the
+/// tunnel — the WSS ticket path deadlocked exactly this way (its own ticket
+/// request was steered into the dead proxy it was trying to heal). The
+/// resolver here sends the A query through a bypass-bound UDP socket
+/// ([`bind_udp_bypass`], the same mark/binding the DNS engine's direct
+/// upstreams use), so the answer is a real address regardless of the hijack.
+///
+/// Order: IP literals pass through; A query to each bypass upstream; finally
+/// the system resolver with fake-ip answers rejected (safe while the TUN is
+/// down, when the hijack is not answering anyway).
+pub(crate) async fn resolve_bypass(
+    host: &str, port: u16,
+) -> io::Result<std::net::SocketAddr> {
+    resolve_bypass_via(&BYPASS_RESOLVER_UPSTREAMS, host, port, true).await
+}
+
+/// [`resolve_bypass`] with injectable upstreams and bind mode. `bypass_bind`
+/// selects the mark/physical-iface-bound socket (`true`, production) or a
+/// plain socket (tests, where the physical-iface bind would detour loopback
+/// mock upstreams).
+async fn resolve_bypass_via(
+    upstreams: &[std::net::SocketAddr], host: &str, port: u16,
+    bypass_bind: bool,
+) -> io::Result<std::net::SocketAddr> {
+    // IP literal — no DNS involved.
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return Ok(std::net::SocketAddr::new(ip, port));
+    }
+
+    let query = crate::dns::wire::build_a_query(host);
+    for upstream in upstreams {
+        let bind_addr: std::net::SocketAddr =
+            if upstream.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" }
+                .parse()
+                .expect("static bind addr");
+        let sock = if bypass_bind {
+            match bind_udp_bypass(bind_addr).await {
+                Ok(s) => s,
+                // No physical iface to bind (pre-TUN, unusual envs): a
+                // plain socket still reaches the upstream as long as the
+                // hijack isn't rewriting it.
+                Err(_) => tokio::net::UdpSocket::bind(bind_addr).await?,
+            }
+        } else {
+            tokio::net::UdpSocket::bind(bind_addr).await?
+        };
+        if sock.connect(upstream).await.is_err() {
+            continue;
+        }
+        if sock.send(&query).await.is_err() {
+            continue;
+        }
+        let mut buf = vec![0u8; 4096];
+        let read = match tokio::time::timeout(
+            BYPASS_RESOLVE_RECV_TIMEOUT,
+            sock.recv(&mut buf),
+        )
+        .await
+        {
+            Ok(Ok(n)) => n,
+            _ => continue,
+        };
+        // Sanity: the response must carry our txn id (build_a_query uses 0)
+        // and must not be a plain query echo.
+        if read < 12
+            || crate::dns::wire::txn_id(&buf[..read]) != 0
+            || (buf[2] & 0x80) == 0
+        {
+            continue;
+        }
+        if let Some(ip) = crate::dns::wire::first_a_record(&buf[..read]) {
+            return Ok(std::net::SocketAddr::new(ip, port));
+        }
+    }
+
+    // System fallback — correct whenever the TUN (and thus the hijack) is
+    // down; fake-ip answers are rejected so a half-up state degrades to an
+    // error instead of a blackholed bypass dial.
+    let last_err = {
+        let host = host.to_string();
+        tokio::task::spawn_blocking(move || {
+            std::net::ToSocketAddrs::to_socket_addrs(&(host.as_str(), port))
+                .map(|addrs| {
+                addrs
+                    .filter(|a| !is_default_fake_ip(a.ip()))
+                    .collect::<Vec<_>>()
+            })
+        })
+        .await
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
+    };
+    match last_err {
+        Ok(addrs) => addrs
+            .into_iter()
+            .next()
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("no non-fake-ip addresses for {host}"),
+                )
+            }),
+        Err(e) => Err(io::Error::new(
+            io::ErrorKind::Other,
+            format!("system resolve {host}: {e}"),
+        )),
+    }
+}
+
 #[cfg(test)]
 mod ech_offer_tests {
     use super::*;
@@ -1106,6 +1350,165 @@ mod ech_offer_tests {
             .await
             .is_err(),
             "a real ECH offer against a non-ECH server must fail closed"
+        );
+    }
+}
+
+#[cfg(test)]
+mod resolve_bypass_tests {
+    use super::*;
+
+    /// An IP literal needs no DNS at all — even an empty upstream list must
+    /// resolve it (proves the fast path and that no network is touched).
+    #[tokio::test]
+    async fn ip_literal_fast_path() {
+        let got = resolve_bypass_via(&[], "127.0.0.1", 8080, true)
+            .await
+            .expect("ip literal must resolve without DNS");
+        assert_eq!(got, "127.0.0.1:8080".parse().unwrap());
+    }
+
+    /// The default fake-ip space is 198.18.0.0/15 → 198.18.x and 198.19.x.
+    #[test]
+    fn fake_ip_range_detection() {
+        for ip in ["198.18.0.1", "198.18.255.255", "198.19.0.0", "198.19.9.9"] {
+            assert!(
+                is_default_fake_ip(ip.parse().unwrap()),
+                "{ip} must be detected as fake-ip"
+            );
+        }
+        for ip in ["198.17.255.255", "198.20.0.1", "8.8.8.8", "1.2.3.4"] {
+            assert!(
+                !is_default_fake_ip(ip.parse().unwrap()),
+                "{ip} must not be detected as fake-ip"
+            );
+        }
+        assert!(!is_default_fake_ip("::1".parse().unwrap()));
+    }
+
+    /// A loopback mock upstream answering with a real A record must be used:
+    /// this exercises the query build, txn-id/QR sanity checks, and the
+    /// answer parse (`first_a_record`) end-to-end without any real network.
+    #[tokio::test]
+    async fn mock_upstream_answer_is_parsed() {
+        let mock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mock_addr = mock.local_addr().unwrap();
+        let answer_ip: std::net::Ipv4Addr = "93.184.216.34".parse().unwrap();
+        let server = tokio::spawn(async move {
+            let mut buf = vec![0u8; 1500];
+            let (n, peer) = mock.recv_from(&mut buf).await.unwrap();
+            let resp = crate::dns::wire::build_fake_a_response(
+                &buf[..n],
+                answer_ip,
+            )
+            .expect("mock response must build");
+            mock.send_to(&resp, peer).await.unwrap();
+        });
+
+        let got = resolve_bypass_via(
+            &[mock_addr],
+            "front.example-cdn.test",
+            443,
+            false,
+        )
+        .await
+        .expect("mock upstream must resolve");
+        server.await.unwrap();
+        assert_eq!(got, "93.184.216.34:443".parse().unwrap());
+    }
+
+    /// A query echo (QR bit unset) must not be mistaken for a response: the
+    /// mock echoes, the sanity check skips it, both upstreams "fail", and the
+    /// system fallback rejects the unresolvable test name with an error.
+    #[tokio::test]
+    async fn query_echo_is_not_treated_as_response() {
+        let mock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mock_addr = mock.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut buf = vec![0u8; 1500];
+            let (n, peer) = mock.recv_from(&mut buf).await.unwrap();
+            mock.send_to(&buf[..n], peer).await.unwrap();
+        });
+
+        let got = resolve_bypass_via(
+            &[mock_addr],
+            "unresolvable-bypass-test.invalid",
+            443,
+            false,
+        )
+        .await;
+        server.await.unwrap();
+        assert!(got.is_err(), "echo must not resolve: {got:?}");
+    }
+}
+
+#[cfg(test)]
+mod bypass_connect_tests {
+    use super::*;
+
+    /// Success case: dial a local listener through the bypass path
+    /// (socket2 socket + nonblocking connect + poll) and confirm the returned
+    /// stream is registered with tokio in nonblocking mode.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn bypass_connect_succeeds_to_local_listener() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let stream = connect_tcp_bypass(addr)
+            .await
+            .expect("loopback dial through the bypass path must succeed");
+        // The stream must be usable as an async stream (nonblocking mode
+        // preserved through the connect).
+        stream.set_nodelay(true).unwrap();
+    }
+
+    /// Regression: a blackholed destination (unroutable RFC1918 address whose
+    /// SYNs are silently dropped) must return an error within the connect
+    /// poll budget instead of hanging for the OS-level connect timeout
+    /// (75s+ on macOS). The 20s wall bound is generous headroom above the
+    /// 5s budget; an environment that actively rejects the SYN just fails
+    /// faster (still an error).
+    /// Regression guard for the WSS bridge leg: the bridge listener is on
+    /// 127.0.0.1, and the bypass dial must NOT bind it to the physical
+    /// interface — a loopback destination forced out en0 blackholes (the
+    /// bridge builds then time out and every proxied dial dies).
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn bypass_connect_loopback_works_with_warm_iface_cache() {
+        // Warm the physical-iface cache exactly like the running engine.
+        refresh_macos_physical_iface_cache();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let stream = tokio::time::timeout(
+            std::time::Duration::from_secs(6),
+            connect_tcp_bypass(addr),
+        )
+        .await
+        .expect("loopback dial must not hang")
+        .expect("loopback dial through the bypass path must succeed");
+        drop(stream);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn bypass_connect_to_blackhole_fails_fast() {
+        let addr: std::net::SocketAddr = "10.255.255.1:65534".parse().unwrap();
+        let start = std::time::Instant::now();
+        let result = connect_tcp_bypass(addr).await;
+        let elapsed = start.elapsed();
+        assert!(
+            result.is_err(),
+            "dial to a blackhole must not succeed: {:?}",
+            result
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(20),
+            "dial to a blackhole must fail within the connect budget, \
+             took {elapsed:?}"
         );
     }
 }

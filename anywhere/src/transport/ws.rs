@@ -8,7 +8,10 @@ use base64::Engine;
 use sha1::Digest;
 use sha1::Sha1;
 
-const MAGIC_STRING: &str = "258EAFA5-E914-47DA-95CA-5AB5A0BD85B1";
+// RFC 6455 §1.3: the fixed GUID appended to the client key when computing
+// Sec-WebSocket-Accept. (A scrambled copy of this constant shipped in
+// 1.0.0 and failed the Accept check against every real server.)
+const MAGIC_STRING: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
 // ========== LCG PRNG ==========
 
@@ -75,7 +78,7 @@ fn read_line<R: Read>(r: &mut R) -> Result<String> {
     })
 }
 
-fn parse_status_line(line: &str) -> Result<u16> {
+pub(crate) fn parse_status_line(line: &str) -> Result<u16> {
     let parts: Vec<&str> = line.splitn(3, ' ').collect();
     if parts.len() < 2 {
         return Err(Error::new(
@@ -88,7 +91,7 @@ fn parse_status_line(line: &str) -> Result<u16> {
     })
 }
 
-fn compute_accept(key: &str) -> String {
+pub(crate) fn compute_accept(key: &str) -> String {
     let mut hasher = Sha1::new();
     hasher.update(key.as_bytes());
     hasher.update(MAGIC_STRING.as_bytes());
@@ -96,7 +99,7 @@ fn compute_accept(key: &str) -> String {
     base64::engine::general_purpose::STANDARD.encode(result)
 }
 
-fn header_value<'a>(line: &'a str, name: &str) -> Option<&'a str> {
+pub(crate) fn header_value<'a>(line: &'a str, name: &str) -> Option<&'a str> {
     let colon = line.find(':')?;
     if line[..colon].eq_ignore_ascii_case(name) {
         Some(line[colon + 1..].trim())
@@ -108,7 +111,7 @@ fn header_value<'a>(line: &'a str, name: &str) -> Option<&'a str> {
 // --------------- shared frame encoder ---------------
 
 /// Encode a masked WebSocket frame. Used by both sync and async paths.
-fn encode_frame(opcode: u8, payload: &[u8]) -> Vec<u8> {
+pub(crate) fn encode_frame(opcode: u8, payload: &[u8]) -> Vec<u8> {
     let mut rng = LcgGen::new();
     let mut mask_key = [0u8; 4];
     rng.next_bytes(&mut mask_key);
@@ -810,7 +813,7 @@ impl<W: AsyncWrite + Unpin> WsConnAsyncWriter<W> {
 }
 
 /// Async line reader — reads one HTTP header line (terminated by \r\n).
-async fn read_line_async<T: AsyncRead + Unpin>(
+pub(crate) async fn read_line_async<T: AsyncRead + Unpin>(
     r: &mut T,
 ) -> std::io::Result<String> {
     let mut line = Vec::new();
@@ -1033,13 +1036,11 @@ mod tests {
 
     #[test]
     fn test_upgrade_success() {
-        let key = "dGhlIHNhbXBsZSBub25jZQ=="; // known test key from RFC 6455
-        let expected_accept = "PHU8yDKU+TEZtgp9fzXN75j2H7s=";
-        // Note: RFC 6455 § 7.2.6.1-2 documents a different accept value
-        // ("s3pPLMBiTxaQ9kYGzzhZRbK+xOo=") but that is a known erratum —
-        // the correct SHA-1 of the concatenated key+magic string (computed
-        // via OpenSSL, Python hashlib, and sha1 0.10 consistently) yields
-        // PHU8yDKU+TEZtgp9fzXN75j2H7s=.
+        // RFC 6455 §1.3 sample key; the response Accept must be the one the
+        // client computes (test_compute_accept pins the constant itself
+        // against the RFC's literal s3pPLMBiTxaQ9kYGzzhZRbK+xOo=).
+        let key = "dGhlIHNhbXBsZSBub25jZQ==";
+        let expected_accept = compute_accept(key);
 
         // Build a valid 101 response
         let response = format!(
@@ -1129,10 +1130,14 @@ mod tests {
         assert!(result.is_err());
     }
 
-    #[allow(dead_code)]
+    /// RFC 6455 §1.3 known-answer vector: key "the sample nonce" (base64)
+    /// must yield exactly this Accept value. Guards against any regression of
+    /// the GUID constant (a scrambled copy shipped in 1.0.0 and silently
+    /// failed every real upgrade's Accept check).
+    #[test]
     fn test_compute_accept() {
         let key = "dGhlIHNhbXBsZSBub25jZQ==";
-        let expected = "PHU8yDKU+TEZtgp9fzXN75j2H7s=";
+        let expected = "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=";
         assert_eq!(compute_accept(key), expected);
     }
 }

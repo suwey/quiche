@@ -46,7 +46,11 @@ pub trait OutboundClient: Send + Sync {
     /// pool acquire, and a node that accepts connections but cannot forward
     /// traffic reports as failed.
     ///
-    /// Bare hosts without a scheme are treated as https (port 443).
+    /// Bare hosts without a scheme are treated as https (port 443). Every
+    /// stage — dial, probe write, and the first-byte read — is bounded by
+    /// [`TEST_PROBE_TIMEOUT`], so a dead node (pool builds, TLS handshakes,
+    /// blocked writes) cannot wedge the caller: the urltest background loop
+    /// (`outbound/urltest.rs::spawn_test_loop`) awaits this inline.
     /// Returns `None` on failure (timeout, unreachable, target silent).
     /// Override to return `None` for outbounds that should not participate
     /// in latency testing (direct, quic, ssh).
@@ -60,10 +64,23 @@ pub trait OutboundClient: Send + Sync {
         .parse()
         .ok()?;
         let start = std::time::Instant::now();
-        let mut relay = match self.dial(&dest).await {
-            Ok(r) => r,
-            Err(e) => {
+        // The dial is bounded like the first-byte read below: on a dead
+        // node the pool build, TLS handshake, or WS upgrade can hang, and
+        // an unbounded dial would wedge the urltest loop
+        // (outbound/urltest.rs::spawn_test_loop) forever.
+        let mut relay = match tokio::time::timeout(
+            TEST_PROBE_TIMEOUT,
+            self.dial(&dest),
+        )
+        .await
+        {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => {
                 log::debug!("latency probe: dial {dest} failed: {e}");
+                return None;
+            },
+            Err(_) => {
+                log::debug!("latency probe: dial {dest} timed out");
                 return None;
             },
         };
@@ -80,10 +97,26 @@ pub trait OutboundClient: Send + Sync {
             )
             .into_bytes()
         };
-        if let Err(e) = relay.write(&probe).await {
-            log::debug!("latency probe: write {dest} failed: {e}");
-            let _ = relay.shutdown().await;
-            return None;
+        // The write is bounded too: some transports block writes (full
+        // buffers, stalled tunnels), wedging the urltest loop just like an
+        // unbounded dial. shutdown() still runs on every failure path.
+        match tokio::time::timeout(
+            TEST_PROBE_TIMEOUT,
+            relay.write(&probe),
+        )
+        .await
+        {
+            Ok(Ok(())) => {},
+            Ok(Err(e)) => {
+                log::debug!("latency probe: write {dest} failed: {e}");
+                let _ = relay.shutdown().await;
+                return None;
+            },
+            Err(_) => {
+                log::debug!("latency probe: write {dest} timed out");
+                let _ = relay.shutdown().await;
+                return None;
+            },
         }
 
         let mut buf = [0u8; 512];
@@ -161,8 +194,10 @@ fn parse_probe_url(url: &str) -> Option<ProbeTarget> {
     })
 }
 
-/// How long the end-to-end latency probe waits for the target's first
-/// response byte (includes dial + probe request + response).
+/// Budget for each stage of the end-to-end latency probe — dial, probe
+/// write, and the wait for the target's first response byte. Bounding every
+/// stage, not just the read, keeps a dead node (pool builds, TLS
+/// handshakes, blocked writes) from wedging the urltest background loop.
 const TEST_PROBE_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(5);
 
@@ -344,6 +379,34 @@ mod tests {
             silent: true,
         };
         assert!(client.test_latency("https://example.com").await.is_none());
+    }
+
+    /// Client whose dial never resolves: on a dead node the pool build or
+    /// TLS handshake can hang, and the probe must shed the dial via its
+    /// timeout instead of blocking the urltest loop forever.
+    struct HangingDialClient;
+
+    #[async_trait]
+    impl OutboundClient for HangingDialClient {
+        async fn dial(
+            &self, _dest: &Destination,
+        ) -> Result<Box<dyn StreamRelay>, Box<dyn std::error::Error>> {
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn probe_dial_timeout_returns_none() {
+        // Paused time auto-advances to the next timer deadline, so the
+        // outer guard below only trips if the probe's own dial bound is
+        // missing — with it, the whole test finishes instantly.
+        let delay = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            HangingDialClient.test_latency("https://example.com"),
+        )
+        .await
+        .expect("test_latency must not hang past its probe timeouts");
+        assert!(delay.is_none());
     }
 
     #[test]

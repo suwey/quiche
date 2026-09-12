@@ -103,9 +103,16 @@ async fn http_get_with_headers_inner(
             if let Some(ech) = ech_config {
                 return fetch_https_with_ech(&addr, host, &build_req, ech).await;
             }
-            let tcp = tokio::net::TcpStream::connect(addr)
-                .await
-                .map_err(|e| format!("TCP connect {addr}: {e}"))?;
+            // Bound the connect like the TLS handshake below: a blackholed
+            // SYN (poisoned DNS, filtered route) must fail fast instead of
+            // hanging for the OS-level connect timeout.
+            let tcp = tokio::time::timeout(
+                Duration::from_secs(5),
+                tokio::net::TcpStream::connect(addr),
+            )
+            .await
+            .map_err(|_| format!("TCP connect timeout ({host})"))?
+            .map_err(|e| format!("TCP connect {addr}: {e}"))?;
             let _ = tcp.set_nodelay(true);
 
             // TLS handshake with ALPN "http/1.1".
@@ -135,9 +142,16 @@ async fn http_get_with_headers_inner(
             do_hyper_get(io, build_req).await
         },
         "http" => {
-            let tcp = tokio::net::TcpStream::connect(addr)
-                .await
-                .map_err(|e| format!("TCP connect {addr}: {e}"))?;
+            // Bound the connect like the TLS handshake below: a blackholed
+            // SYN (poisoned DNS, filtered route) must fail fast instead of
+            // hanging for the OS-level connect timeout.
+            let tcp = tokio::time::timeout(
+                Duration::from_secs(5),
+                tokio::net::TcpStream::connect(addr),
+            )
+            .await
+            .map_err(|_| format!("TCP connect timeout ({host})"))?
+            .map_err(|e| format!("TCP connect {addr}: {e}"))?;
             let _ = tcp.set_nodelay(true);
             do_hyper_get(tcp, build_req).await
         },
@@ -160,9 +174,15 @@ fn plain_dial_error(message: String) -> EchDialError {
 async fn ech_tls_dial(
     addr: &std::net::SocketAddr, host: &str, config_list: &[u8],
 ) -> Result<tokio_boring::SslStream<tokio::net::TcpStream>, EchDialError> {
-    let tcp = tokio::net::TcpStream::connect(addr)
-        .await
-        .map_err(|e| plain_dial_error(format!("TCP connect {addr}: {e}")))?;
+    // Same 5s connect bound as the rustls path: a blackholed SYN must fail
+    // fast so the caller's front failover can move on.
+    let tcp = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::net::TcpStream::connect(addr),
+    )
+    .await
+    .map_err(|_| plain_dial_error(format!("TCP connect timeout ({host})")))?
+    .map_err(|e| plain_dial_error(format!("TCP connect {addr}: {e}")))?;
     let _ = tcp.set_nodelay(true);
     let mut builder = boring::ssl::SslConnector::builder(boring::ssl::SslMethod::tls())
         .map_err(|e| plain_dial_error(format!("TLS config: {e:?}")))?;

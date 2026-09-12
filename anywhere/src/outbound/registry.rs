@@ -418,6 +418,8 @@ mod tests {
             idle_session_timeout: None,
             min_idle_session: None,
             xmux: None,
+            wss_fronts: None,
+            wss_fallback: None,
             transport: None,
             flow: None,
             reality: None,

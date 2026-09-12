@@ -1229,6 +1229,18 @@ async fn run_inbound(mut inbound: impl Inbound + 'static, ctx: AppContext) {
                         Ok(o) => o,
                         Err(msg) => {
                             log::error!("{msg}");
+                            // The outbound refused this UDP session (e.g.
+                            // QUIC/443 unsupported by the vless leg). Tell
+                            // the client via ICMP port-unreachable so it
+                            // aborts and falls back to TCP immediately — a
+                            // silent drop leaves QUIC blackhole-and-retry
+                            // (the "video won't play" failure mode).
+                            if let Err(e) = packet.send_port_unreachable().await
+                            {
+                                log::debug!(
+                                    "TUN: port-unreachable inject failed: {e}"
+                                );
+                            }
                             ctx.stats.remove_connection(&conn_id).await;
                             if msg.contains("No file descriptors") {
                                 tokio::time::sleep(Duration::from_millis(100))

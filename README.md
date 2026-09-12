@@ -82,7 +82,7 @@ plugin = "obfs-local"
 plugin_opts = "obfs=http;obfs-host=os.i.a.com"
 ```
 
-12. Add `--sub` to convert clash subscription to `sub.toml`, copy what you need and change [config.toml](./anywhere/deploy/koolshare/config.toml) and start to use.
+12. Add `--sub` to convert clash subscription  to `sub.toml`, copy what you need to [config.toml](./anywhere/deploy/koolshare/config.toml) and start to use, `--sub-openrung` to get [openrung](https://github.com/openrung/openrung) nodes to `openrung.toml`.
 
 ## Deploy to arm64 router running koolshare with jffs enabled
 Tun inbound only support linux now and need ip & iptables commands (as root), other platform will just ignore it, config is very simple and most are setted, linux desktop can use too, see [config.toml](./anywhere/deploy/koolshare/config.toml), build for arm64 router:

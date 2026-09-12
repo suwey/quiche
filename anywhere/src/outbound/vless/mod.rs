@@ -3,6 +3,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -75,6 +76,22 @@ pub(crate) fn validate_vless_config(
             ));
         }
     }
+    if cfg.wss_fronts.as_ref().is_some_and(|f| !f.is_empty()) {
+        if cfg.reality.is_none() {
+            return Err(
+                "vless: wss_fronts requires a [outbounds.reality] section — \
+                 the WSS fallback tunnels the same REALITY stream through \
+                 the relay-owned CDN front"
+                    .to_string(),
+            );
+        }
+        if cfg.wss_fallback.is_none() {
+            return Err(
+                "vless: wss_fronts requires a [outbounds.wss_fallback] section                  (broker + relay_id for ticket requests)"
+                    .to_string(),
+            );
+        }
+    }
     if cfg.reality.is_some() {
         if cfg.insecure {
             return Err(
@@ -143,6 +160,11 @@ pub(crate) enum VlessStream {
 /// contract and keep the old age-unbounded behavior.
 const REALITY_POOL_MAX_IDLE: Duration = Duration::from_secs(30);
 
+/// Direct-path circuit breaker window. After one failed direct dial the leg
+/// is skipped for this long (connectcore's recovery budget, engine.go: a
+/// dead direct must not tax every dial); a success re-enables it instantly.
+const DIRECT_COOLDOWN_MS: u64 = 30_000;
+
 struct VlessPool {
     ready: tokio::sync::Mutex<std::collections::VecDeque<(VlessStream, std::time::Instant)>>,
     building: AtomicUsize,
@@ -155,6 +177,24 @@ struct VlessPool {
     builder: TransportBuilder,
     /// Target pool size (water mark).
     water_mark: usize,
+    /// Consecutive build failures — drives the replenisher's exponential
+    /// backoff, so a dead/blackholed server is probed at 250ms → 8s instead
+    /// of spawning a fresh 5s-timeout connect every cycle.
+    fail_streak: AtomicUsize,
+    /// Epoch millis before which the replenisher must not spawn new builds.
+    next_build_at: AtomicU64,
+    /// Set when the pool's owner (e.g. a rotated-out WSS session) is gone:
+    /// stops the replenisher and on-demand builds, so a dead session's
+    /// bridge port is not probed forever by orphaned tasks.
+    closed: std::sync::atomic::AtomicBool,
+}
+
+/// Epoch milliseconds (wall clock; jumps are harmless for backoff).
+fn epoch_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 impl VlessPool {
@@ -173,6 +213,9 @@ impl VlessPool {
             fragment,
             builder,
             water_mark,
+            fail_streak: AtomicUsize::new(0),
+            next_build_at: AtomicU64::new(0),
+            closed: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -196,6 +239,12 @@ impl VlessPool {
     /// Build a fresh transport connection (TCP + optional TLS + WS upgrade,
     /// or TCP + REALITY TLS), fully async.
     async fn build_one(&self) -> io::Result<VlessStream> {
+        if self.closed.load(Ordering::Relaxed) {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "vless pool closed",
+            ));
+        }
         let tcp = connect_tcp_bypass(self.addr).await?;
         match &self.builder {
             TransportBuilder::Ws { path, headers, ech } => build_ws_async(
@@ -230,18 +279,36 @@ impl VlessPool {
     async fn replenish(&self) {
         match self.build_one().await {
             Ok(ws) => {
+                self.fail_streak.store(0, Ordering::Relaxed);
+                self.next_build_at.store(0, Ordering::Relaxed);
                 let mut ready = self.ready.lock().await;
                 if ready.len() < self.water_mark {
                     ready.push_back((ws, std::time::Instant::now()));
                 }
             },
             Err(e) => {
-                log::warn!("vless pool: build failed: {e}");
+                // Exponential backoff: a dead/blackholed server must be
+                // probed at 250ms → 8s, not with a fresh 5s-timeout connect
+                // every replenisher cycle.
+                let streak = self.fail_streak.fetch_add(1, Ordering::Relaxed) + 1;
+                let backoff_ms =
+                    250u64 << streak.saturating_sub(1).min(5);
+                self.next_build_at.store(
+                    epoch_millis() + backoff_ms,
+                    Ordering::Relaxed,
+                );
+                log::warn!(
+                    "vless pool: build failed (streak {streak}, \
+                     retry in {backoff_ms}ms): {e}"
+                );
             },
         }
     }
 
     fn spawn_build(self: &Arc<Self>) {
+        if self.closed.load(Ordering::Relaxed) {
+            return;
+        }
         let current = self.building.load(Ordering::Relaxed);
         if current >= self.water_mark {
             return;
@@ -267,11 +334,22 @@ impl VlessPool {
     }
 
     /// Fast bounded replenisher — keeps ready + building near watermark.
+    /// Honors the failure backoff (`next_build_at`) so a dead server is not
+    /// hammered with connect attempts every cycle.
     fn spawn_replenish(self: &Arc<Self>) {
         let this = self.clone();
         tokio::spawn(async move {
             loop {
-                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                tokio::time::sleep(std::time::Duration::from_millis(250))
+                    .await;
+                if this.closed.load(Ordering::Relaxed) {
+                    return;
+                }
+                if epoch_millis()
+                    < this.next_build_at.load(Ordering::Relaxed)
+                {
+                    continue;
+                }
                 let ready = this.ready.lock().await.len();
                 let building = this.building.load(Ordering::Relaxed);
                 for _ in (ready + building)..this.water_mark {
@@ -284,17 +362,85 @@ impl VlessPool {
 
 // ---------------------------------------------------------------------------
 // VLESS Outbound Client
+//
+// Direct-first WSS/CDN fallback (OpenRung): the client always tries the
+// direct REALITY path first. Only after the direct transport itself failed
+// (a remote path failure — exactly Go's `directPathError` gate) does it walk
+// the relay's signed WSS fronts in order: request a broker ticket, dial the
+// CDN front, and point the REALITY transport at a local loopback bridge that
+// copies bytes into the front's multiplexing session.
 pub struct VlessOutboundClient {
-    pool: Arc<VlessPool>,
+    /// Direct REALITY leg (always present).
+    direct: Arc<VlessPool>,
     uuid: [u8; 16],
     /// VLESS flow control, sent only on TCP requests (§S2.8: servers reject
     /// UDP + flow).
     flow: Option<String>,
+    /// REALITY SNI (also the bridge leg's borrow-target name).
+    tls_server: String,
+    insecure: bool,
+    tls_fp: bool,
+    /// REALITY params reused by the bridge leg (present iff the direct leg
+    /// is REALITY, which wss_fronts requires).
+    reality_params: Option<crate::transport::reality::RealityParams>,
+    /// Fallback configuration (None unless fronts + fallback are configured).
+    wss: Option<WssFallbackSetup>,
+    /// The active WSS front session, once the ladder succeeded.
+    active: tokio::sync::Mutex<Option<std::sync::Arc<ActiveFront>>>,
+    /// Single-flight guard so concurrent dials run one ladder at a time.
+    activating: tokio::sync::Mutex<()>,
+    /// Direct-path circuit breaker: epoch millis until which the direct leg
+    /// must not be attempted. Set on a direct failure, cleared on success —
+    /// while cooling, dials fall straight through to the WSS front instead
+    /// of paying the full connect timeout against a dead server.
+    direct_cooldown_until: AtomicU64,
+    /// Test channel: dial fronts over plain TCP against a mock front.
+    #[cfg(test)]
+    plain_front_dial: bool,
+}
+
+/// Static fallback configuration, validated at construction.
+struct WssFallbackSetup {
+    relay_id: String,
+    broker: String,
+    /// Canonical, sorted front set (wsscore order).
+    fronts: Vec<crate::wssfront::WssFront>,
+    ticket_budget: Duration,
+    handshake_timeout: Duration,
+    native_no_sni: bool,
+}
+
+/// One live WSS front: the multiplexing session plus a REALITY pool whose
+/// transports run over the local loopback bridge.
+struct ActiveFront {
+    front_id: String,
+    session: std::sync::Arc<crate::wssfront::WssFrontSession>,
+    pool: Arc<VlessPool>,
+}
+
+impl Drop for ActiveFront {
+    fn drop(&mut self) {
+        // A rotated-out session's bridge listener dies with it; stop its
+        // pool's replenisher and builds so the dead loopback port is not
+        // probed forever by orphaned tasks.
+        self.pool
+            .closed
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 impl VlessOutboundClient {
     pub async fn from_config(
         configs: Vec<&OutboundConfig>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::from_config_inner(configs, false).await
+    }
+
+    /// `plain_front_dial` is a test channel: fronts are then dialed over
+    /// plain TCP against a mock front (mocks address 127.0.0.1:port, which
+    /// production canonical-URL validation forbids).
+    async fn from_config_inner(
+        configs: Vec<&OutboundConfig>, plain_front_dial: bool,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let cfg = configs
             .into_iter()
@@ -378,7 +524,359 @@ impl VlessOutboundClient {
         );
         pool.spawn_replenish();
 
-        Ok(Self { pool, uuid, flow })
+        let reality_params = match &pool.builder {
+            TransportBuilder::Reality { params } => Some(params.clone()),
+            _ => None,
+        };
+
+        // WSS fallback setup: only active with fronts, a REALITY leg, and a
+        // broker to mint tickets. Fronts must be canonical and sorted
+        // (wsscore rules) — the import only emits such sets, and an explicit
+        // config that violates them is an operator error worth rejecting.
+        let wss = match (&cfg.wss_fronts, &cfg.wss_fallback) {
+            (Some(front_cfgs), Some(fb))
+                if !front_cfgs.is_empty() && fb.enabled =>
+            {
+                if reality_params.is_none() {
+                    return Err("vless: wss_fronts requires the reality \
+                                transport"
+                        .into());
+                }
+                let broker = match fb.broker.as_deref() {
+                    Some(b) if !b.trim().is_empty() => b.trim().to_string(),
+                    _ => {
+                        return Err(
+                            "vless: wss_fallback requires a broker URL"
+                                .into(),
+                        )
+                    },
+                };
+                let relay_id = match fb.relay_id.as_deref() {
+                    Some(r) if !r.trim().is_empty() => r.trim().to_string(),
+                    _ => {
+                        return Err(
+                            "vless: wss_fallback requires the relay_id"
+                                .into(),
+                        )
+                    },
+                };
+                let fronts: Vec<crate::wssfront::WssFront> = front_cfgs
+                    .iter()
+                    .map(|f| crate::wssfront::WssFront {
+                        id: f.id.clone(),
+                        url: f.url.clone(),
+                        protocol_version: f.protocol_version,
+                    })
+                    .collect();
+                // The plain dial channel (tests) addresses mock fronts on
+                // 127.0.0.1:port directly; production requires an already
+                // canonical, sorted front set (wsscore rules) — exactly what
+                // the directory import emits — and re-validates every front
+                // URL again at dial time.
+                let fronts = if plain_front_dial {
+                    fronts
+                } else {
+                    let canonical =
+                        crate::wssfront::normalize_fronts(&fronts).map_err(
+                            |e| format!("vless: invalid wss_fronts: {e}"),
+                        )?;
+                    if canonical != fronts {
+                        return Err("vless: wss_fronts must be canonical and \
+                                    sorted by id (wsscore order)"
+                            .into());
+                    }
+                    canonical
+                };
+                Some(WssFallbackSetup {
+                    relay_id,
+                    broker,
+                    fronts,
+                    ticket_budget: Duration::from_millis(
+                        fb.ticket_budget_ms.unwrap_or(
+                            crate::wssfront::TICKET_TOTAL_DEADLINE
+                                .as_millis() as u64,
+                        ),
+                    ),
+                    handshake_timeout: Duration::from_millis(
+                        fb.handshake_timeout_ms.unwrap_or(
+                            crate::wssfront::DEFAULT_HANDSHAKE_TIMEOUT
+                                .as_millis() as u64,
+                        ),
+                    ),
+                    native_no_sni: fb.native_no_sni,
+                })
+            },
+            _ => None,
+        };
+
+        Ok(Self {
+            direct: pool,
+            uuid,
+            flow,
+            tls_server,
+            insecure,
+            tls_fp,
+            reality_params,
+            wss,
+            active: tokio::sync::Mutex::new(None),
+            activating: tokio::sync::Mutex::new(()),
+            direct_cooldown_until: AtomicU64::new(0),
+            #[cfg(test)]
+            plain_front_dial,
+        })
+    }
+
+    #[cfg(test)]
+    fn plain_front_dial(&self) -> bool {
+        self.plain_front_dial
+    }
+
+    #[cfg(not(test))]
+    fn plain_front_dial(&self) -> bool {
+        false
+    }
+
+    /// Take a transport through the currently active WSS front session, if
+    /// one is alive. A dead session deactivates the fallback: recovery
+    /// begins with a fresh direct attempt (docs/wss-fallback.md).
+    async fn acquire_from_active(&self) -> Option<VlessStream> {
+        let active = { self.active.lock().await.clone() }?;
+        if active.session.is_dead() {
+            log::info!(
+                "WSS front session ended; falling back to the direct path"
+            );
+            *self.active.lock().await = None;
+            return None;
+        }
+        if active.session.budget_left() == 0 {
+            // The ticket's stream budget is spent. Rotate: this session
+            // keeps serving its in-flight streams while they last, but new
+            // dials must activate a fresh session — the sidecar closes the
+            // whole session the moment one more stream arrives.
+            log::info!(
+                "WSS front {} ticket stream budget spent; rotating",
+                active.front_id
+            );
+            *self.active.lock().await = None;
+            return None;
+        }
+        match active.pool.acquire().await {
+            Some(stream) => {
+                active.pool.spawn_build();
+                Some(stream)
+            },
+            None => match active.pool.build_one().await {
+                Ok(stream) => Some(stream),
+                Err(e) => {
+                    log::warn!("WSS front {} bridge build failed: {e}", active.front_id);
+                    *self.active.lock().await = None;
+                    None
+                },
+            },
+        }
+    }
+
+    /// Direct-first transport acquisition. Gated by the circuit breaker: a
+    /// failed direct dial puts the leg in cooldown so the next dials reach
+    /// the WSS front immediately instead of paying the connect timeout
+    /// against a dead server; a success clears the cooldown.
+    async fn try_direct(&self) -> std::io::Result<VlessStream> {
+        if epoch_millis()
+            < self.direct_cooldown_until.load(Ordering::Relaxed)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "direct path cooling down after failure",
+            ));
+        }
+        let result = async {
+            if let Some(stream) = self.direct.acquire().await {
+                self.direct.spawn_build();
+                return Ok(stream);
+            }
+            self.direct.build_one().await
+        }
+        .await;
+        match result {
+            Ok(stream) => {
+                self.direct_cooldown_until.store(0, Ordering::Relaxed);
+                Ok(stream)
+            },
+            Err(e) => {
+                self.direct_cooldown_until.store(
+                    epoch_millis() + DIRECT_COOLDOWN_MS,
+                    Ordering::Relaxed,
+                );
+                log::info!(
+                    "direct path failed ({e}); cooling down for \
+                     {}s before retrying",
+                    DIRECT_COOLDOWN_MS / 1000
+                );
+                Err(e)
+            },
+        }
+    }
+
+    /// Walk the relay's signed fronts in order (connectcore
+    /// attemptWSSCandidate): ticket → binding/expiry checks → dial → local
+    /// bridge. The first front that yields a session wins; every failure is
+    /// scoped to the front and never poisons the direct leg.
+    async fn activate_wss_ladder(
+        &self, setup: &WssFallbackSetup,
+    ) -> Result<std::sync::Arc<ActiveFront>, String> {
+        let params = self.reality_params.clone().ok_or_else(|| {
+            "vless: wss fallback requires the reality transport".to_string()
+        })?;
+        let mut last_err = String::from("no fronts attempted");
+        for front in &setup.fronts {
+            log::info!(
+                "direct path failed; trying WSS front {} ({})",
+                front.id, front.url
+            );
+
+            // 1. Ticket ladder across the broker fronts (15s budget).
+            let ticket = match crate::wssfront::request_wss_session_ticket(
+                &setup.broker,
+                &setup.relay_id,
+                &front.id,
+                setup.ticket_budget,
+            )
+            .await
+            {
+                Ok(t) => t,
+                Err(e) => {
+                    log::warn!(
+                        "WSS front {}: ticket request failed: {e}",
+                        front.id
+                    );
+                    last_err = format!("ticket: {e}");
+                    continue;
+                },
+            };
+
+            // 2. Ticket binding: the broker's URL must equal the exact
+            //    signed front URL (connectcore/wss.go:357) and the ticket
+            //    must still be alive (:361).
+            if ticket.url != front.url {
+                log::warn!(
+                    "WSS front {}: ticket URL does not match the signed front",
+                    front.id
+                );
+                last_err = "ticket_binding: URL does not match the \
+                            signed relay front"
+                    .to_string();
+                continue;
+            }
+            if ticket.expires_at <= chrono::Utc::now() {
+                log::warn!("WSS front {}: ticket is already expired", front.id);
+                last_err = "ticket_expired".to_string();
+                continue;
+            }
+
+            // 3. Dial the front: TLS + strict WS upgrade + yamux + bridge.
+            let session = match crate::wssfront::establish_wss_session(
+                &front.url,
+                &ticket.ticket,
+                ticket.max_streams,
+                setup.handshake_timeout,
+                setup.native_no_sni,
+                self.plain_front_dial(),
+            )
+            .await
+            {
+                Ok(s) => s,
+                Err(e) => {
+                    log::warn!(
+                        "WSS front {}: handshake failed: {e}",
+                        front.id
+                    );
+                    last_err = format!("wss_handshake: {e}");
+                    continue;
+                },
+            };
+            log::info!("connected through WSS front {}", front.id);
+            let session = std::sync::Arc::new(session);
+
+            // 4. The bridge leg dials the local loopback listener and runs
+            //    the unmodified REALITY transport over it (fragmentation is
+            //    pointless on loopback). The pre-build water mark stays at 1:
+            //    every bridge connection burns one unit of the ticket's
+            //    stream budget, so warming 30 (the direct-pool default)
+            //    would spend half the ticket before any real traffic.
+            let pool = VlessPool::new(
+                session.bridge_addr,
+                self.tls_server.clone(),
+                self.insecure,
+                self.tls_fp,
+                None,
+                TransportBuilder::Reality { params: params.clone() },
+                1,
+            );
+            pool.spawn_replenish();
+            return Ok(std::sync::Arc::new(ActiveFront {
+                front_id: front.id.clone(),
+                session,
+                pool,
+            }));
+        }
+        Err(last_err)
+    }
+
+    /// Obtain one ready transport: active WSS front first, then the direct
+    /// path, then the front ladder.
+    async fn obtain_stream(
+        &self,
+    ) -> Result<VlessStream, Box<dyn std::error::Error>> {
+        // 1. Active WSS front session.
+        if let Some(stream) = self.acquire_from_active().await {
+            return Ok(stream);
+        }
+
+        // 2. Direct-first.
+        let direct_err = match self.try_direct().await {
+            Ok(stream) => return Ok(stream),
+            Err(e) => e,
+        };
+
+        // 3. Ladder over the signed fronts (single-flight).
+        if let Some(setup) = &self.wss {
+            let _guard = self.activating.lock().await;
+            // Another dial may have activated a front meanwhile.
+            if let Some(stream) = self.acquire_from_active().await {
+                return Ok(stream);
+            }
+            match self.activate_wss_ladder(setup).await {
+                Ok(active) => {
+                    let stream = match active.pool.acquire().await {
+                        Some(stream) => {
+                            active.pool.spawn_build();
+                            stream
+                        },
+                        None => active
+                            .pool
+                            .build_one()
+                            .await
+                            .map_err(|e| {
+                                format!(
+                                    "WSS front {}: bridge transport failed: {e}",
+                                    active.front_id
+                                )
+                            })?,
+                    };
+                    *self.active.lock().await = Some(active);
+                    return Ok(stream);
+                },
+                Err(ladder_err) => {
+                    return Err(format!(
+                        "direct path failed ({direct_err}); WSS fallback \
+                         failed: {ladder_err}"
+                    )
+                    .into());
+                },
+            }
+        }
+
+        Err(direct_err.into())
     }
 }
 
@@ -387,12 +885,7 @@ impl OutboundClient for VlessOutboundClient {
     async fn dial(
         &self, dest: &Destination,
     ) -> Result<Box<dyn StreamRelay>, Box<dyn std::error::Error>> {
-        let stream = if let Some(stream) = self.pool.acquire().await {
-            self.pool.spawn_build();
-            stream
-        } else {
-            self.pool.build_one().await?
-        };
+        let stream = self.obtain_stream().await?;
         let state =
             Arc::new(tokio::sync::Mutex::new(DeferredTcpState::Pending {
                 stream: Some(stream),
@@ -419,12 +912,7 @@ impl OutboundClient for VlessOutboundClient {
             return Err(crate::outbound::common::ERR_UDP_NOT_SUPPORTED.into());
         }
 
-        let stream = if let Some(stream) = self.pool.acquire().await {
-            self.pool.spawn_build();
-            stream
-        } else {
-            self.pool.build_one().await?
-        };
+        let stream = self.obtain_stream().await?;
         let state =
             Arc::new(tokio::sync::Mutex::new(DeferredUdpState::Pending {
                 stream: Some(stream),
@@ -439,6 +927,72 @@ impl OutboundClient for VlessOutboundClient {
 // ---------------------------------------------------------------------------
 // Standalone helpers (no self)
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// VLESS UDP framing
+// ---------------------------------------------------------------------------
+
+// Xray's VLESS UDP body is a sequence of [2-byte BE length] + [packet]
+// frames in BOTH directions (sing-vmess vless/client.go PacketConn Read/
+// Write, the reference implementation openrung's sing-box data plane uses).
+// TCP is an unframed byte stream — framing applies only to VlessCommand::Udp.
+// The initial client write bundles the first frame with the request header.
+
+fn udp_frame_packet(packet: &[u8]) -> Vec<u8> {
+    let mut framed = Vec::with_capacity(packet.len() + 2);
+    framed.extend_from_slice(&(packet.len() as u16).to_be_bytes());
+    framed.extend_from_slice(packet);
+    framed
+}
+
+/// Incremental de-framer for the server's UDP frame stream: feed raw read
+/// bytes (frame boundaries need not align), emit complete packets.
+struct UdpDeframer {
+    hdr: [u8; 2],
+    hdr_filled: usize,
+    payload: Vec<u8>,
+    payload_left: usize,
+}
+
+impl UdpDeframer {
+    fn new() -> Self {
+        Self {
+            hdr: [0; 2],
+            hdr_filled: 0,
+            payload: Vec::new(),
+            payload_left: 0,
+        }
+    }
+
+    fn feed(&mut self, data: &[u8], out: &mut Vec<Vec<u8>>) {
+        let mut pos = 0;
+        while pos < data.len() {
+            if self.hdr_filled < 2 {
+                let take = (2 - self.hdr_filled).min(data.len() - pos);
+                self.hdr[self.hdr_filled..self.hdr_filled + take]
+                    .copy_from_slice(&data[pos..pos + take]);
+                self.hdr_filled += take;
+                pos += take;
+                if self.hdr_filled < 2 {
+                    break;
+                }
+                self.payload_left = u16::from_be_bytes(self.hdr) as usize;
+                self.payload = Vec::with_capacity(self.payload_left);
+            }
+            if self.payload_left > 0 {
+                let take = self.payload_left.min(data.len() - pos);
+                self.payload.extend_from_slice(&data[pos..pos + take]);
+                pos += take;
+                self.payload_left -= take;
+                if self.payload_left > 0 {
+                    break;
+                }
+            }
+            out.push(std::mem::take(&mut self.payload));
+            self.hdr_filled = 0;
+        }
+    }
+}
 
 fn split_vless_response(resp: Vec<u8>) -> io::Result<Vec<u8>> {
     log::debug!(
@@ -493,6 +1047,7 @@ fn spawn_vless_relay(
         // flow empty (§S2.8) → never Vision.
         let vision = matches!(command, VlessCommand::Tcp)
             && flow_for_request == Some("xtls-rprx-vision");
+        let is_udp = matches!(command, VlessCommand::Udp);
         let header =
             encode_request_bytes(&uuid, flow_for_request, command, &dest);
         let mut req = header.clone();
@@ -669,12 +1224,29 @@ fn spawn_vless_relay(
         let read_task = {
             let data_tx = data_tx.clone();
             let pong_tx = pong_tx.clone();
+            // UDP responses arrive as [2-byte BE length]+[packet] frames; TCP
+            // is an unframed stream. Vision is TCP-only (§S2.8: UDP keeps
+            // flow empty), so VisionReality never sees UDP framing.
+            let mut udp_deframer = is_udp.then(UdpDeframer::new);
             tokio::spawn(async move {
                 match reader {
                     VlessReader::Ws(mut reader) => loop {
                         match reader.recv().await {
                             Ok(WsFrame::Binary(d)) => {
-                                if data_tx.send(d).is_err() {
+                                if let Some(dfr) = udp_deframer.as_mut() {
+                                    let mut packets = Vec::new();
+                                    dfr.feed(&d, &mut packets);
+                                    let mut dead = false;
+                                    for packet in packets {
+                                        if data_tx.send(packet).is_err() {
+                                            dead = true;
+                                            break;
+                                        }
+                                    }
+                                    if dead {
+                                        break;
+                                    }
+                                } else if data_tx.send(d).is_err() {
                                     break;
                                 }
                             },
@@ -692,7 +1264,23 @@ fn spawn_vless_relay(
                         match reader.read(&mut buf).await {
                             Ok(0) => break,
                             Ok(n) => {
-                                if data_tx.send(buf[..n].to_vec()).is_err() {
+                                if let Some(dfr) = udp_deframer.as_mut() {
+                                    let mut packets = Vec::new();
+                                    dfr.feed(&buf[..n], &mut packets);
+                                    let mut dead = false;
+                                    for packet in packets {
+                                        if data_tx.send(packet).is_err() {
+                                            dead = true;
+                                            break;
+                                        }
+                                    }
+                                    if dead {
+                                        break;
+                                    }
+                                } else if data_tx
+                                    .send(buf[..n].to_vec())
+                                    .is_err()
+                                {
                                     break;
                                 }
                             },
@@ -1280,7 +1868,10 @@ impl PacketRelay for VlessDeferredPacketRelay {
         &mut self, buf: &[u8], _dest: &Destination,
     ) -> io::Result<()> {
         let mut guard = self.state.lock().await;
-        // On first write: do VLESS handshake with payload bundled.
+        // On first write: do VLESS handshake with payload bundled. The
+        // payload is the framed packet — VLESS UDP bodies carry a 2-byte BE
+        // length prefix per packet (the server parses the first two raw
+        // bytes as a length, so a bare DNS query would stall forever).
         if let DeferredUdpState::Pending { stream, uuid, dest, flow } =
             &mut *guard
         {
@@ -1288,7 +1879,7 @@ impl PacketRelay for VlessDeferredPacketRelay {
             let uuid = *uuid;
             let dest = dest.clone();
             let flow = flow.clone();
-            let first = buf.to_vec();
+            let first = udp_frame_packet(buf);
             let (data_tx, data_rx) = mpsc::unbounded_channel();
             let (outbound_tx, outbound_rx) = mpsc::unbounded_channel();
             spawn_vless_relay(
@@ -1307,11 +1898,16 @@ impl PacketRelay for VlessDeferredPacketRelay {
             };
             return Ok(());
         }
-        // Send subsequent packets via the active relay.
+        // Send subsequent packets via the active relay (framed likewise).
         if let DeferredUdpState::Active { outbound_tx, .. } = &*guard {
-            outbound_tx.send(buf.to_vec()).map_err(|_| {
-                io::Error::new(io::ErrorKind::BrokenPipe, "vless udp closed")
-            })
+            outbound_tx
+                .send(udp_frame_packet(buf))
+                .map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "vless udp closed",
+                    )
+                })
         } else {
             Err(io::Error::new(
                 io::ErrorKind::NotConnected,
@@ -1343,6 +1939,487 @@ impl PacketRelay for VlessDeferredPacketRelay {
 mod tests {
     use super::*;
     use crate::transport::reality::RealityConfig;
+    use std::task::Context;
+    use std::task::Poll;
+
+    /// LIVE full-stack transfer probe (network, #[ignore] by default):
+    /// drives the complete production data plane — vless client →
+    /// (dead direct leg fails fast) → WSS ladder → bridge → relay →
+    /// target — first with a plain-HTTP download, then over TLS, exactly
+    /// what the browser does for media. Reports HTTP status, bytes, timing,
+    /// and stalls.
+    ///
+    /// Run with:
+    ///   FULLSTACK_CONFIG=/Users/suwey/config.toml \
+    ///   cargo test -p anywhere --lib -- --ignored live_full --nocapture
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn live_full_stack_transfer_probe() {
+        let Ok(path) = std::env::var("FULLSTACK_CONFIG") else {
+            return;
+        };
+        let raw = std::fs::read_to_string(&path)
+            .expect("config file readable");
+        let cfg: crate::config::Config =
+            toml::from_str(&raw).expect("config parses");
+        let ob = cfg
+            .outbounds
+            .iter()
+            .find(|o| o.type_ == "vless")
+            .expect("a vless outbound");
+        let client = VlessOutboundClient::from_config(vec![ob])
+            .await
+            .expect("client builds");
+
+        // ---- plain HTTP sustained transfer (speedtest.tele2.net) ----
+        let host = "speedtest.tele2.net";
+        let dest = Destination::new(
+            crate::inbound::Address::Domain(host.to_string()),
+            80,
+        );
+        let mut relay = client.dial(&dest).await.expect("dial through the stack");
+        let request = format!(
+            "GET /1MB.zip HTTP/1.1\r\nHost: {host}\r\n\
+             User-Agent: curl/8.7.1\r\nAccept: */*\r\n\
+             Connection: close\r\n\r\n"
+        );
+        relay.write(request.as_bytes()).await.expect("request written");
+        let (total, head) = drain_relay(relay).await;
+        println!(
+            "PLAIN: {total} bytes, status: {}",
+            String::from_utf8_lossy(&head).lines().next().unwrap_or("?")
+        );
+        assert!(
+            total > 1_000_000,
+            "sustained plain transfer failed: only {total} bytes"
+        );
+
+        // ---- HTTPS through the tunnel (TLS over the vless stream) ----
+        // The StreamRelay is bridged to AsyncRead/AsyncWrite via a shared
+        // mutex + owned-buffer futures (no self-referential borrows).
+        for (host, req, min_bytes) in [
+            ("www.youtube.com", "GET /generate_204 HTTP/1.1", 0usize),
+            (
+                "speed.cloudflare.com",
+                "GET /__down?bytes=8000000 HTTP/1.1",
+                1_000_000,
+            ),
+        ] {
+            let dest = Destination::new(
+                crate::inbound::Address::Domain(host.to_string()),
+                443,
+            );
+            let relay = client.dial(&dest).await.expect("dial for https");
+            let io = RelayIo::new(relay);
+            let start = std::time::Instant::now();
+            let connector = boring::ssl::SslConnector::builder(
+                boring::ssl::SslMethod::tls(),
+            )
+            .expect("ssl builder")
+            .build();
+            let tls_config = connector
+                .configure()
+                .expect("default connector configure");
+            let mut tls = match tokio::time::timeout(
+                Duration::from_secs(15),
+                tokio_boring::connect(tls_config, host, io),
+            )
+            .await
+            {
+                Ok(Ok(t)) => t,
+                Ok(Err(e)) => {
+                    println!("HTTPS {host}: TLS handshake failed: {e}");
+                    continue;
+                },
+                Err(_) => {
+                    println!("HTTPS {host}: TLS handshake timed out");
+                    continue;
+                },
+            };
+            use tokio::io::AsyncReadExt as _;
+            use tokio::io::AsyncWriteExt as _;
+            let request = format!(
+                "{req}\r\nHost: {host}\r\nUser-Agent: curl/8.7.1\r\n\
+                 Accept: */*\r\nConnection: close\r\n\r\n"
+            );
+            tls.write_all(request.as_bytes()).await.unwrap();
+            let mut total = 0usize;
+            let mut head: Vec<u8> = Vec::new();
+            let mut buf = vec![0u8; 32 * 1024];
+            loop {
+                match tokio::time::timeout(
+                    Duration::from_secs(25),
+                    tls.read(&mut buf),
+                )
+                .await
+                {
+                    Ok(Ok(0)) | Ok(Err(_)) => break,
+                    Ok(Ok(n)) => {
+                        if head.len() < 64 {
+                            head.extend_from_slice(
+                                &buf[..n.min(64 - head.len())],
+                            );
+                        }
+                        total += n;
+                    },
+                    Err(_) => {
+                        println!("HTTPS {host}: STALL at {total} bytes");
+                        break;
+                    },
+                }
+            }
+            println!(
+                "HTTPS {host}: {total} bytes in {:?}, status: {}",
+                start.elapsed(),
+                String::from_utf8_lossy(&head).lines().next().unwrap_or("?")
+            );
+            if min_bytes > 0 {
+                assert!(
+                    total > min_bytes,
+                    "sustained TLS transfer failed: {total} bytes"
+                );
+            }
+        }
+
+        // ---- application layer: mint a real videoplayback URL via the
+        // innertube player API through the tunnel, then fetch it through
+        // the tunnel and observe googlevideo's actual status code ----
+        println!("---- innertube player API probe ----");
+        let player_body = serde_json::json!({
+            "context": {
+                "client": {
+                    "clientName": "ANDROID",
+                    "clientVersion": "20.10.38",
+                    "androidSdkVersion": 34,
+                    "hl": "en",
+                }
+            },
+            "videoId": "aqz-KE-bpKQ",
+            "contentCheckOk": true,
+            "racyCheckOk": true,
+        })
+        .to_string();
+        let api_host = "www.youtube.com";
+        let dest = Destination::new(
+            crate::inbound::Address::Domain(api_host.to_string()),
+            443,
+        );
+        let relay = client.dial(&dest).await.expect("dial for player api");
+        let io = RelayIo::new(relay);
+        let connector = boring::ssl::SslConnector::builder(
+            boring::ssl::SslMethod::tls(),
+        )
+        .unwrap()
+        .build();
+        let mut tls = match tokio_boring::connect(
+            connector.configure().unwrap(),
+            api_host,
+            io,
+        )
+        .await
+        {
+            Ok(t) => t,
+            Err(_) => panic!("player api tls failed"),
+        };
+        use tokio::io::AsyncReadExt as _;
+        use tokio::io::AsyncWriteExt as _;
+        let req = format!(
+            "POST /youtubei/v1/player HTTP/1.1\r\nHost: {api_host}\r\n\
+             Content-Type: application/json\r\n\
+             Content-Length: {}\r\nUser-Agent: com.google.android.youtube/20.\
+             10.38 (Linux; U; Android 14) gzip\r\n\
+             Connection: close\r\n\r\n{player_body}",
+            player_body.len()
+        );
+        tls.write_all(req.as_bytes()).await.unwrap();
+        let mut api_resp = Vec::new();
+        let mut buf = vec![0u8; 32 * 1024];
+        loop {
+            match tokio::time::timeout(Duration::from_secs(20), tls.read(&mut buf)).await {
+                Ok(Ok(0)) | Ok(Err(_)) => break,
+                Ok(Ok(n)) => api_resp.extend_from_slice(&buf[..n]),
+                Err(_) => { println!("player api read stall"); break; }
+            }
+        }
+        let api_text = String::from_utf8_lossy(&api_resp);
+        let status_line =
+            api_text.lines().next().unwrap_or("?").to_string();
+        println!("player api status: {status_line}, {} bytes", api_resp.len());
+        // Extract the first googlevideo URL from the adaptiveFormats.
+        let gv_url = api_text
+            .split('"')
+            .find(|s| s.starts_with("https://") && s.contains("googlevideo.com/videoplayback"))
+            .map(|s| s.to_string());
+        let Some(gv_url) = gv_url else {
+            println!("no googlevideo URL in player response");
+            if let Some(pos) = api_text.find("playabilityStatus") {
+                let snippet = &api_text[pos..(pos + 400).min(api_text.len())];
+                let clean: String = snippet.chars().filter(|c| c.is_ascii_graphic() || *c == ' ').collect();
+                println!("PLAYABILITY: {clean}");
+            } else {
+                println!("body head: {}", &api_text[api_text.find("\r\n\r\n").map(|i| i + 4).unwrap_or(0)..]);
+            }
+            return;
+        };
+        let gv_host = gv_url
+            .split('/')
+            .nth(2)
+            .unwrap_or_default()
+            .to_string();
+        println!("videoplayback host: {gv_host}");
+        // Fetch the URL through the tunnel.
+        let dest = Destination::new(
+            crate::inbound::Address::Domain(gv_host.clone()),
+            443,
+        );
+        let relay = client.dial(&dest).await.expect("dial googlevideo");
+        let io = RelayIo::new(relay);
+        let connector = boring::ssl::SslConnector::builder(
+            boring::ssl::SslMethod::tls(),
+        )
+        .unwrap()
+        .build();
+        let mut tls = match tokio_boring::connect(
+            connector.configure().unwrap(),
+            &gv_host,
+            io,
+        )
+        .await
+        {
+            Ok(t) => t,
+            Err(_) => panic!("googlevideo tls failed"),
+        };
+        let req = format!(
+            "GET {} HTTP/1.1\r\nHost: {gv_host}\r\nUser-Agent: com.google.\
+             android.youtube/20.10.38 (Linux; U; Android 14) gzip\r\n\
+             Accept: */*\r\nConnection: close\r\n\r\n",
+            &gv_url[gv_url.find("googlevideo.com").map(|i| i + "googlevideo.com".len()).unwrap_or(0)..]
+                .split('&')
+                .map(|p| if p.starts_with("url=") { url_escape(p) } else { p.to_string() })
+                .collect::<Vec<_>>()
+                .join("&")
+        );
+        tls.write_all(req.as_bytes()).await.unwrap();
+        let mut gv_resp = Vec::new();
+        let mut total = 0usize;
+        loop {
+            match tokio::time::timeout(Duration::from_secs(25), tls.read(&mut buf)).await {
+                Ok(Ok(0)) | Ok(Err(_)) => break,
+                Ok(Ok(n)) => { gv_resp.extend_from_slice(&buf[..n]); total += n; if gv_resp.len() > 300_000 { break; } }
+                Err(_) => { println!("googlevideo STALL at {total}"); break; }
+            }
+        }
+        let gv_text = String::from_utf8_lossy(&gv_resp);
+        println!(
+            "VIDEO FETCH: {total} bytes, status: {}",
+            gv_text.lines().next().unwrap_or("?")
+        );
+        if total > 100_000 {
+            println!("googlevideo serves video data through this exit — tunnel + exit IP OK");
+        }
+    }
+
+    fn url_escape(p: &str) -> String {
+        p.replace('%', "%25")
+    }
+
+    /// Drain a relay to EOF (or a stall), returning (bytes, head).
+    async fn drain_relay(
+        mut relay: Box<dyn crate::relay::StreamRelay>,
+    ) -> (usize, Vec<u8>) {
+        let start = std::time::Instant::now();
+        let mut total = 0usize;
+        let mut chunks = 0usize;
+        let mut head: Vec<u8> = Vec::new();
+        let mut buf = vec![0u8; 32 * 1024];
+        loop {
+            match tokio::time::timeout(
+                Duration::from_secs(20),
+                relay.read(&mut buf),
+            )
+            .await
+            {
+                Ok(Ok(0)) => {
+                    println!(
+                        "clean EOF after {total} bytes in {:?}",
+                        start.elapsed()
+                    );
+                    break;
+                },
+                Ok(Ok(n)) => {
+                    if head.len() < 64 {
+                        head.extend_from_slice(&buf[..n.min(64 - head.len())]);
+                    }
+                    total += n;
+                    chunks += 1;
+                    if chunks % 32 == 0 {
+                        println!(
+                            "progress: {total} bytes, {:?} elapsed",
+                            start.elapsed()
+                        );
+                    }
+                },
+                Ok(Err(e)) => {
+                    println!("read error after {total} bytes: {e}");
+                    break;
+                },
+                Err(_) => {
+                    println!(
+                        "STALL: no data for 20s at {total} bytes \
+                         (after {chunks} chunks)"
+                    );
+                    break;
+                },
+            }
+        }
+        (total, head)
+    }
+
+    /// Bridge `Box<dyn StreamRelay>` (async-trait) to AsyncRead/AsyncWrite.
+    /// Both directions go through a shared mutex; the in-flight futures own
+    /// their buffers and the lock guard, so no self-referential borrows.
+    struct RelayIo {
+        inner: std::sync::Arc<
+            tokio::sync::Mutex<Box<dyn crate::relay::StreamRelay>>,
+        >,
+        read_fut: Option<
+            std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = io::Result<(usize, Vec<u8>)>,
+                        > + Send,
+                >,
+            >,
+        >,
+        write_fut: Option<
+            std::pin::Pin<
+                Box<dyn std::future::Future<Output = io::Result<()>> + Send>,
+            >,
+        >,
+        leftover: Vec<u8>,
+    }
+
+    impl RelayIo {
+        fn new(relay: Box<dyn crate::relay::StreamRelay>) -> Self {
+            Self {
+                inner: std::sync::Arc::new(tokio::sync::Mutex::new(relay)),
+                read_fut: None,
+                write_fut: None,
+                leftover: Vec::new(),
+            }
+        }
+    }
+
+    impl tokio::io::AsyncRead for RelayIo {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            if !self.leftover.is_empty() {
+                let n = self.leftover.len().min(buf.remaining());
+                buf.put_slice(&self.leftover[..n]);
+                self.leftover.drain(..n);
+                return Poll::Ready(Ok(()));
+            }
+            loop {
+                if let Some(fut) = self.read_fut.as_mut() {
+                    match fut.as_mut().poll(cx) {
+                        Poll::Ready(Ok((n, data))) => {
+                            self.read_fut = None;
+                            let take = n.min(buf.remaining());
+                            buf.put_slice(&data[..take]);
+                            if take < n {
+                                self.leftover.extend_from_slice(&data[take..n]);
+                            }
+                            return Poll::Ready(Ok(()));
+                        },
+                        Poll::Ready(Err(e)) => {
+                            self.read_fut = None;
+                            return Poll::Ready(Err(e));
+                        },
+                        Poll::Pending => return Poll::Pending,
+                    }
+                }
+                let inner = self.inner.clone();
+                self.read_fut = Some(Box::pin(async move {
+                    let mut guard = inner.lock().await;
+                    let mut data = vec![0u8; 32 * 1024];
+                    let n = guard.read(&mut data).await?;
+                    data.truncate(n);
+                    Ok((n, data))
+                }));
+            }
+        }
+    }
+
+    impl tokio::io::AsyncWrite for RelayIo {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            if let Some(fut) = self.write_fut.as_mut() {
+                match fut.as_mut().poll(cx) {
+                    Poll::Ready(Ok(())) => {
+                        self.write_fut = None;
+                        return Poll::Ready(Ok(buf.len()));
+                    },
+                    Poll::Ready(Err(e)) => {
+                        self.write_fut = None;
+                        return Poll::Ready(Err(e));
+                    },
+                    Poll::Pending => return Poll::Pending,
+                }
+            }
+            let inner = self.inner.clone();
+            let data = buf.to_vec();
+            self.write_fut = Some(Box::pin(async move {
+                let mut guard = inner.lock().await;
+                guard.write(&data).await
+            }));
+            self.poll_write(cx, buf)
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>, _cx: &mut Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>, _cx: &mut Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    // VLESS UDP framing: [2-byte BE length]+[packet] in both directions.
+    // The deframer must reassemble packets torn across read boundaries.
+    #[test]
+    fn udp_framing_round_trip_with_torn_boundaries() {
+        let packets: Vec<Vec<u8>> = vec![
+            b"aaaa".to_vec(),
+            b"bb".to_vec(),
+            Vec::new(), // zero-length frame is legal
+            vec![7u8; 1000],
+        ];
+        let mut stream = Vec::new();
+        for p in &packets {
+            stream.extend(udp_frame_packet(p));
+        }
+        let mut dfr = UdpDeframer::new();
+        let mut out = Vec::new();
+        for b in &stream {
+            dfr.feed(std::slice::from_ref(b), &mut out);
+        }
+        assert_eq!(out, packets);
+    }
+
+    #[test]
+    fn udp_frame_header_is_big_endian_length() {
+        let f = udp_frame_packet(&[0xAA, 0xBB, 0xCC]);
+        assert_eq!(&f[..2], &[0x00, 0x03]);
+        assert_eq!(&f[2..], &[0xAA, 0xBB, 0xCC]);
+    }
 
     #[test]
     fn test_parse_uuid() {
@@ -1561,8 +2638,310 @@ mod tests {
     /// test_latency` (the default impl used by `ui/mod.rs`'s delay handlers)
     /// must drive the REALITY dial path and report failure gracefully —
     /// here against a plain TCP listener that cannot answer a TLS handshake.
+    // -- direct-first WSS/CDN fallback ladder (OpenRung) ----------------------
+
+    use crate::config::WssFallbackConfig;
+    use crate::config::WssFrontConfig;
+
+    const LADDER_PBK: &str = "Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc=";
+
+    /// Bind and immediately drop a loopback listener; its port now refuses
+    /// connections deterministically (ECONNREFUSED on loopback).
+    fn refused_port() -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap().port()
+    }
+
+    fn ladder_cfg(
+        server: String, fronts: Vec<WssFrontConfig>, broker: String,
+    ) -> OutboundConfig {
+        OutboundConfig {
+            type_: "vless".into(),
+            tag: Some("ladder".into()),
+            server: Some(server),
+            password: Some("b831381d-6324-4d53-ad4f-8cda48b30811".into()),
+            sni: Some("www.example.com".into()),
+            tls_fragment: false,
+            reality: Some(crate::transport::reality::RealityConfig {
+                public_key: LADDER_PBK.into(),
+                short_id: "01ab".into(),
+            }),
+            wss_fronts: Some(fronts),
+            wss_fallback: Some(WssFallbackConfig {
+                broker: Some(broker),
+                relay_id: Some("relay_x".into()),
+                enabled: true,
+                ticket_budget_ms: Some(5_000),
+                handshake_timeout_ms: Some(3_000),
+                native_no_sni: true,
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn front_cfg(id: &str, url: String) -> WssFrontConfig {
+        WssFrontConfig { id: id.into(), url, protocol_version: 1 }
+    }
+
+    fn front_url(addr: std::net::SocketAddr) -> String {
+        format!("wss://127.0.0.1:{}/api/v1/wss-bridge", addr.port())
+    }
+
+    /// Broker routing tickets per front: `tickets` maps front_id to the URL
+    /// embedded in the ticket; unknown fronts get a 404.
+    async fn spawn_ticket_broker(
+        tickets: std::collections::HashMap<String, String>,
+    ) -> String {
+        crate::wssfront::testutil::spawn_mock_broker_router(move |body| {
+            let front_id = crate::wssfront::testutil::front_id_of(&body);
+            match tickets.get(&front_id) {
+                Some(url) => crate::wssfront::testutil::http_ok(
+                    &crate::wssfront::testutil::ticket_body(
+                        "v1.k.claims.sig",
+                        120,
+                        url,
+                    ),
+                ),
+                None => crate::wssfront::testutil::http_status(404, &[]),
+            }
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn wss_ladder_activates_first_front_after_direct_failure() {
+        let front_addr =
+            crate::wssfront::testutil::spawn_mock_front("v1.k.claims.sig")
+                .await;
+        let url = front_url(front_addr);
+        let broker = spawn_ticket_broker(
+            [("front-a".to_string(), url.clone())].into_iter().collect(),
+        )
+        .await;
+
+        // The direct endpoint refuses connections (a blackholed relay IP).
+        let refused = refused_port();
+        let cfg = ladder_cfg(
+            format!("127.0.0.1:{refused}"),
+            vec![front_cfg("front-a", url)],
+            broker,
+        );
+        validate_vless_config(&cfg).unwrap();
+        let client =
+            VlessOutboundClient::from_config_inner(vec![&cfg], true)
+                .await
+                .unwrap();
+
+        // The ladder must mint a ticket from the mock broker, dial the mock
+        // front through it, and activate that front.
+        let setup = client.wss.as_ref().unwrap();
+        let active = client
+            .activate_wss_ladder(setup)
+            .await
+            .expect("ladder must activate the first front");
+        assert_eq!(active.front_id, "front-a");
+        assert!(active.session.bridge_addr.ip().is_loopback());
+        assert!(!active.session.is_dead());
+    }
+
+    #[tokio::test]
+    async fn wss_ladder_walks_to_second_front_on_ticket_denial() {
+        let front_a =
+            crate::wssfront::testutil::spawn_mock_front("v1.k.claims.sig")
+                .await;
+        let front_b =
+            crate::wssfront::testutil::spawn_mock_front("v1.k.claims.sig")
+                .await;
+        // front-a is unknown to the broker (404); front-b gets a ticket.
+        let broker = spawn_ticket_broker(
+            [("front-b".to_string(), front_url(front_b))]
+                .into_iter()
+                .collect(),
+        )
+        .await;
+
+        let refused = refused_port();
+        let cfg = ladder_cfg(
+            format!("127.0.0.1:{refused}"),
+            vec![
+                front_cfg("front-a", front_url(front_a)),
+                front_cfg("front-b", front_url(front_b)),
+            ],
+            broker,
+        );
+        let client =
+            VlessOutboundClient::from_config_inner(vec![&cfg], true)
+                .await
+                .unwrap();
+        let setup = client.wss.as_ref().unwrap();
+        let active = client
+            .activate_wss_ladder(setup)
+            .await
+            .expect("ladder must walk to the second front");
+        assert_eq!(active.front_id, "front-b");
+    }
+
+    #[tokio::test]
+    async fn wss_ladder_rejects_ticket_bound_to_wrong_front() {
+        let front_a =
+            crate::wssfront::testutil::spawn_mock_front("v1.k.claims.sig")
+                .await;
+        let front_b =
+            crate::wssfront::testutil::spawn_mock_front("v1.k.claims.sig")
+                .await;
+        // The broker answers front-a with a ticket carrying front-b's URL:
+        // the binding check (connectcore/wss.go:357) must skip front-a.
+        let tickets = [
+            ("front-a".to_string(), front_url(front_b)),
+            ("front-b".to_string(), front_url(front_b)),
+        ]
+        .into_iter()
+        .collect();
+        let broker = spawn_ticket_broker(tickets).await;
+
+        let refused = refused_port();
+        let cfg = ladder_cfg(
+            format!("127.0.0.1:{refused}"),
+            vec![
+                front_cfg("front-a", front_url(front_a)),
+                front_cfg("front-b", front_url(front_b)),
+            ],
+            broker,
+        );
+        let client =
+            VlessOutboundClient::from_config_inner(vec![&cfg], true)
+                .await
+                .unwrap();
+        let setup = client.wss.as_ref().unwrap();
+        let active = client
+            .activate_wss_ladder(setup)
+            .await
+            .expect("front-b must still activate");
+        assert_eq!(active.front_id, "front-b");
+    }
+
+    #[tokio::test]
+    async fn wss_ladder_all_fail_yields_combined_error() {
+        // Broker unreachable: every front fails on the ticket request.
+        let dead_broker = format!("http://127.0.0.1:{}", refused_port());
+        let front_a = crate::wssfront::testutil::spawn_mock_front("t").await;
+        let cfg = ladder_cfg(
+            format!("127.0.0.1:{}", refused_port()),
+            vec![front_cfg("front-a", front_url(front_a))],
+            dead_broker,
+        );
+        validate_vless_config(&cfg).unwrap();
+        let client =
+            VlessOutboundClient::from_config_inner(vec![&cfg], true)
+                .await
+                .unwrap();
+
+        let msg = match client.obtain_stream().await {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("direct + all fronts failed: expected error"),
+        };
+        assert!(msg.contains("direct path failed"), "{msg}");
+        assert!(msg.contains("WSS fallback failed"), "{msg}");
+        // The active front must remain unset after a failed ladder.
+        assert!(client.active.lock().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn wss_disabled_fallback_never_attempts_fronts() {
+        // Fronts configured but the fallback disabled: the direct failure is
+        // returned as-is — no ticket attempt, no front dial.
+        let mut cfg = ladder_cfg(
+            format!("127.0.0.1:{}", refused_port()),
+            vec![front_cfg(
+                "front-a",
+                "wss://a.b-cdn.net/api/v1/wss-bridge".into(),
+            )],
+            "http://127.0.0.1:1".into(),
+        );
+        cfg.wss_fallback.as_mut().unwrap().enabled = false;
+        validate_vless_config(&cfg).unwrap();
+        let client =
+            VlessOutboundClient::from_config(vec![&cfg]).await.unwrap();
+        assert!(
+            client.wss.is_none(),
+            "disabled fallback must not build a setup"
+        );
+
+        let msg = match client.obtain_stream().await {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected direct failure"),
+        };
+        assert!(!msg.contains("WSS"), "{msg}");
+    }
+
+    #[test]
+    fn vless_config_rejects_fronts_without_reality_or_fallback() {
+        // fronts without the reality section
+        let cfg = OutboundConfig {
+            type_: "vless".into(),
+            server: Some("127.0.0.1:443".into()),
+            password: Some("b831381d-6324-4d53-ad4f-8cda48b30811".into()),
+            sni: Some("www.example.com".into()),
+            wss_fronts: Some(vec![front_cfg(
+                "a",
+                "wss://a.b-cdn.net/api/v1/wss-bridge".into(),
+            )]),
+            wss_fallback: Some(WssFallbackConfig {
+                broker: Some("https://broker.openrung.org/".into()),
+                relay_id: Some("relay_x".into()),
+                enabled: true,
+                ticket_budget_ms: None,
+                handshake_timeout_ms: None,
+                native_no_sni: true,
+            }),
+            ..Default::default()
+        };
+        let err = validate_vless_config(&cfg).unwrap_err();
+        assert!(err.contains("reality"), "{err}");
+
+        // reality but no fallback section
+        let cfg = OutboundConfig {
+            type_: "vless".into(),
+            server: Some("127.0.0.1:443".into()),
+            password: Some("b831381d-6324-4d53-ad4f-8cda48b30811".into()),
+            sni: Some("www.example.com".into()),
+            reality: Some(crate::transport::reality::RealityConfig {
+                public_key: LADDER_PBK.into(),
+                short_id: "01ab".into(),
+            }),
+            wss_fronts: Some(vec![front_cfg(
+                "a",
+                "wss://a.b-cdn.net/api/v1/wss-bridge".into(),
+            )]),
+            ..Default::default()
+        };
+        let err = validate_vless_config(&cfg).unwrap_err();
+        assert!(err.contains("wss_fallback"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn vless_config_rejects_non_canonical_fronts() {
+        let refused = refused_port();
+        let broker = spawn_ticket_broker(Default::default()).await;
+        // Unsorted front set (wsscore canonical order required).
+        let cfg = ladder_cfg(
+            format!("127.0.0.1:{refused}"),
+            vec![
+                front_cfg("b", "wss://b.b-cdn.net/api/v1/wss-bridge".into()),
+                front_cfg("a", "wss://a.b-cdn.net/api/v1/wss-bridge".into()),
+            ],
+            broker,
+        );
+        let err = match VlessOutboundClient::from_config(vec![&cfg]).await {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("non-canonical fronts must be rejected"),
+        };
+        assert!(err.contains("canonical"), "{err}");
+    }
+
     #[tokio::test]
     async fn test_latency_drives_reality_dial_path() {
+
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         std::thread::spawn(move || {

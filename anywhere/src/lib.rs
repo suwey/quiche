@@ -22,6 +22,7 @@ pub mod subscription;
 pub mod tlsfragment;
 pub mod transport;
 pub mod ui;
+pub mod wssfront;
 
 // Re-export the core entry point so both the desktop binary (main.rs)
 // and the Android JNI bridge (android/jni.rs) can call the same code.

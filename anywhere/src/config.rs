@@ -124,6 +124,62 @@ pub struct WsConfig {
     pub headers: Option<HashMap<String, String>>,
 }
 
+/// One OpenRung WSS CDN front (`[[outbounds.wss_fronts]]`) — mirrors the
+/// signed descriptor's front entry (`crate::wssfront::WssFront`).
+#[derive(Debug, Clone, Deserialize)]
+pub struct WssFrontConfig {
+    /// Stable front ID (bound into tickets; must be canonical per
+    /// `wssfront::validate_front_id`).
+    pub id: String,
+    /// `wss://<cdn-host>/api/v1/wss-bridge` (canonical production URL).
+    pub url: String,
+    /// Front protocol version; only version 1 is supported (defaults to 1).
+    #[serde(default = "default_wss_protocol_version")]
+    pub protocol_version: i64,
+}
+
+fn default_wss_protocol_version() -> i64 {
+    crate::wssfront::PROTOCOL_VERSION
+}
+
+/// Direct-first WSS/CDN fallback knobs (`[outbounds.wss_fallback]`).
+///
+/// Modeled after the Go client's connectcore ladder: when the direct REALITY
+/// path to the relay fails with an eligible remote-network failure, anywhere
+/// requests a broker-signed ticket for each advertised front in order and
+/// tunnels the opaque REALITY byte stream through the relay-owned CDN front.
+#[derive(Debug, Clone, Deserialize)]
+pub struct WssFallbackConfig {
+    /// Broker base URL used to request WSS session tickets
+    /// (POST {broker}/api/v1/wss/tickets). Required for fallback to run; the
+    /// OpenRung directory import records the front the directory was fetched
+    /// from. Requests use HTTPS (plain http only to loopback, like the
+    /// directory fetch) and never follow redirects.
+    pub broker: Option<String>,
+    /// The OpenRung relay ID of this node (`relay_...`), bound into every
+    /// ticket (the broker issues front- and relay-bound tickets). Populated
+    /// by the directory import from the signed descriptor.
+    pub relay_id: Option<String>,
+    /// Master switch. Default: true (fallback activates only when
+    /// `wss_fronts` are present AND a broker is configured).
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Total deadline for the whole ticket ladder — every broker front, both
+    /// rounds and the Retry-After wait — in milliseconds
+    /// (Go connectcore `wssTicketTotalDeadline`, default 15000).
+    pub ticket_budget_ms: Option<u64>,
+    /// TLS + WebSocket handshake deadline per front dial in milliseconds
+    /// (Go wsscore `DefaultHandshakeTimeout`, default 10000).
+    pub handshake_timeout_ms: Option<u64>,
+    /// Omit ClientHello SNI for native one-label `*.cloudfront.net` /
+    /// `*.b-cdn.net` front URLs while still verifying the certificate against
+    /// the exact signed URL hostname (Go wsscore `NativeFrontNoSNI`; the Go
+    /// desktop client enables it). Custom CDN CNAMEs and other fronts keep
+    /// ordinary SNI regardless.
+    #[serde(default = "default_true")]
+    pub native_no_sni: bool,
+}
+
 /// Nested transport configuration.
 #[derive(Debug, Clone, Deserialize)]
 pub struct TransportConfig {
@@ -227,6 +283,16 @@ pub struct OutboundConfig {
     /// for this outbound (replaces the WS transport; no `[transport]` needed).
     #[serde(default)]
     pub reality: Option<crate::transport::reality::RealityConfig>,
+
+    /// OpenRung WSS CDN fronts for this relay (`[[outbounds.wss_fronts]]`,
+    /// array of tables). Only meaningful together with the `reality` section:
+    /// the fallback tunnels the same opaque REALITY byte stream through the
+    /// front. Populated by `--sub-openrung` from signed descriptors.
+    #[serde(default)]
+    pub wss_fronts: Option<Vec<WssFrontConfig>>,
+    /// Direct-first WSS/CDN fallback knobs (`[outbounds.wss_fallback]`).
+    #[serde(default)]
+    pub wss_fallback: Option<WssFallbackConfig>,
 
     // --- anytls session pool ---
     /// How often the pool cleanup task runs (seconds, default: 60).

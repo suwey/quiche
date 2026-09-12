@@ -63,6 +63,10 @@ getrandom = "0.4"
 blake3 = "1"
 chacha20poly1305 = "0.11"
 noyalib = "0.0.18"
+# OpenRung WSS-front fallback: yamux multiplexer over the WebSocket bridge
+# (wire-compatible with the Go client's hashicorp/yamux profile, see
+# openrung/wsscore/transport.go — 256 KiB stream window, yamux spec v1).
+yamux = "0.14"
 
 [dev-dependencies]
 # `#[tokio::test(start_paused = true)]` needs tokio's test-util feature,
