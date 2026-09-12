@@ -15,18 +15,17 @@ listen = "127.0.0.1:1080"
 
 [[outbounds]]
 type = "vless"
-tag = "C"
-server = "11.11.1.11:2083"
-password = "xxxxx"
-sni = "h.p.dev"
-# fp = true
+tag = "vl"
+server = "1.9.5.1:2096"
+password = ""
+sni = "k.p.d"
 
 [outbounds.transport]
 type = "ws"
 
 [outbounds.transport.ws]
 path = "/"
-headers.Host = "h.p.dev"
+headers = { Host = "k.p.d" }
 
 [[rules]]
-outbound = "C"
+outbound = "vl"

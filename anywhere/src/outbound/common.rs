@@ -235,6 +235,8 @@ fn bind_to_physical_iface(fd: std::os::fd::RawFd) -> io::Result<()> {
 /// Connect timeout for the bypass TCP dial helpers. Bounds the connect's
 /// poll budget so a blackholed destination (SYN dropped) fails fast instead
 /// of hanging for the OS-level connect timeout (75s+ on macOS).
+/// Only the Android dial path ignores it, polling with its own 10s budget.
+#[cfg_attr(target_os = "android", allow(dead_code))]
 const TCP_CONNECT_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(5);
 
@@ -1069,6 +1071,11 @@ pub async fn create_tls_stream_async(
     }
     if insecure {
         builder.set_verify(SslVerifyMode::NONE);
+    } else {
+        // SslConnector::builder() already ran set_default_verify_paths(), but
+        // that probes Unix cert locations that don't exist on Android.
+        #[cfg(target_os = "android")]
+        load_android_system_roots(&mut builder);
     }
     let connector = builder.build();
     let mut config = connector
@@ -1083,6 +1090,43 @@ pub async fn create_tls_stream_async(
     crate::ech::verify_ech_outcome(tls.ssl(), ech)
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
     Ok(tls)
+}
+
+/// Android keeps its trusted root CAs as individual PEM files under
+/// /system/etc/security/cacerts (moved into the Conscrypt APEX on 14+).
+/// boringssl's `SSL_CTX_set_default_verify_paths` only probes the classic
+/// Unix locations (/etc/ssl, /usr/lib/ssl, ...), none of which exist on
+/// Android, leaving an empty trust store — every verified TLS handshake
+/// then fails with CERTIFICATE_VERIFY_FAILED ("unable to get local issuer
+/// certificate"). Load the system store explicitly.
+#[cfg(target_os = "android")]
+pub(crate) fn load_android_system_roots(builder: &mut SslContextBuilder) {
+    let dirs = [
+        "/apex/com.android.conscrypt/cacerts", // Android 14+
+        "/system/etc/security/cacerts",        // Android 13 and older
+    ];
+    for dir in dirs {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        let mut loaded = 0usize;
+        for entry in entries.flatten() {
+            let Ok(pem) = std::fs::read(entry.path()) else {
+                continue;
+            };
+            let Ok(cert) = boring::x509::X509::from_pem(&pem) else {
+                continue;
+            };
+            if builder.cert_store_mut().add_cert(cert).is_ok() {
+                loaded += 1;
+            }
+        }
+        if loaded > 0 {
+            log::info!("TLS: loaded {loaded} system CA certs from {dir}");
+            return;
+        }
+    }
+    log::warn!("TLS: no Android system CA directory readable; verified TLS will fail");
 }
 
 /// Resolve a `server` string (IP:port or domain:port) to a `SocketAddr`.

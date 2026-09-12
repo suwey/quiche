@@ -3,6 +3,17 @@ plugins {
     id("org.jetbrains.kotlin.android")
 }
 
+// Keep the APK version in sync with the Rust crate: read the [package]
+// version straight from ../anywhere/Cargo.toml at configuration time, so
+// bumping the Rust version updates versionName/versionCode automatically.
+val cargoToml = rootDir.parentFile.resolve("anywhere/Cargo.toml")
+val cargoPackageSection = cargoToml.readText()
+    .substringAfter("[package]")
+    .substringBefore("\n[")
+val anywhereVersion = Regex("""(?m)^\s*version\s*=\s*"([^"]+)"""")
+    .find(cargoPackageSection)?.groupValues?.get(1)
+    ?: error("Failed to parse package `version` from $cargoToml")
+
 android {
     namespace = "com.anywhere.android"
     compileSdk = 35
@@ -11,8 +22,13 @@ android {
         applicationId = "com.anywhere.android"
         minSdk = 29      // Android 10+ (VpnService.requireStrongKeystore etc.)
         targetSdk = 35
-        versionCode = 1
-        versionName = "1.0.0"
+        // major*10000 + minor*100 + patch keeps versionCode monotonic across
+        // semver bumps (pre-release suffixes like 1.2.0-rc.1 are truncated).
+        val semver = anywhereVersion.substringBefore('-').split(".")
+        versionCode = semver[0].toInt() * 10000 +
+            semver.getOrElse(1) { "0" }.toInt() * 100 +
+            semver.getOrElse(2) { "0" }.toInt()
+        versionName = anywhereVersion
     }
 
     buildFeatures {

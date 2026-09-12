@@ -189,6 +189,11 @@ async fn ech_tls_dial(
     builder
         .set_default_verify_paths()
         .map_err(|e| plain_dial_error(format!("TLS roots: {e:?}")))?;
+    // set_default_verify_paths probes Unix cert locations that don't exist
+    // on Android; load the system store explicitly or every verified
+    // handshake fails with CERTIFICATE_VERIFY_FAILED.
+    #[cfg(target_os = "android")]
+    crate::outbound::common::load_android_system_roots(&mut builder);
     builder
         .set_alpn_protos(b"\x08http/1.1")
         .map_err(|e| plain_dial_error(format!("ALPN: {e:?}")))?;

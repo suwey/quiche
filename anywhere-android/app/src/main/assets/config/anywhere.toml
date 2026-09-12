@@ -4,7 +4,6 @@ secret = "admin"
 [[inbounds]]
 type = "tun"
 tag = "tun-in"
-mtu = 1500
 
 [[outbounds]]
 type = "mless"
@@ -28,7 +27,7 @@ outbounds = ["CF"]
 [[rules]]
 # protocol examples: "both:1232" "tcp:123,1132" "udp:123,2222"
 protocol = "stun"  # both:3748,3749
-outbound = "none" # drop the traffic
+outbound = "reject" # drop the traffic
 
 [[rules]]
 # some software use other ports such as Xunlei, recommend set direct mode in ui when download.
