@@ -13,3 +13,4 @@ reasonix.toml
 .qoder
 **/.wrangler
 **/node_modules
+/releases/

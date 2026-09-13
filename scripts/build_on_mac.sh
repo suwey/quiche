@@ -1,6 +1,14 @@
 #!/bin/bash
 # Build script: compile all targets (desktop + Linux musl + Android) and optionally build APK.
 #
+# Usage:
+#   ./scripts/build_on_mac.sh            # build all targets (desktop is debug)
+#   ./scripts/build_on_mac.sh --apk      # also build the Android release APK
+#   ./scripts/build_on_mac.sh --releases # desktop becomes release; collect
+#                                        # anywhere-v<version>-<platform>.(tgz|apk)
+#                                        # for every platform into quiche/releases/
+#                                        # (implies --apk)
+#
 # Prerequisites:
 #   - Android NDK installed (ANDROID_NDK_HOME set)
 #   - Rust targets: rustup target add aarch64-linux-android aarch64-unknown-linux-musl
@@ -26,12 +34,29 @@ RUST_PROJECT="$SCRIPT_DIR/../anywhere"
 
 # --- Parse args ---
 BUILD_APK=false
+RELEASES=false
+RELEASE_FLAG=""
 for arg in "$@"; do
     case "$arg" in
         --apk) BUILD_APK=true ;;
         --all) BUILD_APK=true ;;
+        # Build release artifacts for every platform and collect them in
+        # quiche/releases/ as anywhere-v<version>-<platform>.(tgz|apk),
+        # ready for a GitHub release upload. Implies --apk.
+        --releases) RELEASES=true; BUILD_APK=true ;;
     esac
 done
+if [[ "$RELEASES" == "true" ]]; then
+    RELEASE_FLAG="--release"
+fi
+
+# Crate version from the [package] section (single source of truth for
+# artifact naming; the Android gradle build reads the same field).
+VERSION=$(awk '/^\[package\]/{p=1;next} /^\[/{p=0} p && /^version/{gsub(/"/,"",$3); print $3; exit}' "$RUST_PROJECT/Cargo.toml")
+if [[ -z "$VERSION" ]]; then
+    echo "ERROR: failed to parse version from $RUST_PROJECT/Cargo.toml"
+    exit 1
+fi
 
 # --- Environment info ---
 echo ""
@@ -46,7 +71,7 @@ echo ""
 # 1. Desktop build (native)
 # ============================================================
 echo "=== Building desktop (native) ==="
-cargo build -p anywhere
+cargo build -p anywhere $RELEASE_FLAG
 
 # ============================================================
 # 2. Linux musl cross-compile (aarch64) — requires zig
@@ -206,6 +231,108 @@ else
     echo "The .so files are in: $ANDROID_PROJECT/app/src/main/jniLibs/"
     echo ""
     echo "To build the APK, run:"
-    echo "  ./scripts/build.sh --apk"
+    echo "  ./scripts/build_on_mac.sh --apk"
     echo "  (or open the project in Android Studio)"
+fi
+
+# ============================================================
+# 6. Package release artifacts (--releases)
+# ============================================================
+# Collect per-platform release artifacts into quiche/releases/ as
+# anywhere-v<version>-<platform>.(tgz|apk), ready for GitHub upload.
+if [[ "$RELEASES" == "true" ]]; then
+    echo ""
+    echo "=== Packaging releases (v${VERSION}) ==="
+    REL_DIR="$SCRIPT_DIR/../releases"
+    mkdir -p "$REL_DIR"
+    # Stage inside REL_DIR, not the system tmpdir: sandboxed environments
+    # can virtualize /var/folders|/tmp writes, which once materialized the
+    # staging copies into releases/ itself. Workspace writes are always real.
+    STAGE="$REL_DIR/.stage.$$"
+    mkdir -p "$STAGE"
+    trap 'rm -rf "$STAGE"' EXIT
+
+    # Tar the given binaries into <top>.tgz with a top-level directory
+    # named after the archive base. extra_src (may be empty) copies
+    # additional deploy files (configs, runtime DLLs, ...) next to the
+    # binary. Missing binaries are skipped with a warning.
+    pack_bins() {
+        local platform="$1" src="$2" extra_src="$3"
+        shift 3
+        local top="anywhere-v${VERSION}-${platform}"
+        local bin have=0
+        mkdir -p "$STAGE/$top"
+        for bin in "$@"; do
+            if [[ -f "$src/$bin" ]]; then
+                cp "$src/$bin" "$STAGE/$top/"
+                have=1
+            else
+                echo "  ⚠ $platform: $bin not found, skipped"
+            fi
+        done
+        if [[ -n "$extra_src" ]]; then
+            if [[ -d "$extra_src" ]]; then
+                local f
+                for f in "$extra_src"/*; do
+                    if [[ -f "$f" ]]; then
+                        cp "$f" "$STAGE/$top/"
+                    fi
+                done
+            else
+                echo "  ⚠ $platform: extra dir $extra_src not found, skipped"
+            fi
+        fi
+        if [[ "$have" == "1" ]]; then
+            tar -czf "$REL_DIR/${top}.tgz" -C "$STAGE" "$top"
+            echo "  ✅ ${top}.tgz"
+        fi
+        rm -rf "$STAGE/$top"
+    }
+
+    pack_bins "macos-arm64" \
+        "$SCRIPT_DIR/../target/release" "" \
+        anywhere
+    pack_bins "linux-aarch64-musl" \
+        "$SCRIPT_DIR/../target/aarch64-unknown-linux-musl/release" "" \
+        anywhere
+    pack_bins "windows-x64-gnu" \
+        "$SCRIPT_DIR/../target/x86_64-pc-windows-gnu/release" \
+        "$SCRIPT_DIR/../anywhere/deploy/windows" \
+        anywhere.exe
+
+    # Android APK
+    APK_SRC="$ANDROID_PROJECT/app/build/outputs/apk/release/app-release.apk"
+    if [[ -f "$APK_SRC" ]]; then
+        cp "$APK_SRC" "$REL_DIR/anywhere-v${VERSION}-android-arm64.apk"
+        echo "  ✅ anywhere-v${VERSION}-android-arm64.apk"
+    else
+        echo "  ⚠ APK not found, android artifact skipped"
+    fi
+
+    # Web UI, taken from the Android assets. AAPT forbids '_'-prefixed asset
+    # dirs, so the repo stores nuxt/ and fonts/ — rename them back to
+    # _nuxt/_fonts (same mapping as Kotlin's copyUiAssets) for serving.
+    UI_SRC="$ANDROID_PROJECT/app/src/main/assets/ui"
+    if [[ -d "$UI_SRC" ]]; then
+        rm -rf "$STAGE/ui"
+        cp -R "$UI_SRC" "$STAGE/ui"
+        if [[ -d "$STAGE/ui/nuxt" ]]; then
+            mv "$STAGE/ui/nuxt" "$STAGE/ui/_nuxt"
+        fi
+        if [[ -d "$STAGE/ui/fonts" ]]; then
+            mv "$STAGE/ui/fonts" "$STAGE/ui/_fonts"
+        fi
+        tar -czf "$REL_DIR/anywhere-v${VERSION}-ui.tgz" -C "$STAGE" ui
+        rm -rf "$STAGE/ui"
+        echo "  ✅ anywhere-v${VERSION}-ui.tgz"
+    else
+        echo "  ⚠ UI assets not found at $UI_SRC, ui artifact skipped"
+    fi
+
+    echo ""
+    echo "=== Releases in $REL_DIR ==="
+    ls -lh "$REL_DIR"
+    echo ""
+    echo "Upload hint:"
+    echo "  gh release create v${VERSION} $REL_DIR/* --generate-notes"
 fi

@@ -1073,9 +1073,12 @@ pub async fn create_tls_stream_async(
         builder.set_verify(SslVerifyMode::NONE);
     } else {
         // SslConnector::builder() already ran set_default_verify_paths(), but
-        // that probes Unix cert locations that don't exist on Android.
+        // that probes /etc/ssl (see boringssl x509_def.c), which exists on
+        // macOS only — load the platform trust store explicitly elsewhere.
         #[cfg(target_os = "android")]
         load_android_system_roots(&mut builder);
+        #[cfg(target_os = "windows")]
+        load_windows_system_roots(&mut builder);
     }
     let connector = builder.build();
     let mut config = connector
@@ -1127,6 +1130,82 @@ pub(crate) fn load_android_system_roots(builder: &mut SslContextBuilder) {
         }
     }
     log::warn!("TLS: no Android system CA directory readable; verified TLS will fail");
+}
+
+/// Windows keeps its trusted root CAs in CryptoAPI certificate stores
+/// ("ROOT" and "CA"), not as files on disk. boringssl's
+/// `SSL_CTX_set_default_verify_paths` only probes /etc/ssl (x509_def.c),
+/// which never exists on native Windows, leaving an empty trust store —
+/// every verified TLS handshake then fails with CERTIFICATE_VERIFY_FAILED
+/// ("unable to get local issuer certificate"). Export the system stores
+/// into the boring context instead.
+#[cfg(target_os = "windows")]
+pub(crate) fn load_windows_system_roots(builder: &mut SslContextBuilder) {
+    // Partial CERT_CONTEXT (cryptoapi layout); only the fields we read.
+    #[repr(C)]
+    #[allow(dead_code)]
+    struct CertContext {
+        dw_cert_encoding_type: u32,
+        pb_cert_encoded: *mut u8,
+        cb_cert_encoded: u32,
+        p_cert_info: *mut std::ffi::c_void,
+        h_cert_store: *mut std::ffi::c_void,
+    }
+
+    #[link(name = "crypt32")]
+    unsafe extern "system" {
+        fn CertOpenSystemStoreW(
+            hprov: *mut std::ffi::c_void, sz_subsystem_protocol: *const u16,
+        ) -> *mut std::ffi::c_void;
+        fn CertEnumCertificatesInStore(
+            h_cert_store: *mut std::ffi::c_void,
+            p_prev_cert_context: *const CertContext,
+        ) -> *const CertContext;
+        fn CertCloseStore(
+            h_cert_store: *mut std::ffi::c_void, dw_flags: u32,
+        ) -> i32;
+    }
+
+    let mut loaded = 0usize;
+    // UTF-16 store names: "ROOT", "CA" (null-terminated; padded to [u16; 5]).
+    for name in [
+        [0x0052u16, 0x004F, 0x004F, 0x0054, 0x0000],
+        [0x0043u16, 0x0041, 0x0000, 0x0000, 0x0000],
+    ] {
+        let store = unsafe {
+            CertOpenSystemStoreW(std::ptr::null_mut(), name.as_ptr())
+        };
+        if store.is_null() {
+            continue;
+        }
+        let mut prev: *const CertContext = std::ptr::null();
+        // CertEnumCertificatesInStore frees the previous context on each
+        // call, so copy the DER bytes out before the next iteration.
+        loop {
+            let ctx = unsafe { CertEnumCertificatesInStore(store, prev) };
+            if ctx.is_null() {
+                break;
+            }
+            prev = ctx;
+            let der = unsafe {
+                std::slice::from_raw_parts(
+                    (*ctx).pb_cert_encoded,
+                    (*ctx).cb_cert_encoded as usize,
+                )
+            };
+            if let Ok(cert) = boring::x509::X509::from_der(der) {
+                if builder.cert_store_mut().add_cert(cert).is_ok() {
+                    loaded += 1;
+                }
+            }
+        }
+        unsafe { CertCloseStore(store, 0) };
+    }
+    if loaded > 0 {
+        log::info!("TLS: loaded {loaded} system CA certs from Windows cert stores");
+    } else {
+        log::warn!("TLS: no Windows system CA certs found; verified TLS will fail");
+    }
 }
 
 /// Resolve a `server` string (IP:port or domain:port) to a `SocketAddr`.

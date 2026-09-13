@@ -194,6 +194,8 @@ async fn ech_tls_dial(
     // handshake fails with CERTIFICATE_VERIFY_FAILED.
     #[cfg(target_os = "android")]
     crate::outbound::common::load_android_system_roots(&mut builder);
+    #[cfg(target_os = "windows")]
+    crate::outbound::common::load_windows_system_roots(&mut builder);
     builder
         .set_alpn_protos(b"\x08http/1.1")
         .map_err(|e| plain_dial_error(format!("ALPN: {e:?}")))?;
