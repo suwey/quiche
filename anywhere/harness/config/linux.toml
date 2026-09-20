@@ -1,0 +1,6 @@
+# linux 平台覆盖。ssh 平台必须配置 serve_path：
+# 部署目录 = serve_path 的上一层（本例发到 /home/you/，二进制、ui/、
+# final-<tag>.toml 都在那里，serve_path 保持原值不改写）。
+
+[ui]
+serve_path = "/home/you/ui"

@@ -283,13 +283,15 @@ if [[ "$RELEASES" == "true" ]]; then
             fi
         fi
         if [[ "$have" == "1" ]]; then
-            tar -czf "$REL_DIR/${top}.tgz" -C "$STAGE" "$top"
+            # COPYFILE_DISABLE: keep macOS xattrs out of the archive
+            # (otherwise every file gets a junk ._ AppleDouble twin)
+            COPYFILE_DISABLE=1 tar --exclude='._*' -czf "$REL_DIR/${top}.tgz" -C "$STAGE" "$top"
             echo "  ✅ ${top}.tgz"
         fi
         rm -rf "$STAGE/$top"
     }
 
-    pack_bins "macos-arm64" \
+    pack_bins "mac-arm64" \
         "$SCRIPT_DIR/../target/release" "" \
         anywhere
     pack_bins "linux-aarch64-musl" \
@@ -299,6 +301,12 @@ if [[ "$RELEASES" == "true" ]]; then
         "$SCRIPT_DIR/../target/x86_64-pc-windows-gnu/release" \
         "$SCRIPT_DIR/../anywhere/deploy/windows" \
         anywhere.exe
+
+    # Android raw executable: the APK carries only the cdylib (not exec'able),
+    # while the conformance harness runs this bin via adb shell.
+    pack_bins "android-arm64" \
+        "$SCRIPT_DIR/../target/aarch64-linux-android/release" "" \
+        anywhere
 
     # Android APK
     APK_SRC="$ANDROID_PROJECT/app/build/outputs/apk/release/app-release.apk"
@@ -322,7 +330,7 @@ if [[ "$RELEASES" == "true" ]]; then
         if [[ -d "$STAGE/ui/fonts" ]]; then
             mv "$STAGE/ui/fonts" "$STAGE/ui/_fonts"
         fi
-        tar -czf "$REL_DIR/anywhere-v${VERSION}-ui.tgz" -C "$STAGE" ui
+        COPYFILE_DISABLE=1 tar --exclude='._*' -czf "$REL_DIR/anywhere-v${VERSION}-ui.tgz" -C "$STAGE" ui
         rm -rf "$STAGE/ui"
         echo "  ✅ anywhere-v${VERSION}-ui.tgz"
     else

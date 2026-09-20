@@ -1,0 +1,43 @@
+# Mless 服务端最简配置（VLESS over 多路复用 WebSocket，带 per-frame XOR 混淆）。
+#
+# 客户端侧参考 anytls-client.toml / vless-client.toml 的风格，对应的 outbound 写法：
+#   [[outbounds]]
+#   type = "mless"
+#   server = "<本机地址>:8443"
+#   password = "b831381d-6324-4d53-ad4f-8cda48b30811"   # password 即 VLESS UUID，
+#                                                       # 同时派生混淆密钥
+#   sni = "localhost"        # 域名证书填证书域名，IP + insecure = true 可省
+#   insecure = true          # 自签证书时需要
+#   tls_fragment = false     # 服务端同机时建议关闭分片
+#   [outbounds.transport]
+#   type = "ws"
+#   [outbounds.transport.ws]
+#   path = "/ws"
+
+[[users]]
+name = "alice"
+# password 直接作为 VLESS UUID（与 outbound 的解析一致），同时用于派生
+# per-frame XOR 混淆密钥：SHA-256(uuid字符串 || "anywhere-obfuscation-v1")。
+password = "b831381d-6324-4d53-ad4f-8cda48b30811"
+
+[[inbounds]]
+type = "mless"
+listen = "0.0.0.0:8443"
+cert = "cert.pem"
+key = "key.pem"
+
+[inbounds.transport]
+type = "ws"
+
+[inbounds.transport.ws]
+path = "/ws"
+# 可选：校验客户端请求的 Host 头（与 outbound 的 Host/SNI 一致）；
+# 不配置则接受任意 Host（CDN 回源改写 Host 的场景）。
+# headers = { Host = "localhost" }
+
+[[outbounds]]
+type = "direct"
+tag = "direct-out"
+
+[[rules]]
+outbound = "direct-out"

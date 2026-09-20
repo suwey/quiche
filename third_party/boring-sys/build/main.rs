@@ -523,6 +523,13 @@ fn ensure_patches_applied(config: &Config) -> io::Result<()> {
     println!("cargo:warning=applying REALITY client session_id override patch to boringssl");
     apply_patch(config, "reality-session-id.patch")?;
 
+    // REALITY server hook: lets a server mirror the xtls/reality fork and
+    // sign the one-time certificate's CertificateVerify without intersecting
+    // with the client's advertised signature_algorithms (utls/xray REALITY
+    // clients never advertise ed25519). Always applied in this vendored copy.
+    println!("cargo:warning=applying REALITY server signature algorithm patch to boringssl");
+    apply_patch(config, "reality-server-sigalg.patch")?;
+
     Ok(())
 }
 

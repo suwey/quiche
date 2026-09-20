@@ -1178,6 +1178,14 @@ impl AnyTlsOutboundClient {
 
         Ok(SessionHandle { inner })
     }
+
+    /// MD5 of the padding scheme this client currently advertises. Updated
+    /// process-wide whenever a server pushes `CMD_UPDATE_PADDING_SCHEME`
+    /// (diagnostic/test observability only; not part of the wire protocol).
+    #[doc(hidden)]
+    pub fn cached_padding_md5(&self) -> String {
+        self.padding_cache.lock().unwrap().md5().to_string()
+    }
 }
 
 #[async_trait]

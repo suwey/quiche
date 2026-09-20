@@ -101,6 +101,64 @@ pub struct InboundConfig {
     /// Custom padding scheme text for anytls inbound (optional).
     #[serde(default)]
     pub padding_scheme: Option<String>,
+
+    /// Optional transport for the vless inbound — same shape as the
+    /// outbound's `[transport]` section. Only `type = "ws"` is supported:
+    /// the inbound then performs an HTTP/1.1 WebSocket upgrade on every
+    /// connection (path validated against `[transport.ws] path`, and the
+    /// `Host` header against `[transport.ws] headers.Host` when configured).
+    /// When absent, VLESS runs directly over TCP (inside TLS when cert/key
+    /// are configured).
+    #[serde(default)]
+    pub transport: Option<TransportConfig>,
+
+    /// REALITY server settings (`[inbounds.reality]`) for the vless inbound.
+    /// Its presence switches the inbound from plain TLS (cert/key) to the
+    /// REALITY protocol: pre-handshake ClientHello authentication, per-
+    /// connection one-time Ed25519 certificates, and transparent fallback
+    /// of unauthenticated connections to `dest`. Mutually exclusive with
+    /// `cert`/`key` and with `[transport]` (ws).
+    #[serde(default)]
+    pub reality: Option<RealityInboundConfig>,
+}
+
+/// REALITY inbound section — field names mirror xray's REALITYConfig
+/// (`infra/conf/transport_security.go:31-39`) in snake_case.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RealityInboundConfig {
+    /// xray `dest`/`target`: the camouflage site unauthenticated
+    /// connections are transparently spliced to ("host:port", TCP only).
+    pub dest: String,
+
+    /// xray `serverNames`: SNI values a REALITY client must present;
+    /// anything else falls back to `dest`.
+    #[serde(default)]
+    pub server_names: Vec<String>,
+
+    /// xray `privateKey`: the server's X25519 private key, base64
+    /// (32 raw bytes; `xray x25519` output "Private key").
+    pub private_key: String,
+
+    /// xray `shortIds`: accepted hex ids, at most 8 bytes each (xray
+    /// zero-pads to the wire size); `""` is the all-zero id accepted by
+    /// clients configured with an empty short_id.
+    #[serde(default)]
+    pub short_ids: Vec<String>,
+
+    /// xray `maxTimeDiff`: maximum |now − session_id timestamp| in
+    /// milliseconds. 0/absent disables the check (xray default).
+    #[serde(default)]
+    pub max_time_diff_ms: u64,
+
+    /// xray `minClientVer` ("x.y.z"). Default: no limit — unlike xray,
+    /// whose default floor [26, 3, 27] would also reject sing-box clients
+    /// (`transport_security.go:118`). An explicit value is enforced as-is.
+    #[serde(default)]
+    pub min_client_ver: Option<String>,
+
+    /// xray `maxClientVer` ("x.y.z"); absent disables the upper bound.
+    #[serde(default)]
+    pub max_client_ver: Option<String>,
 }
 
 fn default_auto_hijack() -> bool {

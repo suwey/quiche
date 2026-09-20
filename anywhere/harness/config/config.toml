@@ -1,0 +1,100 @@
+# anywhere conformance 测试的公共模板。
+# `##test node##` 是节点注入占位符（conformance 会把 outbounds.toml 里的节点
+# 逐个以 tag = "test" 注入进来），测哪个协议取决于节点池里有什么。
+# tun 不放进模板：矩阵测试全部走 socks5，tun 需要管理员权限且会劫持测试通道。
+
+[ui]
+listen = "0.0.0.0:9090"
+secret = "admin"
+# ssh 平台部署时会被 harness 自动改写为 <remote_dir>/ui；
+# mac 本机测试时这里需要指向真实存在的 UI 静态目录（不影响 client 起停）。
+serve_path = "/path/to/ui"
+
+[common]
+cache_dir = "/tmp"
+
+[dns]
+# fakeip = false
+
+[[inbounds]]
+type = "socks5"
+listen = "127.0.0.1:1080"
+
+# [[inbounds]]
+# type = "tun"
+# tag = "tun-in"
+# local_direct = false
+
+##test node##
+
+[[outbounds]]
+type = "urltest"
+tag = "auto"
+outbounds = ["test"]
+
+[[rules]]
+# protocol examples: "both:1232" "tcp:123,1132" "udp:123,2222"
+protocol = "stun"  # both:3748,3749
+outbound = "reject" # drop the traffic
+
+[[rules]]
+# some software use other ports such as Xunlei, recommend set direct mode in ui when download.
+protocol = "bittorrent" # tcp:6881,6889 && udp:6881,
+outbound = "direct"
+
+[[rules]]
+# NTP
+protocol = "udp:123"
+outbound = "direct"
+
+[[rules]]
+# mDNS
+protocol = "udp:5353"
+outbound = "direct"
+
+[[rules]]
+# NetBIOS
+protocol = "udp:137,139"
+outbound = "direct"
+
+[[rules]]
+# DHCP
+protocol = "udp:67,68"
+outbound = "direct"
+
+[[rules]]
+domain_suffix = [
+    "microsoft.com",
+    "npmjs.org",
+    "apple.com",
+    "pypi.org",
+    "rust-lang.org"
+]
+outbound = "direct"
+
+[[rules]]
+geo_url = "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/private.srs"
+outbound = "direct"
+
+[[rules]]
+geo_url = "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/cn.srs"
+outbound = "direct"
+
+[[rules]]
+geo_url = "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geoip/cn.srs"
+outbound = "direct"
+
+[[rules]]
+geo_url = "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/category-games@cn.srs"
+outbound = "direct"
+
+[[rules]]
+geo_url = "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/category-ads-all.srs"
+outbound = "reject"
+
+[[rules]]
+geo_url = "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/geolocation-!cn.srs"
+outbound = "auto"
+
+[[rules]]
+outbound = "auto"

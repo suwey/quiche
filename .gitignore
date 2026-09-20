@@ -14,3 +14,8 @@ reasonix.toml
 **/.wrangler
 **/node_modules
 /releases/
+
+# conformance harness run artifacts (in case config is run in-place)
+anywhere/harness/config/run/
+anywhere/harness/config/report-*.html
+**/__pycache__/

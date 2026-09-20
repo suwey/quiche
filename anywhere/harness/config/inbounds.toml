@@ -1,0 +1,76 @@
+# 自环测试用服务端 inbound 池 —— 与 outbounds.toml（客户端节点池）对偶。
+#
+# harness 依次取一个块替换 server.toml 里的 ##test inbound## 占位符启动
+# 服务端，并自动生成配对的 client outbound（tag = "self:<type>"）替换
+# config.toml 的 ##test node##，逐协议跑 G/Y/X 探测。
+#
+# 装配时 harness 改写/注入：
+#   - server.toml 的 [[users]] password → 每轮随机 UUID（两侧同值）
+#   - reality private_key → 每轮 openssl 现生成 x25519，
+#     client 侧 public_key 自动配对注入
+#   - cert.pem / key.pem → 每轮现生成自签证书推到部署目录，
+#     client 侧 insecure = true（sni = localhost）
+# listen 端口即真相（全部 127.0.0.1 高位，避开常用端口）。
+# 不要 socks5/tun —— 自环只测代理协议的 server 侧。
+
+# --- anytls：TLS + users 认证 ---
+[[inbounds]]
+type = "anytls"
+listen = "127.0.0.1:21001"
+cert = "cert.pem"
+key = "key.pem"
+
+# --- vless：裸 TCP + TLS（无 transport）---
+# ws 变体（与 outbounds.toml 里 vl 节点对齐）可整段换成：
+#   [inbounds.transport] type = "ws" + [inbounds.transport.ws] path = "/ws"
+[[inbounds]]
+type = "vless"
+listen = "127.0.0.1:21002"
+cert = "cert.pem"
+key = "key.pem"
+
+# --- mless：VLESS over 复用 ws + per-frame XOR 混淆 ---
+[[inbounds]]
+type = "mless"
+listen = "127.0.0.1:21003"
+cert = "cert.pem"
+key = "key.pem"
+
+[inbounds.transport]
+type = "ws"
+
+[inbounds.transport.ws]
+path = "/ws"
+
+# --- vless + reality：裸 TCP（reality 与 cert/key、transport 互斥）---
+# 未认证连接透明转发到 dest 伪装站；client 必须 flow = "xtls-rprx-vision"，
+# sni 必须命中 server_names 之一，public_key 与 private_key 配对（装配时注入）。
+[[inbounds]]
+type = "vless"
+listen = "127.0.0.1:21004"
+
+[inbounds.reality]
+dest = "www.example.com:443"
+server_names = ["www.example.com"]
+# 占位：装配时改写为每轮 openssl 生成的 x25519 私钥（base64url）
+private_key = ""
+short_ids = ["0123abcd"]
+max_time_diff_ms = 60000
+
+# --- shadowsocks（含 2022）：inbound 尚未在 anywhere 实现（runner 只分发
+# socks5/quic/anytls/vless/mless/tun，未知类型静默忽略），实现后取消注释即可
+# 进入自环。字段按 outbound 对偶推测：password 沿用 [[users]]（装配时随机
+# UUID），method 必须与 client 侧一致（配对生成时从 inbound 镜像）。
+# [[inbounds]]
+# type = "shadowsocks"
+# listen = "127.0.0.1:21005"
+# method = "2022-blake3-aes-128-gcm"
+# cert = "cert.pem"
+# key = "key.pem"
+
+# --- quic：UDP 传输，inbound 已实现，client outbound 字段待对齐 ---
+# [[inbounds]]
+# type = "quic"
+# listen = "127.0.0.1:21006"
+# cert = "cert.pem"
+# key = "key.pem"

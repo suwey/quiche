@@ -491,61 +491,74 @@ impl StreamRelay for MlessStreamRelay {
             } else {
                 std::time::Duration::from_secs(30)
             };
-            match tokio::time::timeout(read_timeout, self.rx.recv()).await {
-                Ok(Some(data)) => {
-                    let mut data = data;
-                    // Strip the 2-byte VLESS response header [version, addon_len]
-                    // from the first data chunk(s).
-                    if self.pending_vless_response {
-                        let needed = 2 - self.vless_resp_prefix.len();
-                        if data.len() < needed {
-                            // Not enough bytes yet; buffer and wait for more.
-                            self.vless_resp_prefix.extend_from_slice(&data);
-                            self.ever_received = true;
-                            // Recursively retry reading the next chunk.
-                            return self.read(buf).await;
+            // The VLESS 2-byte response header may arrive as its own frame
+            // (or split across frames), leaving no payload. Keep reading
+            // instead of reporting a false EOF.
+            loop {
+                match tokio::time::timeout(read_timeout, self.rx.recv()).await {
+                    Ok(Some(data)) => {
+                        self.ever_received = true;
+                        let mut data = data;
+                        // Strip the 2-byte VLESS response header
+                        // [version, addon_len] from the first data chunk(s).
+                        if self.pending_vless_response {
+                            let needed = 2 - self.vless_resp_prefix.len();
+                            if data.len() < needed {
+                                // Not enough bytes yet; buffer and wait for
+                                // more.
+                                self.vless_resp_prefix.extend_from_slice(&data);
+                                continue;
+                            }
+                            // Consume the remaining header bytes.
+                            let header_rest = &data[..needed];
+                            self.vless_resp_prefix.extend_from_slice(header_rest);
+                            let header = &self.vless_resp_prefix;
+                            log::debug!(
+                                "mless: stream#{} vless response head={:02x?}",
+                                self.stream_id,
+                                header,
+                            );
+                            if header[1] != 0 {
+                                return Err(std::io::Error::new(
+                                    std::io::ErrorKind::InvalidData,
+                                    format!(
+                                        "vless response status {}",
+                                        header[1]
+                                    ),
+                                ));
+                            }
+                            data = data[needed..].to_vec();
+                            self.vless_resp_prefix.clear();
+                            self.pending_vless_response = false;
                         }
-                        // Consume the remaining header bytes.
-                        let header_rest = &data[..needed];
-                        self.vless_resp_prefix.extend_from_slice(header_rest);
-                        let header = &self.vless_resp_prefix;
+                        if data.is_empty() {
+                            // Header-only frame — the payload comes in the
+                            // next frame.
+                            continue;
+                        }
+                        self.read_buf = data;
+                        self.read_pos = 0;
+                        break;
+                    },
+                    Ok(None) => {
                         log::debug!(
-                            "mless: stream#{} vless response head={:02x?}",
+                            "mless: stream#{} rx channel closed (server sent CLOSE or disconnected)",
                             self.stream_id,
-                            header,
                         );
-                        if header[1] != 0 {
-                            return Err(std::io::Error::new(
-                                std::io::ErrorKind::InvalidData,
-                                format!("vless response status {}", header[1]),
-                            ));
+                        return Ok(0);
+                    },
+                    Err(_) => {
+                        log::debug!(
+                            "mless: stream#{} timeout ({}s), closing",
+                            self.stream_id,
+                            if self.ever_received { 300 } else { 30 },
+                        );
+                        if let Some(mux) = self.multiplexer.upgrade() {
+                            mux.close_stream(self.stream_id);
                         }
-                        data = data[needed..].to_vec();
-                        self.vless_resp_prefix.clear();
-                        self.pending_vless_response = false;
-                    }
-                    self.read_buf = data;
-                    self.read_pos = 0;
-                    self.ever_received = true;
-                },
-                Ok(None) => {
-                    log::debug!(
-                        "mless: stream#{} rx channel closed (server sent CLOSE or disconnected)",
-                        self.stream_id,
-                    );
-                    return Ok(0);
-                },
-                Err(_) => {
-                    log::debug!(
-                        "mless: stream#{} timeout ({}s), closing",
-                        self.stream_id,
-                        if self.ever_received { 300 } else { 30 },
-                    );
-                    if let Some(mux) = self.multiplexer.upgrade() {
-                        mux.close_stream(self.stream_id);
-                    }
-                    return Ok(0);
-                },
+                        return Ok(0);
+                    },
+                }
             }
         }
         let available = self.read_buf.len() - self.read_pos;
@@ -660,5 +673,66 @@ impl PacketRelay for MlessPacketRelay {
     async fn close(&mut self) -> std::io::Result<()> {
         self.handle.close().await;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn new_relay(rx: mpsc::UnboundedReceiver<Vec<u8>>) -> MlessStreamRelay {
+        MlessStreamRelay {
+            stream_id: 1,
+            rx,
+            multiplexer: Weak::new(),
+            first_write: false,
+            vless_header: Vec::new(),
+            read_buf: Vec::new(),
+            read_pos: 0,
+            ever_received: false,
+            pending_vless_response: true,
+            vless_resp_prefix: Vec::new(),
+        }
+    }
+
+    /// The 2-byte VLESS response header arriving as its own frame must not
+    /// be reported as EOF — the payload comes in the next frame.
+    #[tokio::test]
+    async fn standalone_response_header_is_not_eof() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut relay = new_relay(rx);
+        tx.send(vec![0x00, 0x00]).unwrap();
+        tx.send(vec![1, 2, 3]).unwrap();
+
+        let mut buf = [0u8; 16];
+        let n = relay.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], &[1, 2, 3]);
+    }
+
+    /// Header split across frames: no EOF in between, payload intact.
+    #[tokio::test]
+    async fn split_response_header_is_not_eof() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut relay = new_relay(rx);
+        tx.send(vec![0x00]).unwrap();
+        tx.send(vec![0x00, 0xaa, 0xbb]).unwrap();
+
+        let mut buf = [0u8; 16];
+        let n = relay.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], &[0xaa, 0xbb]);
+    }
+
+    /// After the header-only frame, EOF still surfaces correctly once the
+    /// channel closes.
+    #[tokio::test]
+    async fn eof_after_header_only_frame_still_works() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut relay = new_relay(rx);
+        tx.send(vec![0x00, 0x00]).unwrap();
+        drop(tx);
+
+        let mut buf = [0u8; 16];
+        let n = relay.read(&mut buf).await.unwrap();
+        assert_eq!(n, 0, "channel close must surface EOF");
     }
 }

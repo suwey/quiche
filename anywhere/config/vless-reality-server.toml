@@ -1,0 +1,79 @@
+# VLESS + REALITY 服务端配置（Vision flow，仿 xray REALITY 服务器）。
+#
+# REALITY 服务器不需要任何证书文件：每个连接动态签发一次性 Ed25519 证书
+# （签名值 = HMAC-SHA512(AuthKey, 公钥)），未通过认证的连接透明转发到
+# dest 伪装站，探测者看到的是真网站。客户端必须带 flow = "xtls-rprx-vision"。
+#
+# 密钥生成（x25519 私钥/公钥对；有 xray 时直接 `xray x25519` 即可，其输出
+# 的 "Private key"/"Public key" 就是下面两个字段要的 base64url 值）。
+# openssl 等价写法：
+#   openssl genpkey -algorithm X25519 -out reality.key
+#   openssl pkey -in reality.key -pubout -out reality.pub
+#   PRIVATE_B64=$(openssl pkey -in reality.key -outform DER | tail -c 32 \
+#     | base64 | tr '+/' '-_' | tr -d '=')     # PKCS#8 DER 尾部 32B 即原始私钥
+#   PUBLIC_B64=$(openssl pkey -pubin -in reality.pub -outform DER | tail -c 32 \
+#     | base64 | tr '+/' '-_' | tr -d '=')     # SPKI DER 尾部 32B 即原始公钥
+# private_key 填 PRIVATE_B64；客户端 publicKey 填 PUBLIC_B64。
+# short_ids 为任意偶数位 hex（每条 ≤ 8 字节），"" 表示全零 id。
+#
+# --- 客户端对接写法一：anywhere outbound ---
+#   [[outbounds]]
+#   type = "vless"
+#   server = "<本机地址>:443"
+#   password = "b831381d-6324-4d53-ad4f-8cda48b30811"   # password 即 VLESS UUID
+#   sni = "www.example.com"        # 必须命中 server_names 之一
+#   flow = "xtls-rprx-vision"      # REALITY 下必须声明 Vision flow
+#   tls_fragment = false
+#   [outbounds.reality]
+#   public_key = "<PUBLIC_B64>"
+#   short_id = "0123abcd"
+#
+# --- 客户端对接写法二：xray 客户端 ---
+#   "streamSettings": {
+#     "network": "tcp",
+#     "security": "reality",
+#     "realitySettings": {
+#       "show": false,
+#       "fingerprint": "chrome",
+#       "serverName": "www.example.com",
+#       "publicKey": "<PUBLIC_B64>",
+#       "shortId": "0123abcd",
+#       "spiderX": "/"
+#     }
+#   }
+#
+# 注意：[inbounds.reality] 与 cert/key、[inbounds.transport]（ws）互斥；
+# REALITY 必须跑在裸 TCP 上（Vision 的 Direct 直传需要原始 socket）。
+
+[[users]]
+name = "alice"
+# password 直接作为 VLESS UUID（与 outbound 的解析一致）。
+password = "b831381d-6324-4d53-ad4f-8cda48b30811"
+
+[[inbounds]]
+type = "vless"
+listen = "0.0.0.0:443"
+
+[inbounds.reality]
+# 伪装站（xray dest/target）：未认证连接逐字节透明转发到这里。
+dest = "www.example.com:443"
+# 允许的 SNI（xray serverNames，精确匹配）；客户端 serverName 必须命中其一。
+server_names = ["www.example.com"]
+# X25519 私钥，base64url（xray privateKey；生成方式见文件头注释）。
+private_key = ""
+# 允许的 short_id（xray shortIds，hex，每条 ≤ 8 字节；"" 为全零 id）。
+short_ids = ["", "0123abcd"]
+# session_id 时间窗（毫秒）；0/缺省 = 不校验（xray 默认）。建议 60000。
+max_time_diff_ms = 60000
+# 可选：客户端版本下限/上限（"x.y.z"）。min_client_ver 缺省 = 不限制（与 xray
+# 不同：xray 默认下限 [26, 3, 27] 会拒绝上报自家版本 1.8.1 的 sing-box 客户端；
+# 如需对齐 xray 默认行为可显式设 "26.3.27"）。max_client_ver 缺省 = 不设上限。
+# min_client_ver = "26.3.27"
+# max_client_ver = ""
+
+[[outbounds]]
+type = "direct"
+tag = "direct-out"
+
+[[rules]]
+outbound = "direct-out"

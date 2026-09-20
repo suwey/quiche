@@ -1,0 +1,85 @@
+# 节点池示例 —— 已脱敏！真实 server/password/sni 等不要提交进仓库。
+# 用法：把本文件复制到你的私有测试目录（仓库外），填入真实节点值。
+# 结构约定：
+#   - 每个被测节点一个 [[outbounds]]，建议带 tag（报告里用 tag 做行名）；
+#   - 可测节点 type ∈ {anytls, vless, mless, shadowsocks, ssh, quic}；
+#   - urltest/direct 会被自动跳过；
+#   - harness 测试时会把选中节点的 tag 强制改成 "test"（模板的 urltest 组引用它）。
+
+[[outbounds]]
+type = "anytls"
+tag = "yt"
+server = "yt.example.com:30002"
+password = "00000000-0000-0000-0000-000000000001"
+sni = "cover-1.example.com"
+fp = true
+
+[[outbounds]]
+type = "anytls"
+tag = "ng"
+server = "ng.example.com:48326"
+password = "00000000-0000-0000-0000-000000000002"
+sni = "cover-2.example.com"
+
+[[outbounds]]
+type = "shadowsocks"
+tag = "ss"
+server = "ss.example.com:48313"
+method = "2022-blake3-aes-128-gcm"
+password = "cGFzc3dvcmQxMjM=:c2FsdDEyMzQ1Njc="
+plugin = "obfs-local"
+plugin_opts = "obfs=http;obfs-host=cover-3.example.com"
+
+[[outbounds]]
+type = "vless"
+tag = "vl"
+server = "vl.example.com:2096"
+password = "00000000-0000-0000-0000-000000000003"
+sni = "cover-3.example.com"
+
+[outbounds.transport]
+type = "ws"
+
+[outbounds.transport.ws]
+path = "/"
+headers = { Host = "cover-3.example.com" }
+
+[[outbounds]]
+type = "mless"
+tag = "ml"
+server = "ml.example.com:2096"
+password = "00000000-0000-0000-0000-000000000004"
+sni = "cover-4.example.com"
+# fp = true (default)
+
+[outbounds.transport]
+type = "ws"
+
+[outbounds.transport.ws]
+path = "/"
+headers = { Host = "cover-4.example.com" }
+
+[outbounds.xmux]
+pool_size = 5
+
+
+[[outbounds]]
+type = "vless"
+tag = "nimble-comet"
+server = "reality.example.com:443"
+password = "00000000-0000-0000-0000-000000000005"
+sni = "www.example.com"
+flow = "xtls-rprx-vision"
+
+[outbounds.reality]
+public_key = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaA"
+short_id = "0123456789abcdef"
+
+[[outbounds.wss_fronts]]
+id = "nimble-comet-bunny-a"
+url = "wss://cdn-front.example.com/api/v1/wss-bridge"
+protocol_version = 1
+
+[outbounds.wss_fallback]
+broker = "https://broker.example.com/"
+relay_id = "relay_00000000000000000000000000000000"

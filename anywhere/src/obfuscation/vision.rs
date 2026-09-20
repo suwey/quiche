@@ -32,6 +32,16 @@
 //! the two relay halves run in separate tasks (Xray shares the struct
 //! across goroutines the same way).
 //!
+//! A server needs the complementary pair: an uplink [`VisionReader`]
+//! (Inbound read line — unpadding what the client framed) and a downlink
+//! [`VisionWriter`] (Inbound write line — padding what the target sends),
+//! sharing their own [`VisionFilterState`]. The frame algorithms are
+//! direction-symmetric in Xray (`ReadMultiBuffer`/`WriteMultiBuffer` only
+//! swap the state-line pointers, proxy.go:211-234 / :314-320), so the
+//! server roles reuse the same two types under the
+//! [`ServerUplinkReader`]/[`ServerDownlinkWriter`] aliases — used by
+//! `inbound/vless.rs`.
+//!
 //! # Direct phase semantics and the raw-socket handoff (§S2.6)
 //!
 //! Seeing the first complete inner-TLS AppData record, the writer sends the
@@ -636,6 +646,29 @@ impl VisionReader {
 }
 
 // ---------------------------------------------------------------------------
+// Server roles — Inbound read/write state lines (proxy.go:118-128, 211-234,
+// 314-320). Zero algorithm changes: the two machines above only swap state
+// lines per direction; a server owns the complementary pair.
+// ---------------------------------------------------------------------------
+
+/// Server uplink reader (client → server): the unpadding machine owning the
+/// Inbound read line (`TrafficState.Inbound.WithinPaddingBuffers` /
+/// `UplinkReaderDirectCopy`, proxy.go:118-128). It consumes the frames the
+/// client's uplink [`VisionWriter`] produces and flips to raw splice on a
+/// Direct frame, exactly like the client's downlink reader does on the
+/// opposite side of the wire.
+pub(crate) type ServerUplinkReader = VisionReader;
+
+/// Server downlink writer (server → client): the padding machine owning the
+/// Inbound write line (`TrafficState.Inbound.IsPadding` /
+/// `DownlinkWriterDirectCopy`, proxy.go:128-131). It frames what the target
+/// sends — long padding once the inner ServerHello marks the stream TLS,
+/// Direct on the first complete inner AppData record when TLS 1.3 was
+/// detected — exactly like the client's uplink writer does on the opposite
+/// side of the wire.
+pub(crate) type ServerDownlinkWriter = VisionWriter;
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1048,6 +1081,59 @@ mod tests {
         assert_eq!(r.read_chunk(&df), ad);
         assert!(r.take_direct_switch());
         assert_eq!(r.read_chunk(b"raw-downlink"), b"raw-downlink");
+    }
+
+    /// Wire-level cross-role round trip: a client endpoint (uplink writer +
+    /// downlink reader, one shared filter state) against a server endpoint
+    /// ([`ServerUplinkReader`] + [`ServerDownlinkWriter`], another shared
+    /// filter state). TLS 1.3 detection happens on the server's downlink
+    /// write (it sees the inner ServerHello), and both directions flip to
+    /// raw splice on their Direct frames.
+    #[test]
+    fn server_roles_cross_endpoint_round_trip() {
+        let client_filter = Arc::new(Mutex::new(VisionFilterState::new()));
+        let mut uplink_w = VisionWriter::new(UUID, client_filter.clone());
+        let mut downlink_r = VisionReader::new(UUID, client_filter);
+
+        let server_filter = Arc::new(Mutex::new(VisionFilterState::new()));
+        let mut uplink_r = ServerUplinkReader::new(UUID, server_filter.clone());
+        let mut downlink_w = ServerDownlinkWriter::new(UUID, server_filter.clone());
+
+        // Uplink: the client frames the inner ClientHello; the server
+        // unpads it and its filter marks the stream TLS.
+        let ch = client_hello_record();
+        let framed = uplink_w.write_chunk(&ch);
+        assert_eq!(parse_frame_at(&framed, 16).0.command, COMMAND_PADDING_CONTINUE);
+        assert_eq!(uplink_r.read_chunk(&framed), ch);
+        assert!(server_filter.lock().unwrap().is_tls);
+
+        // Downlink: the server frames the inner TLS 1.3 ServerHello; the
+        // client unpads it and the server's filter sets EnableXtls.
+        let sh = server_hello_record(0x1301, true);
+        let framed = downlink_w.write_chunk(&sh);
+        assert_eq!(downlink_r.read_chunk(&framed), sh);
+        assert!(server_filter.lock().unwrap().enable_xtls);
+
+        // First complete inner AppData record on each side: the writer
+        // emits Direct and the matching reader flips to raw splice after
+        // delivering the record.
+        let ad = app_data_record(&[0xEE; 77]);
+        let framed = uplink_w.write_chunk(&ad);
+        assert_eq!(parse_frame_at(&framed, 0).0.command, COMMAND_PADDING_DIRECT);
+        assert_eq!(uplink_r.read_chunk(&framed), ad);
+        assert!(uplink_r.take_direct_switch());
+        assert!(uplink_r.read_chunk(b"raw-uplink") == b"raw-uplink");
+
+        let ad = app_data_record(&[0xDD; 88]);
+        let framed = downlink_w.write_chunk(&ad);
+        assert_eq!(parse_frame_at(&framed, 0).0.command, COMMAND_PADDING_DIRECT);
+        assert_eq!(downlink_r.read_chunk(&framed), ad);
+        assert!(downlink_r.take_direct_switch());
+        assert_eq!(downlink_r.read_chunk(b"raw-downlink"), b"raw-downlink");
+
+        // Post-switch writers are the identity on both endpoints.
+        assert_eq!(uplink_w.write_chunk(b"raw"), b"raw");
+        assert_eq!(downlink_w.write_chunk(b"raw"), b"raw");
     }
 
     #[test]

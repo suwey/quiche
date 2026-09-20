@@ -46,6 +46,7 @@ use proto::CMD_SERVER_SETTINGS;
 use proto::CMD_SETTINGS;
 use proto::CMD_SYN;
 use proto::CMD_SYNACK;
+use proto::CMD_UPDATE_PADDING_SCHEME;
 use proto::CMD_WASTE;
 use proto::PROTOCOL_VERSION;
 use proto::PaddingFactory;
@@ -62,6 +63,9 @@ struct ServerStreamReader {
     rx: mpsc::UnboundedReceiver<Vec<u8>>,
     buf: Vec<u8>,
     closed: bool,
+    /// Keeps the session-map entry (and thus the data channel) alive for
+    /// as long as the relay holds this stream.
+    _entry_guard: StreamEntryGuard,
 }
 
 /// Write half of a server-side multiplexed stream.
@@ -251,6 +255,50 @@ enum OutboundMsg {
 
 // ========== Session internals ==========
 
+/// The inbound's effective padding scheme: the [`PaddingFactory`] that pads
+/// this side's TLS writes plus the raw scheme text it was built from and the
+/// MD5 of that text. The raw text and MD5 back the `CMD_UPDATE_PADDING_SCHEME`
+/// push when a client reports a different scheme (sing-anytls
+/// session.go:271-283) — [`PaddingFactory`] itself does not retain the text.
+#[derive(Clone)]
+struct ServerPadding {
+    factory: PaddingFactory,
+    /// Raw scheme text (config `padding_scheme`, defaulting to
+    /// `DEFAULT_PADDING_SCHEME`); also the update-frame payload.
+    raw: String,
+    /// MD5 hex of `raw`; the comparison key against the client's
+    /// reported `padding-md5`.
+    md5: String,
+}
+
+impl ServerPadding {
+    /// Build from the configured scheme text, falling back to the built-in
+    /// default when absent or unparseable (same policy as the factory).
+    fn from_config(scheme_text: Option<&str>) -> Self {
+        let (factory, raw) = match scheme_text {
+            Some(text) => match PaddingFactory::new(text.as_bytes()) {
+                Ok(f) => (f, text.to_string()),
+                Err(e) => {
+                    log::warn!(
+                        "anytls inbound: failed to parse custom padding \
+                         scheme: {e}, using default"
+                    );
+                    (
+                        PaddingFactory::default_factory(),
+                        proto::DEFAULT_PADDING_SCHEME.to_string(),
+                    )
+                },
+            },
+            None => (
+                PaddingFactory::default_factory(),
+                proto::DEFAULT_PADDING_SCHEME.to_string(),
+            ),
+        };
+        let md5 = PaddingFactory::md5_hex(raw.as_bytes());
+        Self { factory, raw, md5 }
+    }
+}
+
 struct SessionInner {
     outbound_tx: mpsc::UnboundedSender<OutboundMsg>,
     streams: StdMutex<HashMap<u32, StreamSender>>,
@@ -260,6 +308,23 @@ struct SessionInner {
 
 struct StreamSender {
     data_tx: mpsc::UnboundedSender<Vec<u8>>,
+}
+
+/// Removes the stream's session-map entry when the relay drops the stream.
+///
+/// The entry carries the `data_tx` the session loop forwards client PSH
+/// data through, so it must outlive the handoff in
+/// [`handle_server_stream`] — dropping it early closes the channel and
+/// the relay sees an instant EOF instead of the client's data.
+struct StreamEntryGuard {
+    stream_id: u32,
+    inner: Arc<SessionInner>,
+}
+
+impl Drop for StreamEntryGuard {
+    fn drop(&mut self) {
+        self.inner.streams.lock().unwrap().remove(&self.stream_id);
+    }
 }
 
 // ========== Write task (blocking) ==========
@@ -319,11 +384,25 @@ fn write_padded(
     Ok(())
 }
 
+/// Padding sync decision (sing-anytls session.go:271-283): a client whose
+/// reported `padding-md5` is missing/empty or differs from `server_md5` is
+/// not on this side's scheme, so it gets a
+/// `CMD_UPDATE_PADDING_SCHEME(stream_id=0)` frame carrying the raw scheme
+/// text. `None` = the client is already in sync, send nothing.
+fn padding_update_frame(
+    client_md5: &str, server_md5: &str, raw_scheme: &str,
+) -> Option<Vec<u8>> {
+    if client_md5 == server_md5 {
+        return None;
+    }
+    encode_frame(CMD_UPDATE_PADDING_SCHEME, 0, raw_scheme.as_bytes()).ok()
+}
+
 // ========== Server session handler ==========
 
 fn handle_connection_inner(
     mut stream: SslStream<TcpStream>, passwords: Arc<Vec<String>>,
-    padding: PaddingFactory, conn_tx: mpsc::Sender<InboundConn>,
+    padding: ServerPadding, conn_tx: mpsc::Sender<InboundConn>,
     peer: std::net::SocketAddr,
 ) -> std::io::Result<()> {
     // --- Auth ---
@@ -362,7 +441,7 @@ fn handle_connection_inner(
         outbound_tx: outbound_tx.clone(),
         streams: StdMutex::new(HashMap::new()),
         closed: AtomicBool::new(false),
-        padding: StdMutex::new(padding.clone()),
+        padding: StdMutex::new(padding.factory.clone()),
     });
 
     // Split TLS stream: read half stays here, write half goes to write task.
@@ -411,19 +490,23 @@ fn handle_connection_inner(
                     client_version = v.parse().unwrap_or(0);
                 }
 
-                // Check padding md5; if mismatch, send update.
+                // Check padding md5; a missing or differing client md5 means
+                // the client is not on this side's scheme — push the raw
+                // scheme text as an update (sing-anytls session.go:271-283).
                 let client_md5 =
                     settings.get("padding-md5").cloned().unwrap_or_default();
-                let server_md5 = PaddingFactory::md5_hex(
-                    proto::DEFAULT_PADDING_SCHEME.as_bytes(),
-                );
-                // For simplicity, we always compare against default for now.
-                // If a custom scheme is configured, we'd use that instead.
-                //
-                // TODO: on `client_md5 != server_md5` mismatch, send a
-                // padding scheme update to the client. For now always match
-                // and skip the update.
-                let _ = (client_md5, server_md5);
+                if let Some(frame) = padding_update_frame(
+                    &client_md5,
+                    &padding.md5,
+                    &padding.raw,
+                ) {
+                    log::debug!(
+                        "anytls inbound: client padding-md5 mismatch \
+                         ({client_md5:?} vs {:?}); sending scheme update",
+                        padding.md5
+                    );
+                    let _ = outbound_tx.send(OutboundMsg::RawFrame(frame));
+                }
 
                 // Send server settings if client v >= 2.
                 if client_version >= PROTOCOL_VERSION {
@@ -455,21 +538,23 @@ fn handle_connection_inner(
         let _ = stream_id;
     }
 
-    // Drain any queued outbound frames (e.g. server settings).
-    drain_outbound(&mut stream, &mut outbound_rx, &inner, &mut 1u32);
+    // Padding packet index: per the anytls spec it counts this side's TLS
+    // writes, so it must persist across the whole session (the first write,
+    // server settings, is packet #1).
+    let mut pkt_counter = 1u32;
+    drain_outbound(&mut stream, &mut outbound_rx, &inner, &mut pkt_counter);
 
     // --- Main session loop ---
+    // 3 s, matching the outbound: the idle read tick also bounds how long
+    // frames queued by relays wait before being flushed to the client.
     stream
         .get_mut()
-        .set_read_timeout(Some(Duration::from_secs(30)))
+        .set_read_timeout(Some(Duration::from_secs(3)))
         .ok();
 
     loop {
         // First drain outbound channel.
-        drain_outbound(&mut stream, &mut outbound_rx, &inner, &mut {
-            // Use a simple counter starting from 2.
-            2u32
-        });
+        drain_outbound(&mut stream, &mut outbound_rx, &inner, &mut pkt_counter);
 
         match read_frame_blocking(&mut stream) {
             Ok((cmd, stream_id, data)) => {
@@ -513,9 +598,13 @@ fn handle_connection_inner(
                                     let _ = data_tx.send(remaining_data);
                                 }
 
-                                // Spawn relay for this stream.
+                                // Spawn relay for this stream. The session
+                                // map entry is removed by the
+                                // StreamEntryGuard inside the ServerStream
+                                // once the relay drops it — removing it
+                                // here would close the data channel while
+                                // the relay is still reading.
                                 let inner_clone = inner.clone();
-                                let writer_tx_clone = inner.outbound_tx.clone();
                                 let client_ver = client_version;
                                 let conn_tx_clone = conn_tx.clone();
                                 let peer_clone = peer;
@@ -524,10 +613,10 @@ fn handle_connection_inner(
                                         stream_id,
                                         &target,
                                         data_rx,
-                                        writer_tx_clone,
                                         client_ver,
                                         conn_tx_clone,
                                         peer_clone,
+                                        inner_clone,
                                     )
                                     .await
                                     {
@@ -535,9 +624,6 @@ fn handle_connection_inner(
                                             "anytls inbound: stream {stream_id} relay ended: {e}"
                                         );
                                     }
-                                    let mut streams =
-                                        inner_clone.streams.lock().unwrap();
-                                    streams.remove(&stream_id);
                                 });
                             } else {
                                 pending_syn.insert(stream_id, pending_data);
@@ -591,7 +677,12 @@ fn handle_connection_inner(
                 if let Ok(frame) = encode_frame(CMD_HEART_REQUEST, 0, &[]) {
                     let _ = inner.outbound_tx.send(OutboundMsg::RawFrame(frame));
                 }
-                drain_outbound(&mut stream, &mut outbound_rx, &inner, &mut 2u32);
+                drain_outbound(
+                    &mut stream,
+                    &mut outbound_rx,
+                    &inner,
+                    &mut pkt_counter,
+                );
             },
             Err(e) => {
                 log::debug!("anytls inbound: read error from {peer}: {e}");
@@ -636,15 +727,26 @@ fn drain_outbound(
 
 /// Handle a single server-side stream: parse destination, build ServerStream,
 /// and send InboundConn so the main relay loop can dial outbound and proxy.
+///
+/// The session-map entry for `stream_id` was inserted by the caller; from
+/// here on its removal is owned by the [`StreamEntryGuard`] inside the
+/// `ServerStream` — except for early failures before the stream is built,
+/// which must remove it explicitly.
 async fn handle_server_stream(
     stream_id: u32, target: &str, data_rx: mpsc::UnboundedReceiver<Vec<u8>>,
-    writer_tx: mpsc::UnboundedSender<OutboundMsg>, client_version: u32,
-    conn_tx: mpsc::Sender<InboundConn>, peer: std::net::SocketAddr,
+    client_version: u32, conn_tx: mpsc::Sender<InboundConn>,
+    peer: std::net::SocketAddr, inner: std::sync::Arc<SessionInner>,
 ) -> std::io::Result<()> {
+    let writer_tx = inner.outbound_tx.clone();
+
     // Parse destination.
-    let destination: Destination = target.parse().map_err(|e: String| {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, e)
-    })?;
+    let destination: Destination = match target.parse() {
+        Ok(d) => d,
+        Err(e) => {
+            inner.streams.lock().unwrap().remove(&stream_id);
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, e));
+        },
+    };
 
     // Send SYNACK success if client v >= 2.
     if client_version >= PROTOCOL_VERSION {
@@ -654,11 +756,13 @@ async fn handle_server_stream(
     }
 
     // Build a ServerStream relay that reads from data_rx and writes via
-    // writer_tx.
+    // writer_tx. The guard keeps the map entry (data channel) alive until
+    // the relay drops the stream.
     let reader = ServerStreamReader {
         rx: data_rx,
         buf: Vec::new(),
         closed: false,
+        _entry_guard: StreamEntryGuard { stream_id, inner },
     };
     let writer = ServerStreamWriter {
         stream_id,
@@ -718,7 +822,7 @@ async fn handle_server_stream(
 
 // ========== TLS Acceptor ==========
 
-fn build_ssl_context(
+pub(crate) fn build_ssl_context(
     cert_path: &str, key_path: &str,
 ) -> std::io::Result<boring::ssl::SslContext> {
     let mut builder = SslContextBuilder::new(SslMethod::tls())
@@ -772,16 +876,9 @@ impl AnytlsInbound {
         let cert = config.cert.as_ref()?;
         let key = config.key.as_ref()?;
 
-        let padding = if let Some(ref scheme_text) = config.padding_scheme {
-            PaddingFactory::new(scheme_text.as_bytes()).unwrap_or_else(|e| {
-                log::warn!(
-                    "anytls inbound: failed to parse custom padding scheme: {e}, using default"
-                );
-                PaddingFactory::default_factory()
-            })
-        } else {
-            PaddingFactory::default_factory()
-        };
+        let padding = ServerPadding::from_config(
+            config.padding_scheme.as_deref(),
+        );
 
         let (conn_tx, conn_rx) = mpsc::channel(256);
 
@@ -798,7 +895,7 @@ impl AnytlsInbound {
 
     async fn run(
         listen_addr: String, cert: String, key: String, passwords: Vec<String>,
-        padding: PaddingFactory, conn_tx: mpsc::Sender<InboundConn>,
+        padding: ServerPadding, conn_tx: mpsc::Sender<InboundConn>,
     ) {
         let ctx = match build_ssl_context(&cert, &key) {
             Ok(a) => a,
@@ -839,8 +936,11 @@ impl AnytlsInbound {
             let pad = padding.clone();
             let tx = conn_tx.clone();
 
-            tokio::spawn(async move {
-                // Perform TLS accept in spawn_blocking (boring is sync).
+            // boring is synchronous: the TLS handshake and the whole
+            // session loop below block on std TcpStream reads, so they
+            // must run on the blocking pool — an async worker would be
+            // pinned for the lifetime of the connection.
+            tokio::task::spawn_blocking(move || {
                 let std_stream = match tcp.into_std() {
                     Ok(s) => s,
                     Err(e) => {
@@ -850,6 +950,15 @@ impl AnytlsInbound {
                         return;
                     },
                 };
+                // tokio hands the raw fd over in nonblocking mode; boring's
+                // blocking TLS accept (and the session loop below) would
+                // fail with WANT_READ on the very first read.
+                if let Err(e) = std_stream.set_nonblocking(false) {
+                    log::warn!(
+                        "anytls inbound: failed to set blocking mode: {e}"
+                    );
+                    return;
+                }
 
                 let ssl = match Ssl::new(&acceptor) {
                     Ok(s) => s,
@@ -891,5 +1000,68 @@ impl AnytlsInbound {
 impl Inbound for AnytlsInbound {
     async fn accept(&mut self) -> Option<InboundConn> {
         self.conn_rx.recv().await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Decode one anytls frame: [cmd:u8][stream_id:u32-be][len:u16-be][data].
+    fn decode_frame(bytes: &[u8]) -> (u8, u32, Vec<u8>) {
+        assert!(bytes.len() >= proto::FRAME_HEADER_SIZE);
+        let cmd = bytes[0];
+        let sid = u32::from_be_bytes(bytes[1..5].try_into().unwrap());
+        let len = u16::from_be_bytes(bytes[5..7].try_into().unwrap()) as usize;
+        assert_eq!(bytes.len(), proto::FRAME_HEADER_SIZE + len);
+        (cmd, sid, bytes[7..].to_vec())
+    }
+
+    /// A client already on the server's scheme gets no update frame.
+    #[test]
+    fn no_update_when_client_md5_matches() {
+        let raw = proto::DEFAULT_PADDING_SCHEME;
+        let md5 = PaddingFactory::md5_hex(raw.as_bytes());
+        assert!(padding_update_frame(&md5, &md5, raw).is_none());
+    }
+
+    /// A mismatching or missing/empty client md5 triggers a
+    /// CMD_UPDATE_PADDING_SCHEME frame: cmd=6, stream_id=0, payload = the
+    /// raw scheme text (sing-anytls session.go:271-283, frame.go:14).
+    #[test]
+    fn update_frame_on_mismatch_and_missing_md5() {
+        assert_eq!(CMD_UPDATE_PADDING_SCHEME, 6);
+        let raw = proto::DEFAULT_PADDING_SCHEME;
+        let md5 = PaddingFactory::md5_hex(raw.as_bytes());
+        for client_md5 in ["00000000000000000000000000000000", ""] {
+            let frame = padding_update_frame(client_md5, &md5, raw)
+                .expect("mismatch must produce an update frame");
+            let (cmd, sid, data) = decode_frame(&frame);
+            assert_eq!(cmd, CMD_UPDATE_PADDING_SCHEME);
+            assert_eq!(sid, 0, "update rides stream 0");
+            assert_eq!(data, raw.as_bytes(), "payload is the scheme text");
+        }
+    }
+
+    /// The session's effective scheme mirrors the config: a custom
+    /// `padding_scheme` is used verbatim (text + md5), an absent or
+    /// unparseable one falls back to the built-in default.
+    #[test]
+    fn server_padding_from_config() {
+        let custom = "stop=4\n0=30-30\n1=50-80\n";
+        let p = ServerPadding::from_config(Some(custom));
+        assert_eq!(p.raw, custom);
+        assert_eq!(p.md5, PaddingFactory::md5_hex(custom.as_bytes()));
+        assert_eq!(p.factory.stop(), 4);
+
+        let p = ServerPadding::from_config(None);
+        assert_eq!(p.raw, proto::DEFAULT_PADDING_SCHEME);
+        assert_eq!(
+            p.md5,
+            PaddingFactory::md5_hex(proto::DEFAULT_PADDING_SCHEME.as_bytes())
+        );
+
+        let p = ServerPadding::from_config(Some("not a scheme"));
+        assert_eq!(p.raw, proto::DEFAULT_PADDING_SCHEME);
     }
 }

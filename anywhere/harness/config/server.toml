@@ -1,0 +1,19 @@
+# 自环测试的公共服务端模板。`##test inbound##` 是注入占位符（harness 从
+# inbounds.toml 依次取一个 [[inbounds]] 块替换进来，每协议重启一次服务端）。
+# [[users]] password 由 harness 每轮随机生成并同步写入配对的 client outbound；
+# cert.pem/key.pem 由 harness 现生成（自签）放在部署目录（相对路径按 cwd 解析）。
+# 出口 = 本机网络：direct 出站 + 全 direct 规则，不需要 ui/dns/tun。
+
+[[users]]
+name = "self"
+# 占位：装配时改写为随机 UUID（与 client 侧 outbound 同值）
+password = "00000000-0000-0000-0000-00000000self"
+
+##test inbound##
+
+[[outbounds]]
+type = "direct"
+tag = "direct-out"
+
+[[rules]]
+outbound = "direct-out"

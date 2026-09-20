@@ -85,6 +85,11 @@ tokio-stream = { version = "0.1" }
 tokio-util = { version = "0.7.13" }
 url = { version = "2" }
 
+[build]
+rustflags = [
+  "-C", "remap-path-prefix=${HOME}/="
+]
+
 [profile.bench]
 debug = true
 
@@ -94,9 +99,15 @@ strip = true
 # Vendored boring-sys 4.22.0 (crates.io package contents) carrying the REALITY
 # client session-id-override patch:
 #   third_party/boring-sys/patches/reality-session-id.patch
+# and the REALITY server signature-algorithm patch:
+#   third_party/boring-sys/patches/reality-server-sigalg.patch
 # Adds SSL_set_client_session_id_override() so a TLS client can supply the
 # ClientHello legacy session_id (REALITY's auth carrier) before the handshake
-# transcript is hashed. Purely additive — behavior changes only when the new
-# API is explicitly called; see anywhere/docs/vless-reality-wire-notes.md §S0.
+# transcript is hashed, and SSL_set_reality_server_ignore_sigalgs() so a TLS
+# server can sign the one-time REALITY certificate's CertificateVerify the
+# way the xtls/reality fork does (without intersecting with the client's
+# advertised signature_algorithms; utls/xray clients never advertise
+# ed25519). Purely additive — behavior changes only when the new APIs are
+# explicitly called; see anywhere/docs/vless-reality-wire-notes.md §S0.
 [patch.crates-io]
 boring-sys = { path = "third_party/boring-sys" }

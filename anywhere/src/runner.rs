@@ -21,8 +21,10 @@ use crate::inbound::Destination;
 use crate::inbound::Inbound;
 use crate::inbound::InboundConn;
 use crate::inbound::anytls::AnytlsInbound;
+use crate::inbound::mless::MlessInbound;
 use crate::inbound::quic::QuicInbound;
 use crate::inbound::socks5::Socks5Inbound;
+use crate::inbound::vless::VlessInbound;
 use crate::outbound::registry::OutboundRegistry;
 use crate::relay::CountedPacketRelay;
 use crate::relay::CountedStreamRelay;
@@ -798,6 +800,46 @@ pub async fn run(opts: RunOptions) -> Result<(), Box<dyn std::error::Error>> {
             },
             None => {
                 log::warn!("AnytlsInbound::from_config returned None");
+            },
+        }
+    }
+
+    // --- VLESS inbounds ---
+    for cfg in config.inbounds_by_type("vless") {
+        if has_tun {
+            log::warn!(
+                "TUN inbound active -- skipping vless inbounds \
+                 (all traffic already proxied via TUN)"
+            );
+            break;
+        }
+        match VlessInbound::from_config(cfg, config.passwords()) {
+            Some(inbound) => {
+                log::info!("Starting vless inbound");
+                tasks.push(tokio::spawn(run_inbound(inbound, ctx.clone())));
+            },
+            None => {
+                log::warn!("VlessInbound::from_config returned None");
+            },
+        }
+    }
+
+    // --- Mless inbounds ---
+    for cfg in config.inbounds_by_type("mless") {
+        if has_tun {
+            log::warn!(
+                "TUN inbound active -- skipping mless inbounds \
+                 (all traffic already proxied via TUN)"
+            );
+            break;
+        }
+        match MlessInbound::from_config(cfg, config.passwords()) {
+            Some(inbound) => {
+                log::info!("Starting mless inbound");
+                tasks.push(tokio::spawn(run_inbound(inbound, ctx.clone())));
+            },
+            None => {
+                log::warn!("MlessInbound::from_config returned None");
             },
         }
     }

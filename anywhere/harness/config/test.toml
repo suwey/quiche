@@ -1,0 +1,32 @@
+# 测试参数 + 平台清单。复制到私有测试目录后填真实值（此文件中的
+# 路径/主机均为占位）。优先级：CLI 参数 > 各平台段 > [test] 全局默认。
+
+[test]
+count = 4                       # 默认模式：每站点探测次数（回归用，快）
+                                # 持续模式只经 CLI 进入：--duration / -d <秒>
+                                # （按 interval_ms 匀速探测满时长，图表为时间序列）
+probe_timeout_s = 10            # 单次探测超时，独立计时；count 模式不设总时长上限
+interval_ms = 500               # 探测间隔（两种模式共用）
+connect_timeout_s = 5
+pass_ratio = 0.8                # 节点判定：每站点成功率阈值
+
+# 平台段：有该段才会被测；arch 决定 -r releases 里取哪个架构的产物。
+# CLI: --platform windows,android-armv7（逗号分隔，可带 -arch 后缀；
+#      CLI 指定的 arch 与下面声明的 arch 冲突时直接报错不跑）。
+
+[mac]
+arch = "arm64"                          # arm64 | x64
+file = "/absolute/path/to/anywhere"     # 本机二进制（debug 或 releases 解包）
+
+[windows]
+ssh = "user@windows-box.lan"            # 免密 ssh；部署目录由 <平台>.toml 的 serve_path 决定
+arch = "x64"                            # x64 | arm64
+
+[linux]
+ssh = "user@linux-box.lan"
+arch = "x64"                            # x64 | arm64 | armv7
+
+[android]
+adb = ""                                # 空 = 自动取唯一在线设备，或填 serial/ip
+arch = "arm64"                          # arm64 | armv7 | x64
+file = "/absolute/path/to/android/anywhere"   # cargo ndk 产出的裸二进制（非 .apk）

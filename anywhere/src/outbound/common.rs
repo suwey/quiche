@@ -278,7 +278,12 @@ pub async fn connect_tcp_bypass(
 
         tokio::task::spawn_blocking(move || {
             let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
-            socket.set_mark(fwmark)?;
+            // SO_MARK needs CAP_NET_ADMIN. A plain non-root process cannot
+            // have brought up a TUN either, so connecting unmarked is safe
+            // there — better than failing every outbound connection.
+            if let Err(e) = socket.set_mark(fwmark) {
+                log::warn!("tcp bypass: set_mark failed: {e}, connecting unmarked");
+            }
             // Disable Nagle for low-latency protocols (DoH, proxy handshakes).
             socket.set_tcp_nodelay(true)?;
             // Enable TCP keepalive to detect half-open connections.
@@ -652,7 +657,12 @@ pub async fn bind_udp_bypass(
         tokio::task::spawn_blocking(move || {
             let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
             socket.set_reuse_address(true)?;
-            socket.set_mark(fwmark)?;
+            // SO_MARK needs CAP_NET_ADMIN; see connect_tcp_bypass — a plain
+            // non-root process has no owned TUN routing to bypass, so
+            // connecting/binding unmarked is the correct fallback.
+            if let Err(e) = socket.set_mark(fwmark) {
+                log::warn!("udp bypass: set_mark failed: {e}, binding unmarked");
+            }
             socket.bind(&bind_addr.into())?;
             let std_socket: std::net::UdpSocket = socket.into();
             std_socket.set_nonblocking(true)?;
@@ -781,7 +791,12 @@ pub fn connect_tcp_bypass_sync(
             Domain::IPV6
         };
         let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
-        socket.set_mark(BYPASS_FWMARK)?;
+        // SO_MARK needs CAP_NET_ADMIN. A plain non-root process cannot
+        // have brought up a TUN either, so connecting unmarked is safe
+        // there — better than failing every outbound connection.
+        if let Err(e) = socket.set_mark(BYPASS_FWMARK) {
+            log::warn!("tcp bypass: set_mark failed: {e}, connecting unmarked");
+        }
         socket.set_tcp_nodelay(true)?;
         socket.set_keepalive(true)?;
         socket.set_tcp_keepalive(
@@ -832,49 +847,70 @@ pub fn connect_tcp_bypass_sync(
         use socket2::Type;
         use std::os::fd::AsRawFd;
 
-        // Same as async: IP_BOUND_IF to physical interface.
         let domain = if addr.is_ipv4() {
             Domain::IPV4
         } else {
             Domain::IPV6
         };
-        let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
-        socket.set_tcp_nodelay(true)?;
-        socket.set_keepalive(true)?;
-        socket.set_tcp_keepalive(
-            &socket2::TcpKeepalive::new()
-                .with_time(std::time::Duration::from_secs(60))
-                .with_interval(std::time::Duration::from_secs(15))
-                .with_retries(3),
-        )?;
 
-        let fd = socket.as_raw_fd();
-        if let Some(idx) = physical_iface_index() {
-            if addr.is_ipv4() {
-                const IP_BOUND_IF: libc::c_int = 25;
-                unsafe {
-                    libc::setsockopt(
-                        fd,
-                        libc::IPPROTO_IP,
-                        IP_BOUND_IF,
-                        &idx as *const _ as *const _,
-                        std::mem::size_of::<u32>() as libc::socklen_t,
-                    )
-                };
-            } else {
-                const IPV6_BOUND_IF: libc::c_int = 125;
-                unsafe {
-                    libc::setsockopt(
-                        fd,
-                        libc::IPPROTO_IPV6,
-                        IPV6_BOUND_IF,
-                        &idx as *const _ as *const _,
-                        std::mem::size_of::<u32>() as libc::socklen_t,
-                    )
-                };
+        let make_socket = || -> io::Result<Socket> {
+            let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
+            socket.set_tcp_nodelay(true)?;
+            socket.set_keepalive(true)?;
+            socket.set_tcp_keepalive(
+                &socket2::TcpKeepalive::new()
+                    .with_time(std::time::Duration::from_secs(60))
+                    .with_interval(std::time::Duration::from_secs(15))
+                    .with_retries(3),
+            )?;
+            Ok(socket)
+        };
+
+        // Same as async: IP_BOUND_IF to physical interface.
+        if let Ok(socket) = make_socket() {
+            let fd = socket.as_raw_fd();
+            if let Some(idx) = physical_iface_index() {
+                if addr.is_ipv4() {
+                    const IP_BOUND_IF: libc::c_int = 25;
+                    unsafe {
+                        libc::setsockopt(
+                            fd,
+                            libc::IPPROTO_IP,
+                            IP_BOUND_IF,
+                            &idx as *const _ as *const _,
+                            std::mem::size_of::<u32>() as libc::socklen_t,
+                        )
+                    };
+                } else {
+                    const IPV6_BOUND_IF: libc::c_int = 125;
+                    unsafe {
+                        libc::setsockopt(
+                            fd,
+                            libc::IPPROTO_IPV6,
+                            IPV6_BOUND_IF,
+                            &idx as *const _ as *const _,
+                            std::mem::size_of::<u32>() as libc::socklen_t,
+                        )
+                    };
+                }
+            }
+
+            match socket.connect_timeout(&addr.into(), SYNC_CONNECT_TIMEOUT)
+            {
+                Ok(()) => return Ok(socket.into()),
+                Err(e) => {
+                    // The bound interface cannot reach `addr` (e.g. a
+                    // loopback target in a local chain). Fall through to
+                    // a plain socket following the routing table instead
+                    // of failing hard.
+                    log::debug!(
+                        "tcp bypass: iface-bound connect to {addr} failed: {e}, retrying unbound"
+                    );
+                },
             }
         }
 
+        let socket = make_socket()?;
         socket.connect_timeout(&addr.into(), SYNC_CONNECT_TIMEOUT)?;
         Ok(socket.into())
     }
