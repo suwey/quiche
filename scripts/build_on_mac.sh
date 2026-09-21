@@ -68,6 +68,19 @@ echo "NDK:      ${ANDROID_NDK_HOME:-${NDK_HOME:-not set}}"
 echo ""
 
 # ============================================================
+# 1. Strip local user paths from release artifacts
+# ============================================================
+# rustc embeds absolute source paths (panic/tracing strings from registry
+# deps, build-script OUT_DIR, std toolchain paths) and BoringSSL embeds
+# __FILE__; remap $HOME to "" so artifacts carry no /Users/<user> strings.
+# Must happen here, not in config files: only the shell expands $HOME.
+# Note the spelling: --remap-path-prefix is its own rustc flag, NOT a -C
+# codegen option (-C remap-path-prefix fails with "unknown codegen option").
+export RUSTFLAGS="${RUSTFLAGS:-} --remap-path-prefix=${HOME}/="
+export CFLAGS="${CFLAGS:-} -ffile-prefix-map=${HOME}/="
+export CXXFLAGS="${CXXFLAGS:-} -ffile-prefix-map=${HOME}/="
+
+# ============================================================
 # 1. Desktop build (native)
 # ============================================================
 echo "=== Building desktop (native) ==="

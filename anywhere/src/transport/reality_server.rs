@@ -40,6 +40,8 @@
 
 use std::io;
 use std::net::Shutdown;
+use std::sync::atomic::AtomicU16;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use aes_gcm::aead::{Aead, Payload};
@@ -71,6 +73,30 @@ const MAX_HELLO_BYTES: usize = 64 * 1024;
 /// ClientHello peek budget (same rationale as the vless inbound's
 /// HANDSHAKE_TIMEOUT; xray imposes none — the fork just blocks).
 const HELLO_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Fallback dest dial budget (sing-box's handshake timeout default,
+/// C.TCPTimeout): a blackholed dest must not wedge the fallback splice.
+const DEST_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Budget for reading the destination site's ServerHello during the borrow
+/// attempt. A healthy site answers in one RTT; exceeding the budget means
+/// the borrow is unavailable and the connection falls back to the local
+/// handshake (today's behavior).
+const BORROW_SH_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The TLS 1.3 cipher suites this boring build can negotiate (wire ids);
+/// a borrowed ServerHello suite must be one of these.
+const BORING_TLS13_SUITES: [u16; 3] = [0x1301, 0x1302, 0x1303];
+
+/// Key-share groups this boring build can negotiate.
+const GROUP_X25519_WIRE: u16 = 0x001d;
+const GROUP_X25519MLKEM768_WIRE: u16 = 0x11ec;
+
+/// Test hook: wire id of the last cipher suite injected via the borrow FFI
+/// (0 = no borrow applied). Hidden — integration tests read it to verify the
+/// borrowing path end to end.
+#[doc(hidden)]
+pub static LAST_APPLIED_BORROW: AtomicU16 = AtomicU16::new(0);
 
 /// TLS record header length.
 const RECORD_HEADER: usize = 5;
@@ -186,6 +212,12 @@ struct ClientHello {
     /// x25519 key share (tls.go:215-228): the x25519 entry, else the tail
     /// 32 bytes of an X25519MLKEM768 entry.
     peer_pub: Option<[u8; 32]>,
+    /// Offered cipher suites (wire ids) — the borrowed ServerHello suite
+    /// must be one the client actually offered.
+    cipher_suites: Vec<u16>,
+    /// Offered key-share groups — the borrowed ServerHello group must be
+    /// one the client actually offered.
+    groups: Vec<u16>,
 }
 
 fn parse_client_hello(prefix: &[u8]) -> Option<ClientHello> {
@@ -207,8 +239,16 @@ fn parse_client_hello(prefix: &[u8]) -> Option<ClientHello> {
     let mut server_name = None;
     let mut tls13 = false;
     let mut peer_pub = None;
+    let mut cipher_suites = Vec::new();
+    let mut groups = Vec::new();
     if p + 2 <= msg.len() {
         let ciphers = u16::from_be_bytes([msg[p], msg[p + 1]]) as usize;
+        let mut q = p + 2;
+        let ciphers_end = (q + ciphers).min(msg.len());
+        while q + 2 <= ciphers_end {
+            cipher_suites.push(u16::from_be_bytes([msg[q], msg[q + 1]]));
+            q += 2;
+        }
         p += 2 + ciphers;
         if p < msg.len() {
             let comp = msg[p] as usize;
@@ -227,7 +267,24 @@ fn parse_client_hello(prefix: &[u8]) -> Option<ClientHello> {
                     match etype {
                         0 => server_name = parse_sni(&msg[ds..de]),
                         43 => tls13 = has_tls13(&msg[ds..de]),
-                        51 => peer_pub = pick_key_share(&msg[ds..de]),
+                        51 => {
+                            peer_pub = pick_key_share(&msg[ds..de]);
+                            // Collect every offered group. The client's
+                            // key_share carries a 2-byte list length, then
+                            // entries of group(2B) + key_len(2B) + key.
+                            let mut q = ds + 2;
+                            while q + 4 <= de {
+                                groups.push(u16::from_be_bytes([
+                                    msg[q],
+                                    msg[q + 1],
+                                ]));
+                                let klen = u16::from_be_bytes([
+                                    msg[q + 2],
+                                    msg[q + 3],
+                                ]) as usize;
+                                q += 4 + klen;
+                            }
+                        },
                         _ => {},
                     }
                     p = p + 4 + elen;
@@ -242,6 +299,8 @@ fn parse_client_hello(prefix: &[u8]) -> Option<ClientHello> {
         server_name,
         tls13,
         peer_pub,
+        cipher_suites,
+        groups,
     })
 }
 
@@ -431,14 +490,32 @@ impl CertTemplate {
 // RealityServer
 // ---------------------------------------------------------------------------
 
+/// The ClientHello facts the ServerHello borrow needs (offered cipher
+/// suites and key-share groups).
+#[derive(Debug, Clone)]
+pub struct BorrowContext {
+    pub cipher_suites: Vec<u16>,
+    pub groups: Vec<u16>,
+}
+
+/// The destination site's ServerHello parameters worth borrowing
+/// (see [`RealityServer::borrow_server_hello`]).
+#[derive(Debug, Clone, Copy)]
+pub struct BorrowedServerHello {
+    pub cipher_id: u16,
+    pub group_id: u16,
+}
+
 /// Outcome of the pre-handshake ClientHello peek.
 pub enum RealityPeek {
     /// The ClientHello authenticated: `auth_key` drives the one-time
-    /// certificate and `prefix` holds the consumed bytes to replay into
-    /// `SSL_accept`.
+    /// certificate, `prefix` holds the consumed bytes to replay into
+    /// `SSL_accept`, and `borrow_ctx` carries the ClientHello facts the
+    /// ServerHello borrow validates against.
     Authenticated {
         auth_key: [u8; 32],
         prefix: Vec<u8>,
+        borrow_ctx: BorrowContext,
     },
     /// Not a REALITY client: replay `prefix` into `dest` and splice.
     Fallback { prefix: Vec<u8> },
@@ -496,9 +573,14 @@ impl RealityServer {
             short_ids.push(padded);
         }
         if short_ids.is_empty() {
-            return Err("reality: short_ids is required (xray rejects empty \
-                        shortIds)"
-                .into());
+            // sing-box allows an empty ShortID list and then accepts only the
+            // all-zero id — the same id clients with an unset short_id send.
+            // (xray instead rejects the config.) Follow sing-box: default [0].
+            log::info!(
+                "reality: no short_ids configured; accepting the all-zero \
+                 short_id only"
+            );
+            short_ids.push([0u8; 8]);
         }
         let max_time_diff = if cfg.max_time_diff_ms == 0 {
             None
@@ -572,7 +654,17 @@ impl RealityServer {
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
         match self.authenticate_hello_at(&hello, now_ms) {
-            Ok(auth_key) => Ok(RealityPeek::Authenticated { auth_key, prefix }),
+            Ok(auth_key) => {
+                let borrow_ctx = BorrowContext {
+                    cipher_suites: hello.cipher_suites.clone(),
+                    groups: hello.groups.clone(),
+                };
+                Ok(RealityPeek::Authenticated {
+                    auth_key,
+                    prefix,
+                    borrow_ctx,
+                })
+            },
             Err(reason) => {
                 log::debug!("reality: unauthenticated ({reason}); falling back");
                 Ok(RealityPeek::Fallback { prefix })
@@ -674,9 +766,30 @@ impl RealityServer {
         Ok(auth_key)
     }
 
-    /// A fresh server SSL from the TLS 1.3-only accept context.
-    pub(crate) fn new_ssl(&self) -> io::Result<Ssl> {
+    /// A fresh server SSL from the TLS 1.3-only accept context. When
+    /// `borrowed` is set (the destination site answered the mirrored
+    /// ClientHello with a usable TLS 1.3 ServerHello), the SSL is pinned to
+    /// the destination's key-share group and cipher suite — the boring-side
+    /// half of the xtls/reality ServerHello borrow. Opt-in per connection:
+    /// `None` (or any non-REALITY use of the context) keeps boring's own
+    /// selection.
+    pub(crate) fn new_ssl(
+        &self, borrowed: Option<&BorrowedServerHello>,
+    ) -> io::Result<Ssl> {
         let ssl = Ssl::new(&self.ssl_ctx).map_err(io::Error::other)?;
+        if let Some(b) = borrowed {
+            // SAFETY: the pointer is a live SSL from this crate's boring
+            // build; the FFI only sets two opt-in override fields read by
+            // the ServerHello construction (reality-server-sh-borrow.patch).
+            unsafe {
+                boring_sys::SSL_set_reality_server_hello_borrow(
+                    ssl.as_ptr(),
+                    b.cipher_id,
+                    b.group_id,
+                );
+            }
+            LAST_APPLIED_BORROW.store(b.cipher_id, Ordering::Relaxed);
+        }
         // Mirror the xtls/reality fork (handshake_server_tls13.go assigns
         // hs.sigAlg = Ed25519 without consulting the client): sign the
         // one-time certificate's CertificateVerify with the certificate's
@@ -708,6 +821,97 @@ impl RealityServer {
         Ok(())
     }
 
+    /// ServerHello 借用尝试（xtls/reality 的"借用目标站点握手"）。
+    ///
+    /// 认证成功后调用：把镜像的 ClientHello 回放给真实站点，读取其
+    /// ServerHello 并校验（TLS 1.3 + x25519/MLKEM768 key share + 套件在
+    /// 客户端提供列表内）。返回 [`Some`] 时调用方通过
+    /// [`RealityServer::new_ssl`] 把 group/套件注入本连接的握手——可见
+    /// 握手参数与真实站点一致；返回 [`None`]（目标不可达/行为异常/超时）
+    /// 时退回本地握手（既有行为），服务不中断。
+    pub async fn borrow_server_hello(
+        &self, prefix: &[u8], ctx: &BorrowContext,
+    ) -> Option<BorrowedServerHello> {
+        let mut dest = match tokio::time::timeout(
+            DEST_CONNECT_TIMEOUT,
+            tokio::net::TcpStream::connect(&self.dest),
+        )
+        .await
+        {
+            Ok(Ok(d)) => d,
+            _ => {
+                log::debug!(
+                    "reality borrow: dest {} dial failed/timed out",
+                    self.dest
+                );
+                return None;
+            },
+        };
+        if tokio::time::timeout(HELLO_TIMEOUT, dest.write_all(prefix))
+            .await
+            .ok()?
+            .is_err()
+        {
+            log::debug!("reality borrow: dest {} write failed", self.dest);
+            return None;
+        }
+        let sh = match tokio::time::timeout(
+            BORROW_SH_TIMEOUT,
+            read_target_server_hello(&mut dest),
+        )
+        .await
+        {
+            Ok(Ok(Some(sh))) => sh,
+            Ok(Ok(None)) => {
+                log::debug!(
+                    "reality borrow: dest {} ServerHello not borrowable",
+                    self.dest
+                );
+                return None;
+            },
+            Ok(Err(e)) => {
+                log::debug!(
+                    "reality borrow: dest {} ServerHello read failed: {e:?}",
+                    self.dest
+                );
+                return None;
+            },
+            Err(_) => {
+                log::debug!(
+                    "reality borrow: dest {} ServerHello read timed out",
+                    self.dest
+                );
+                return None;
+            },
+        };
+        // 校验：套件必须是本 boring 支持的 TLS 1.3 套件且客户端有提供；
+        // key-share 组必须客户端有提供。
+        if !BORING_TLS13_SUITES.contains(&sh.cipher_id)
+            || !ctx.cipher_suites.contains(&sh.cipher_id)
+        {
+            log::debug!(
+                "reality borrow: borrowed suite {:#06x} not usable",
+                sh.cipher_id
+            );
+            return None;
+        }
+        if !ctx.groups.contains(&sh.group_id) {
+            log::debug!(
+                "reality borrow: borrowed group {:#06x} not offered",
+                sh.group_id
+            );
+            return None;
+        }
+        log::debug!(
+            "reality borrow: borrowing dest {} ServerHello \
+             (suite {:#06x}, group {:#06x})",
+            self.dest,
+            sh.cipher_id,
+            sh.group_id
+        );
+        Some(sh)
+    }
+
     /// Transparent fallback (tls.go:271-286, :430-447): replay the peeked
     /// bytes to `dest` and splice both directions. Client FIN half-closes
     /// dest (CloseWrite); errors break the respective direction. The task
@@ -716,17 +920,29 @@ impl RealityServer {
     pub async fn splice_fallback(
         &self, client: tokio::net::TcpStream, prefix: Vec<u8>,
     ) {
-        let mut dest =
-            match tokio::net::TcpStream::connect(&self.dest).await {
-                Ok(d) => d,
-                Err(e) => {
-                    log::debug!(
-                        "reality fallback: dest {} dial failed: {e}",
-                        self.dest
-                    );
-                    return;
-                },
-            };
+        let mut dest = match tokio::time::timeout(
+            DEST_CONNECT_TIMEOUT,
+            tokio::net::TcpStream::connect(&self.dest),
+        )
+        .await
+        {
+            Ok(Ok(d)) => d,
+            Ok(Err(e)) => {
+                log::debug!(
+                    "reality fallback: dest {} dial failed: {e}",
+                    self.dest
+                );
+                return;
+            },
+            Err(_) => {
+                log::debug!(
+                    "reality fallback: dest {} dial timed out after \
+                     {DEST_CONNECT_TIMEOUT:?}",
+                    self.dest
+                );
+                return;
+            },
+        };
         if !prefix.is_empty()
             && tokio::time::timeout(HELLO_TIMEOUT, dest.write_all(&prefix))
                 .await
@@ -807,6 +1023,119 @@ async fn read_client_hello_prefix(
             },
         }
     }
+}
+
+/// Read one TLS record off `dest` and parse it as the destination site's
+/// ServerHello. Returns `Ok(None)` when the record is not a borrowable
+/// TLS 1.3 ServerHello (wrong shape, no TLS 1.3, unusable key share).
+async fn read_target_server_hello(
+    dest: &mut tokio::net::TcpStream,
+) -> io::Result<Option<BorrowedServerHello>> {
+    let mut header = [0u8; 5];
+    dest.read_exact(&mut header).await?;
+    if header[0] != 0x16 || header[1] != 0x03 || header[2] != 0x03 {
+        // 常见情形：目标是 TLS alert（type 0x15，体 2 字节）——把描述读出
+        // 来便于诊断（如 handshake_failure）。
+        if header[0] == 0x15 {
+            let alen = u16::from_be_bytes([header[3], header[4]]) as usize;
+            let mut alert = vec![0u8; alen.min(2)];
+            let _ = dest.read_exact(&mut alert).await;
+            log::debug!(
+                "reality borrow: dest answered with a TLS alert \
+                 (level={:#04x} desc={:#04x})",
+                alert.first().copied().unwrap_or(0),
+                alert.get(1).copied().unwrap_or(0)
+            );
+        } else {
+            log::debug!(
+                "reality borrow: first record is not a handshake record \
+                 ({:02x?})",
+                header
+            );
+        }
+        return Ok(None);
+    }
+    let len = u16::from_be_bytes([header[3], header[4]]) as usize;
+    if !(39..=16_384).contains(&len) {
+        return Ok(None);
+    }
+    let mut body = vec![0u8; len];
+    dest.read_exact(&mut body).await?;
+    if len == 2 {
+        log::debug!(
+            "reality borrow: dest sent an alert: level={:#04x} desc={:#04x}",
+            body[0],
+            body[1]
+        );
+    }
+    // 握手消息：type(1) + length(3) + 载荷(legacy_version 2B + random 32B
+    // + session_id + cipher_suite + compression + extensions)。
+    if body[0] != 0x02 || body[4] != 0x03 || body[5] != 0x03 {
+        log::debug!(
+            "reality borrow: first handshake message is not a ServerHello \
+             (type {:#04x}, ver {:02x?})",
+            body[0],
+            &body[4..6]
+        );
+        return Ok(None);
+    }
+    let sid_len = body[38] as usize;
+    let mut p = 39 + sid_len;
+    if p + 5 > body.len() {
+        return Ok(None);
+    }
+    let cipher_id = u16::from_be_bytes([body[p], body[p + 1]]);
+    p += 2;
+    if body[p] != 0 {
+        return Ok(None); // compression must be null in TLS 1.3
+    }
+    p += 1;
+    if p + 2 > body.len() {
+        return Ok(None);
+    }
+    let ext_total = u16::from_be_bytes([body[p], body[p + 1]]) as usize;
+    p += 2;
+    let end = (p + ext_total).min(body.len());
+    let (mut tls13, mut group_id) = (false, None);
+    while p + 4 <= end {
+        let etype = u16::from_be_bytes([body[p], body[p + 1]]);
+        let elen = u16::from_be_bytes([body[p + 2], body[p + 3]]) as usize;
+        let (ds, de) = (p + 4, (p + 4 + elen).min(end));
+        log::debug!(
+            "reality borrow: target SH ext type={etype} len={elen}"
+        );
+        match etype {
+            // supported_versions：ServerHello 携带单个 selected_version
+            //（2 字节，RFC 8446 §4.1.3，与 ClientHello 的列表格式不同）。
+            43 if ds + 2 <= de => {
+                if body[ds] == 0x03 && body[ds + 1] == 0x04 {
+                    tls13 = true;
+                }
+            },
+            // key_share: the server's entry is group(2) + key_len(2) + key.
+            51 if ds + 4 <= de => {
+                let group = u16::from_be_bytes([body[ds], body[ds + 1]]);
+                let klen =
+                    u16::from_be_bytes([body[ds + 2], body[ds + 3]]) as usize;
+                let usable = (group == GROUP_X25519_WIRE && klen == 32)
+                    || (group == GROUP_X25519MLKEM768_WIRE && klen == 1120);
+                if usable {
+                    group_id = Some(group);
+                }
+            },
+            _ => {},
+        }
+        p = p + 4 + elen;
+    }
+    log::debug!(
+        "reality borrow: target ServerHello parsed: tls13={tls13} \
+         group={group_id:?} cipher={cipher_id:#06x} len={}",
+        body.len()
+    );
+    if !tls13 {
+        return Ok(None);
+    }
+    Ok(group_id.map(|group_id| BorrowedServerHello { cipher_id, group_id }))
 }
 
 // ---------------------------------------------------------------------------
@@ -936,6 +1265,7 @@ mod tests {
     use super::*;
 
     const SERVER_PRIV: [u8; 32] = [42u8; 32];
+    const TLS1_2_VERSION_BYTES: [u8; 2] = [0x03, 0x03];
     const CLIENT_PRIV: [u8; 32] = [7u8; 32];
     const NOW: u32 = 1_700_000_000;
     const SNI: &str = "www.example.com";
@@ -1223,6 +1553,64 @@ mod tests {
             .unwrap();
     }
 
+    /// 缺省 short_ids（空列表）= 只接受全零 short_id（sing-box 行为）：
+    /// 全零客户端通过，非零 short_id 仍被拒绝。
+    #[test]
+    fn short_ids_default_accepts_zero_only() {
+        let mut cfg = server_config(&SERVER_PRIV);
+        cfg.short_ids = vec![];
+        let server = RealityServer::from_config(&cfg).unwrap();
+
+        // 全零 short_id（客户端未配置 short_id 时发送的值）→ 通过。
+        let hello = parse(&good_hello(NOW, &[0u8; 8]));
+        server
+            .authenticate_hello_at(&hello, i64::from(NOW) * 1000)
+            .unwrap();
+
+        // 非零 short_id 不在（空的显式）列表里 → 拒绝。
+        let hello = parse(&good_hello(NOW, &[0x01, 0x23, 0xab, 0xcd, 0, 0, 0, 0]));
+        let err = server
+            .authenticate_hello_at(&hello, i64::from(NOW) * 1000)
+            .unwrap_err();
+        assert!(err.contains("short_id"), "{err}");
+    }
+
+    /// fallback dest 连不上（拒连）时快速返回，不挂起拼接。
+    #[tokio::test]
+    async fn splice_fallback_returns_on_dial_failure() {
+        // 占住一个端口再释放：连接它的行为是确定性的拒连。
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let server = test_server();
+        let dest_addr = server.dest().to_string();
+        // 用拒连端口作为 dest。
+        let mut cfg = server_config(&SERVER_PRIV);
+        cfg.dest = addr.to_string();
+        drop(dest_addr);
+        let server = RealityServer::from_config(&cfg).unwrap();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let client_addr = listener.local_addr().unwrap();
+        let connect = tokio::spawn(async move {
+            tokio::net::TcpStream::connect(client_addr).await.unwrap()
+        });
+        let (client, _) = listener.accept().await.unwrap();
+        let _ = connect.await.unwrap();
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            server.splice_fallback(client, b"GET / HTTP/1.1\r\n\r\n".to_vec()),
+        )
+        .await
+        .expect("splice_fallback must return promptly on dial failure");
+    }
+
     #[test]
     fn rejects_stale_timestamp() {
         let server = test_server();
@@ -1460,11 +1848,8 @@ mod tests {
             .unwrap_err()
             .contains("server_names"));
 
-        let mut cfg = server_config(&SERVER_PRIV);
-        cfg.short_ids.clear();
-        assert!(RealityServer::from_config(&cfg)
-            .unwrap_err()
-            .contains("short_ids"));
+        // 空 short_ids 现在是合法的（缺省 = 只接受全零 short_id，
+        // 与 sing-box 一致；行为覆盖见 short_ids_default_accepts_zero_only）。
 
         let mut cfg = server_config(&SERVER_PRIV);
         cfg.short_ids = vec!["00112233445566778899".into()];
@@ -1532,7 +1917,7 @@ mod tests {
         use tokio::io::AsyncWriteExt;
         client.write_all(&hello).await.unwrap();
         match server_task.await.unwrap().unwrap() {
-            RealityPeek::Authenticated { auth_key, prefix } => {
+            RealityPeek::Authenticated { auth_key, prefix, .. } => {
                 assert_eq!(prefix, hello);
                 // The server's AuthKey opens what the client sealed.
                 let mut mac =
@@ -1574,5 +1959,155 @@ mod tests {
                 panic!("garbage must not authenticate")
             },
         }
+    }
+
+    // -- ServerHello borrow (xtls/reality 目标站点借用) ----------------------
+
+    /// 构造一个可借用的目标站点 ServerHello 记录（TLS 1.3 + x25519 share +
+    /// 指定套件）。
+    fn fake_target_sh(cipher_id: u16) -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&TLS1_2_VERSION_BYTES);
+        payload.extend_from_slice(&[0xA5u8; 32]); // random
+        payload.push(32); // session_id echo length (REALITY size)
+        payload.extend_from_slice(&[0u8; 32]);
+        payload.extend_from_slice(&cipher_id.to_be_bytes());
+        payload.push(0); // compression
+        // extensions: key_share(x25519) + supported_versions(1.3)
+        let mut ext = Vec::new();
+        ext.extend_from_slice(&51u16.to_be_bytes()); // key_share
+        let ks_data_len = 4u16 + 32u16; // group(2) + klen(2) + key
+        ext.extend_from_slice(&ks_data_len.to_be_bytes());
+        ext.extend_from_slice(&GROUP_X25519_WIRE.to_be_bytes());
+        ext.extend_from_slice(&32u16.to_be_bytes());
+        ext.extend_from_slice(&[9u8; 32]);
+        ext.extend_from_slice(&43u16.to_be_bytes());
+        // ServerHello 的 selected_version = 2 字节，无列表长度。
+        ext.extend_from_slice(&2u16.to_be_bytes());
+        ext.extend_from_slice(&[0x03, 0x04]);
+        payload.extend_from_slice(&(ext.len() as u16).to_be_bytes());
+        payload.extend_from_slice(&ext);
+
+        // 握手消息 = type(1) + length(3) + payload。
+        let mut hs = Vec::new();
+        hs.push(0x02);
+        let plen = payload.len();
+        hs.extend_from_slice(&[
+            (plen >> 16) as u8,
+            (plen >> 8) as u8,
+            plen as u8,
+        ]);
+        hs.extend_from_slice(&payload);
+
+        let mut rec = vec![0x16, 0x03, 0x03];
+        rec.extend_from_slice(&(hs.len() as u16).to_be_bytes());
+        rec.extend_from_slice(&hs);
+        rec
+    }
+
+    /// 派生 dest：接受连接、读取（丢弃）客户端字节、回写伪造的目标
+    /// ServerHello 记录。
+    async fn spawn_fake_dest(cipher_id: u16) -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let sh = fake_target_sh(cipher_id);
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let sh = sh.clone();
+                tokio::spawn(async move {
+                    use tokio::io::AsyncWriteExt;
+                    let mut buf = [0u8; 4096];
+                    let _ = tokio::io::AsyncReadExt::read(&mut sock, &mut buf)
+                        .await;
+                    let _ = sock.write_all(&sh).await;
+                    // 保持半开片刻，等待服务端读取 SH。
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                });
+            }
+        });
+        port
+    }
+
+    /// read_target_server_hello 解析伪造的目标 ServerHello 并提取套件/组。
+    #[tokio::test]
+    async fn borrow_parses_target_server_hello() {
+        let port = spawn_fake_dest(0x1302).await;
+        let mut dest = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        use tokio::io::AsyncWriteExt;
+        dest.write_all(b"client-hello-bytes").await.unwrap();
+        let sh = read_target_server_hello(&mut dest)
+            .await
+            .unwrap()
+            .expect("borrowable ServerHello");
+        assert_eq!(sh.cipher_id, 0x1302);
+        assert_eq!(sh.group_id, GROUP_X25519_WIRE);
+    }
+
+    /// 非借用形态：目标回了 TLS 1.2 记录 → None（降级到本地握手）。
+    #[tokio::test]
+    async fn borrow_rejects_non_tls13_target() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                // TLS 1.2 风格的 ServerHello（legacy_version 0x0303 但
+                // supported_versions 不含 1.3）。
+                let mut hs = Vec::new();
+                hs.push(0x02);
+                hs.extend_from_slice(&TLS1_2_VERSION_BYTES);
+                hs.extend_from_slice(&[0xA5u8; 32]);
+                hs.push(0);
+                hs.extend_from_slice(&0x1302u16.to_be_bytes());
+                hs.push(0);
+                hs.extend_from_slice(&0u16.to_be_bytes());
+                let mut rec = vec![0x16, 0x03, 0x03];
+                rec.extend_from_slice(&(hs.len() as u16).to_be_bytes());
+                rec.extend_from_slice(&hs);
+                tokio::spawn(async move {
+                    use tokio::io::AsyncWriteExt;
+                    let _ = sock.write_all(&rec).await;
+                });
+            }
+        });
+        let mut dest = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        assert!(read_target_server_hello(&mut dest).await.unwrap().is_none());
+    }
+
+    /// borrow_server_hello 编排：dial → 回放 → 读取 → 校验（marker 套件）。
+    #[tokio::test]
+    async fn borrow_server_hello_end_to_end() {
+        let marker = 0x1302;
+        let port = spawn_fake_dest(marker).await;
+        let mut cfg = server_config(&SERVER_PRIV);
+        cfg.dest = format!("127.0.0.1:{port}");
+        let server = RealityServer::from_config(&cfg).unwrap();
+
+        let ctx = BorrowContext {
+            // 客户端必须提供 marker 套件与 x25519 组。
+            cipher_suites: vec![0x1301, marker],
+            groups: vec![GROUP_X25519_WIRE],
+        };
+        let prefix = good_hello(NOW, &[0u8; 8]);
+        let borrowed = server
+            .borrow_server_hello(&prefix, &ctx)
+            .await
+            .expect("borrow must succeed against the fake dest");
+        assert_eq!(borrowed.cipher_id, marker);
+        assert_eq!(borrowed.group_id, GROUP_X25519_WIRE);
+
+        // 不在客户端提供列表内的套件不可借用。
+        let ctx = BorrowContext {
+            cipher_suites: vec![0x1301],
+            groups: vec![GROUP_X25519_WIRE],
+        };
+        assert!(server.borrow_server_hello(&prefix, &ctx).await.is_none());
     }
 }

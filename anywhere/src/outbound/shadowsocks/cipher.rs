@@ -156,6 +156,22 @@ impl CipherMethod {
         }
     }
 
+    /// All PSK segments of the password, first to last. The inbound's user
+    /// entries mirror the outbound password format (colon-separated), so the
+    /// server inspects this parsed list: the last segment derives the session
+    /// key, earlier segments are the EIH identity chain.
+    pub fn psk_list(&self) -> Vec<Vec<u8>> {
+        match self {
+            CipherMethod::Aes128Gcm { psk_list, .. } => {
+                psk_list.iter().map(|p| p.to_vec()).collect()
+            },
+            CipherMethod::Aes256Gcm { psk_list, .. } => {
+                psk_list.iter().map(|p| p.to_vec()).collect()
+            },
+            CipherMethod::ChaCha20Poly1305 { psk } => vec![psk.to_vec()],
+        }
+    }
+
     /// Method name string.
     pub fn method_name(&self) -> &'static str {
         match self {
@@ -172,13 +188,7 @@ impl CipherMethod {
     /// `session_key = blake3_derive_key("shadowsocks 2022 session subkey",
     /// psk_last || salt)` truncated to `key_salt_length`.
     pub fn session_key(&self, salt: &[u8]) -> Vec<u8> {
-        let psk = self.last_psk();
-        let mut key_material = Vec::with_capacity(psk.len() + salt.len());
-        key_material.extend_from_slice(psk);
-        key_material.extend_from_slice(salt);
-        let derived =
-            blake3::derive_key("shadowsocks 2022 session subkey", &key_material);
-        derived[..self.key_salt_length()].to_vec()
+        session_subkey(self.last_psk(), salt, self.key_salt_length())
     }
 
     /// Create an AEAD cipher from a session key.
@@ -239,23 +249,52 @@ impl CipherMethod {
         let mut result = Vec::with_capacity((psk_refs.len() - 1) * 16);
         for i in 0..psk_refs.len() - 1 {
             let psk = psk_refs[i];
-            let mut key_material = Vec::with_capacity(ksl * 2);
-            key_material.extend_from_slice(psk);
-            key_material.extend_from_slice(salt);
-            let identity_subkey = blake3::derive_key(
-                "shadowsocks 2022 identity subkey",
-                &key_material,
-            );
-            let identity_subkey = &identity_subkey[..ksl];
+            let identity_subkey = identity_subkey(psk, salt, ksl);
 
             let psk_hash_block = &psk_hash[i * 16..(i + 1) * 16];
-            let ecb = AesEcb::new(identity_subkey);
+            let ecb = AesEcb::new(&identity_subkey);
             let mut block = [0u8; 16];
             block.copy_from_slice(psk_hash_block);
             ecb.encrypt_block(&mut block);
             result.extend_from_slice(&block);
         }
         result
+    }
+
+    /// Generate UDP Extended Identity Header blocks for a multi-PSK password.
+    ///
+    /// Mirrors sing-shadowsocks2 `clientPacketConn.WritePacket`: block_i =
+    /// AES-ECB(psk_i, blake3(psk_{i+1})[:16] ⊕ raw_header), where raw_header
+    /// is the unencrypted 16-byte sessionId||packetId header (no salt exists
+    /// in UDP, so the packet header ties the block to this packet). Empty for
+    /// single-PSK and for chacha (multi-PSK rejected at parse time).
+    pub fn generate_udp_eih(&self, raw_header: &[u8; 16]) -> Vec<u8> {
+        fn build(
+            psk_list: &[impl AsRef<[u8]>], psk_hash: &[u8],
+            raw_header: &[u8; 16],
+        ) -> Vec<u8> {
+            let mut out =
+                Vec::with_capacity(16 * psk_list.len().saturating_sub(1));
+            for i in 0..psk_list.len().saturating_sub(1) {
+                let mut block = [0u8; 16];
+                block.copy_from_slice(&psk_hash[i * 16..(i + 1) * 16]);
+                for (b, h) in block.iter_mut().zip(raw_header.iter()) {
+                    *b ^= h;
+                }
+                AesEcb::new(psk_list[i].as_ref()).encrypt_block(&mut block);
+                out.extend_from_slice(&block);
+            }
+            out
+        }
+        match self {
+            CipherMethod::Aes128Gcm { psk_list, psk_hash } => {
+                build(psk_list, psk_hash, raw_header)
+            },
+            CipherMethod::Aes256Gcm { psk_list, psk_hash } => {
+                build(psk_list, psk_hash, raw_header)
+            },
+            CipherMethod::ChaCha20Poly1305 { .. } => Vec::new(),
+        }
     }
 
     /// `true` if this is an AES method (supports EIH).
@@ -280,8 +319,7 @@ impl CipherMethod {
     }
 
     /// AES-ECB block cipher for UDP header encryption (key = `psk_list[0]`).
-    pub fn udp_block_encryptor(&self) -> AesEcb {
-        match self {
+    pub fn udp_block_encryptor(&self) -> AesEcb {        match self {
             CipherMethod::Aes128Gcm { psk_list, .. } => AesEcb::new(&psk_list[0]),
             CipherMethod::Aes256Gcm { psk_list, .. } => AesEcb::new(&psk_list[0]),
             CipherMethod::ChaCha20Poly1305 { .. } => {
@@ -316,9 +354,8 @@ fn compute_psk_hash(psk_list: &[Vec<u8>]) -> Vec<u8> {
         return Vec::new();
     }
     let mut hash = Vec::with_capacity((psk_list.len() - 1) * 16);
-    for i in 1..psk_list.len() {
-        let h = blake3::hash(&psk_list[i]);
-        hash.extend_from_slice(&h.as_bytes()[..16]);
+    for psk in &psk_list[1..] {
+        hash.extend_from_slice(&psk_identity_hash(psk));
     }
     hash
 }
@@ -333,6 +370,34 @@ pub enum SsAead {
 }
 
 impl SsAead {
+    /// Build an AEAD of `kind` from a session key whose length must equal
+    /// [`MethodKind::key_salt_length`]. Server-side construction helper.
+    pub fn new(kind: MethodKind, key: &[u8]) -> Result<Self, String> {
+        match kind {
+            MethodKind::Aes128Gcm => {
+                use aes_gcm::aead::KeyInit;
+                Ok(SsAead::Aes128(
+                    aes_gcm::Aes128Gcm::new_from_slice(key)
+                        .map_err(|e| format!("bad AES-128 session key: {e}"))?,
+                ))
+            },
+            MethodKind::Aes256Gcm => {
+                use aes_gcm::aead::KeyInit;
+                Ok(SsAead::Aes256(
+                    aes_gcm::Aes256Gcm::new_from_slice(key)
+                        .map_err(|e| format!("bad AES-256 session key: {e}"))?,
+                ))
+            },
+            MethodKind::ChaCha20Poly1305 => {
+                use chacha20poly1305::aead::KeyInit;
+                Ok(SsAead::ChaCha20(
+                    chacha20poly1305::ChaCha20Poly1305::new_from_slice(key)
+                        .map_err(|e| format!("bad chacha session key: {e}"))?,
+                ))
+            },
+        }
+    }
+
     /// Encrypt `plaintext` with the given 12-byte nonce. Returns
     /// ciphertext + 16-byte tag.
     pub fn seal(&self, nonce: &[u8], plaintext: &[u8]) -> Vec<u8> {
@@ -456,6 +521,77 @@ pub fn increase_nonce(nonce: &mut [u8]) {
             return;
         }
     }
+}
+
+// ─── Server-side primitives ─────────────────────────────────────────────────
+
+/// Cipher variant without PSK state. Lets the inbound reuse the outbound's
+/// AEAD constructors ([`SsAead`]) and key lengths for a configured method.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MethodKind {
+    Aes128Gcm,
+    Aes256Gcm,
+    ChaCha20Poly1305,
+}
+
+impl MethodKind {
+    /// Parse an SS2022 method name.
+    pub fn from_name(method: &str) -> Result<Self, String> {
+        match method {
+            "2022-blake3-aes-128-gcm" => Ok(MethodKind::Aes128Gcm),
+            "2022-blake3-aes-256-gcm" => Ok(MethodKind::Aes256Gcm),
+            "2022-blake3-chacha20-poly1305" => Ok(MethodKind::ChaCha20Poly1305),
+            _ => Err(format!("unknown method: {method}")),
+        }
+    }
+
+    /// Key/salt length for this method (16 for aes-128, 32 otherwise).
+    pub fn key_salt_length(self) -> usize {
+        match self {
+            MethodKind::Aes128Gcm => 16,
+            MethodKind::Aes256Gcm | MethodKind::ChaCha20Poly1305 => 32,
+        }
+    }
+
+    /// `true` for the AES methods (EIH / UDP block cipher support).
+    pub fn is_aes(self) -> bool {
+        !matches!(self, MethodKind::ChaCha20Poly1305)
+    }
+}
+
+/// `SessionKey(psk, salt)` — `blake3_derive_key("shadowsocks 2022 session
+/// subkey", psk || salt)` truncated to `key_len` bytes.
+///
+/// Mirrors sing `shadowaead_2022.SessionKey`; the inbound derives session
+/// keys from an arbitrary (e.g. matched user) PSK, which the client-oriented
+/// [`CipherMethod::session_key`] cannot express.
+pub fn session_subkey(psk: &[u8], salt: &[u8], key_len: usize) -> Vec<u8> {
+    let mut key_material = Vec::with_capacity(psk.len() + salt.len());
+    key_material.extend_from_slice(psk);
+    key_material.extend_from_slice(salt);
+    let derived =
+        blake3::derive_key("shadowsocks 2022 session subkey", &key_material);
+    derived[..key_len].to_vec()
+}
+
+/// IdentitySubkey for EIH — `blake3_derive_key("shadowsocks 2022 identity
+/// subkey", psk || salt)` truncated to `key_len` bytes.
+pub fn identity_subkey(psk: &[u8], salt: &[u8], key_len: usize) -> Vec<u8> {
+    let mut key_material = Vec::with_capacity(psk.len() + salt.len());
+    key_material.extend_from_slice(psk);
+    key_material.extend_from_slice(salt);
+    let derived =
+        blake3::derive_key("shadowsocks 2022 identity subkey", &key_material);
+    derived[..key_len].to_vec()
+}
+
+/// `blake3::hash(psk)[..16]` — the per-user identity hash an EIH block
+/// encodes. The inbound matches a decrypted EIH block against this value.
+pub fn psk_identity_hash(psk: &[u8]) -> [u8; 16] {
+    let h = blake3::hash(psk);
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&h.as_bytes()[..16]);
+    out
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
@@ -833,6 +969,58 @@ mod tests {
         ecb.encrypt_block(&mut expected);
 
         assert_eq!(&eih[..16], &expected);
+    }
+
+    // ── UDP EIH generation ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_generate_udp_eih_multi_psk() {
+        let psk0 = [0x01u8; 32];
+        let psk1 = [0x02u8; 32];
+        let psk2 = [0x03u8; 32];
+        let password = format!(
+            "{}:{}:{}",
+            b64_encode(&psk0),
+            b64_encode(&psk1),
+            b64_encode(&psk2)
+        );
+        let method =
+            CipherMethod::new("2022-blake3-aes-256-gcm", &password).unwrap();
+
+        let raw_header = [0xA5u8; 16];
+        let eih = method.generate_udp_eih(&raw_header);
+        // (N-1) * 16 = 2 块。
+        assert_eq!(eih.len(), 32);
+
+        // 逐块独立验证：block_i = AES_enc(psk_i, h(psk_{i+1}) ⊕ raw_header)。
+        let psks = [psk0, psk1, psk2];
+        for i in 0..2 {
+            let mut expected = psk_identity_hash(&psks[i + 1]);
+            for (b, h) in expected.iter_mut().zip(raw_header.iter()) {
+                *b ^= h;
+            }
+            AesEcb::new(&psks[i]).encrypt_block(&mut expected);
+            assert_eq!(
+                &eih[i * 16..(i + 1) * 16],
+                &expected,
+                "UDP EIH block {i} mismatch"
+            );
+        }
+    }
+
+    #[test]
+    fn test_generate_udp_eih_single_and_chacha_empty() {
+        let method =
+            CipherMethod::new("2022-blake3-aes-256-gcm", &b64_encode(&[7u8; 32]))
+                .unwrap();
+        assert!(method.generate_udp_eih(&[0u8; 16]).is_empty());
+
+        let chacha = CipherMethod::new(
+            "2022-blake3-chacha20-poly1305",
+            &b64_encode(&[8u8; 32]),
+        )
+        .unwrap();
+        assert!(chacha.generate_udp_eih(&[0u8; 16]).is_empty());
     }
 
     // ── increase_nonce ──────────────────────────────────────────────────────

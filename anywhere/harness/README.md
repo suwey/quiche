@@ -5,6 +5,8 @@
 协议栈的平台差异（交叉编译 BoringSSL、CA 证书、socket 行为）由真实二进制
 在真实机器上暴露，`cargo test` 的进程内回环测试覆盖不到这一层。
 
+仅测试网络协议，无法测试tun和ui相关的功能。
+
 ## 使用
 
 ```sh
@@ -38,7 +40,7 @@ python3 anywhere/harness/conformance.py -c ~/anywhere-test --dry-run
 | `config.toml` | 客户端公共模板。`##test node##` 占位符处注入节点；tun 不放进模板（矩阵全走 socks5） |
 | `outbounds.toml` | 真实节点池（分发测试用），逐个测试。tag 缺省自动命名；urltest/direct 跳过 |
 | `server.toml` | 自环服务端模板。`##test inbound##` 占位符处注入 inbound；`[[users]]` 密码由 harness 每轮随机生成 |
-| `inbounds.toml` | 自环 inbound 池，与 outbounds.toml 对偶（anytls / vless / mless-ws / vless-reality；ss、quic 注释备用） |
+| `inbounds.toml` | 自环 inbound 池，与 outbounds.toml 对偶（anytls / vless / mless-ws / vless-reality / shadowsocks-2022；quic 注释备用） |
 | `test.toml` | `[test]` 参数 + 各平台传输段（有段才测） |
 | `<平台>.toml` | 可选覆盖：table 深合并、数组/标量整体替换；缺文件/空文件 = 用模板 |
 
@@ -58,9 +60,9 @@ CLI 与 toml 的 arch 冲突时直接报错不跑。
 - 探测目标 `[test] self_sites`（默认仅 `https://www.baidu.com/`）：server 的
   出口在本机网络，必须可直连——污染/被墙目标由真实节点矩阵覆盖。
 - 报告行名 `self:<协议>`，时间线全协议合并为一张图。
-- 池里注释条目（shadowsocks：anywhere 尚无 ss inbound，runner 会静默忽略；
-  quic：client outbound 字段待对齐）在实现后取消注释即进入自环，配对生成
-  已备好（ss 按 method 生成对应长度的 2022 PSK）。
+- 池里注释条目（quic：client outbound 字段待对齐）在实现后取消注释即进入
+  自环。shadowsocks-2022 的密码走统一 `[[users]]` 契约：harness 每轮生成
+  `"iPSK:用户PSK"` 复合值，服务端 users 表与客户端 outbound 同值同写法。
 
 平台传输方式：
 

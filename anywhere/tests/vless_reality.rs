@@ -765,3 +765,106 @@ short_id = "{SHORT_ID}"
     });
     guard.await.expect("wrong reality key test timed out");
 }
+
+/// ServerHello 借用（xtls/reality 的"借用目标站点握手"）：dest 是一个真实
+/// 回答 TLS 1.3 ServerHello 的本地站点（marker 套件 AES_256_GCM_SHA384），
+/// 认证成功后 inbound 采用该 ServerHello 的 key-share 组与套件完成与
+/// 客户端的握手（boring 补丁注入），数据照常双向转发。
+#[tokio::test(flavor = "multi_thread")]
+async fn borrowed_server_hello_roundtrip() {
+    let _ = env_logger::try_init();
+    let guard = tokio::time::timeout(Duration::from_secs(60), async {
+        const MARKER_CIPHER: u16 = 0x1302; // AES_256_GCM_SHA384
+
+        // 伪造目标站点：读掉客户端字节，回写带 marker 套件的
+        // ServerHello 记录（TLS 1.3 + x25519 key share）。
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let marker_port = listener.local_addr().unwrap().port();
+
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&[0x03, 0x03]); // legacy_version
+        payload.extend_from_slice(&[0xA5u8; 32]); // random
+        payload.push(32); // session_id echo
+        payload.extend_from_slice(&[0u8; 32]);
+        payload.extend_from_slice(&MARKER_CIPHER.to_be_bytes());
+        payload.push(0); // compression
+        let mut ext = Vec::new();
+        // key_share(x25519)
+        ext.extend_from_slice(&51u16.to_be_bytes());
+        ext.extend_from_slice(&36u16.to_be_bytes());
+        ext.extend_from_slice(&0x001du16.to_be_bytes());
+        ext.extend_from_slice(&32u16.to_be_bytes());
+        ext.extend_from_slice(&[9u8; 32]);
+        // supported_versions(1.3)：SH 为单个 selected_version
+        ext.extend_from_slice(&43u16.to_be_bytes());
+        ext.extend_from_slice(&2u16.to_be_bytes());
+        ext.extend_from_slice(&[0x03, 0x04]);
+        payload.extend_from_slice(&(ext.len() as u16).to_be_bytes());
+        payload.extend_from_slice(&ext);
+        // 握手消息 = type(1) + length(3) + payload
+        let mut hs = Vec::new();
+        hs.push(0x02); // server_hello
+        let plen = payload.len();
+        hs.extend_from_slice(&[
+            (plen >> 16) as u8,
+            (plen >> 8) as u8,
+            plen as u8,
+        ]);
+        hs.extend_from_slice(&payload);
+        let mut sh_record = vec![0x16, 0x03, 0x03];
+        sh_record.extend_from_slice(&(hs.len() as u16).to_be_bytes());
+        sh_record.extend_from_slice(&hs);
+
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let sh_record = sh_record.clone();
+                tokio::spawn(async move {
+                    use tokio::io::AsyncWriteExt as _;
+                    let mut buf = [0u8; 8192];
+                    let _ = tokio::io::AsyncReadExt::read(&mut sock, &mut buf)
+                        .await;
+                    let _ = sock.write_all(&sh_record).await;
+                    // 服务端取到 ServerHello 后即关闭 dest；这里先短暂
+                    // 半开等待读取完成。
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                });
+            }
+        });
+
+        let vless_port = setup_inbound(marker_port).await;
+        let client = setup_outbound(vless_port).await;
+
+        let echo_port = spawn_plain_echo().await;
+        let dest =
+            Destination::from_str(&format!("127.0.0.1:{echo_port}")).unwrap();
+
+        let mut relay = client.dial(&dest).await.expect("dial");
+        let payload: Vec<u8> =
+            (0..16 * 1024u32).map(|i| (i % 251) as u8).collect();
+        relay.write(&payload).await.expect("write");
+        let mut received = vec![0u8; payload.len()];
+        let mut got = 0usize;
+        while got < received.len() {
+            let n = relay
+                .read(&mut received[got..])
+                .await
+                .expect("read echo");
+            assert!(n > 0, "echo EOF after {got} bytes");
+            got += n;
+        }
+        assert_eq!(received, payload);
+        relay.shutdown().await.expect("shutdown");
+
+        // 借用生效：本连接的握手注入了目标站点的套件。
+        assert_eq!(
+            anywhere::transport::reality_server::LAST_APPLIED_BORROW.load(
+                std::sync::atomic::Ordering::Relaxed
+            ),
+            MARKER_CIPHER,
+            "the destination site's ServerHello suite must be borrowed"
+        );
+    });
+    guard.await.expect("borrowed_server_hello_roundtrip timed out");
+}

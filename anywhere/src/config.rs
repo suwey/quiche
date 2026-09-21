@@ -102,6 +102,11 @@ pub struct InboundConfig {
     #[serde(default)]
     pub padding_scheme: Option<String>,
 
+    /// Shadowsocks 2022 加密方法 (e.g. "2022-blake3-aes-256-gcm").
+    /// 用户取自顶层 `[[users]]`：每条 password 与 outbound 的 password
+    /// 同构（colon 分隔多段 base64 PSK，客户端填同样的串）。
+    pub method: Option<String>,
+
     /// Optional transport for the vless inbound — same shape as the
     /// outbound's `[transport]` section. Only `type = "ws"` is supported:
     /// the inbound then performs an HTTP/1.1 WebSocket upgrade on every
@@ -141,7 +146,9 @@ pub struct RealityInboundConfig {
 
     /// xray `shortIds`: accepted hex ids, at most 8 bytes each (xray
     /// zero-pads to the wire size); `""` is the all-zero id accepted by
-    /// clients configured with an empty short_id.
+    /// clients configured with an empty short_id. 缺省（空列表）时只接受
+    /// 全零 short_id —— 与 sing-box 的默认行为一致（客户端不填 short_id
+    /// 即发全零）。
     #[serde(default)]
     pub short_ids: Vec<String>,
 

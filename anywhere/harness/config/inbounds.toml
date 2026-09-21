@@ -57,16 +57,12 @@ private_key = ""
 short_ids = ["0123abcd"]
 max_time_diff_ms = 60000
 
-# --- shadowsocks（含 2022）：inbound 尚未在 anywhere 实现（runner 只分发
-# socks5/quic/anytls/vless/mless/tun，未知类型静默忽略），实现后取消注释即可
-# 进入自环。字段按 outbound 对偶推测：password 沿用 [[users]]（装配时随机
-# UUID），method 必须与 client 侧一致（配对生成时从 inbound 镜像）。
-# [[inbounds]]
-# type = "shadowsocks"
-# listen = "127.0.0.1:21005"
-# method = "2022-blake3-aes-128-gcm"
-# cert = "cert.pem"
-# key = "key.pem"
+# --- shadowsocks 2022：无 TLS 证书（自带 AEAD）；密码走顶部 [[users]]，
+# 装配时生成 "iPSK:用户PSK" 复合值（两侧同值，与 outbound password 写法一致）
+[[inbounds]]
+type = "shadowsocks"
+listen = "127.0.0.1:21005"
+method = "2022-blake3-aes-128-gcm"
 
 # --- quic：UDP 传输，inbound 已实现，client outbound 字段待对齐 ---
 # [[inbounds]]

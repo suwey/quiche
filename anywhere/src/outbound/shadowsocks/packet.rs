@@ -51,13 +51,22 @@ use super::socks::{deserialize_socks_addr, serialize_socks_addr};
 /// Tracks the highest packet ID seen and a bitmask of the last 64 IDs.
 /// Bit position is the *distance* from `highest` (not `id % 64`) so that
 /// the window shifts correctly as `highest` advances.
-struct SlidingWindow {
+///
+/// Shared with the inbound server (which runs the same filter over client
+/// packet IDs in the opposite direction).
+pub struct SlidingWindow {
     highest: u64,
     bitmap: u64,
 }
 
+impl Default for SlidingWindow {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SlidingWindow {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             highest: 0,
             bitmap: 0,
@@ -65,7 +74,7 @@ impl SlidingWindow {
     }
 
     /// Returns `true` if `id` has not been seen (acceptable).
-    fn check(&self, id: u64) -> bool {
+    pub fn check(&self, id: u64) -> bool {
         if id > self.highest {
             return true; // ahead of window
         }
@@ -78,7 +87,7 @@ impl SlidingWindow {
 
     /// Marks `id` as seen. Call [`check`](Self::check) first to verify
     /// the ID is acceptable.
-    fn add(&mut self, id: u64) {
+    pub fn add(&mut self, id: u64) {
         if id > self.highest {
             let shift = id - self.highest;
             if shift >= 64 {
@@ -96,6 +105,23 @@ impl SlidingWindow {
 }
 
 // ─── SsUdpRelay ──────────────────────────────────────────────────────────────
+
+/// Compute SS2022 UDP padding length.
+///
+/// Padding is only applied to DNS (port 53) packets shorter than
+/// `MAX_PADDING_LENGTH`. The length is random in `1..=(max - len)`.
+///
+/// Shared with the inbound server (same rule on the response path).
+pub fn compute_padding_len(payload_len: usize, port: u16) -> usize {
+    if port == 53 && payload_len < MAX_PADDING_LENGTH {
+        let mut rand_bytes = [0u8; 2];
+        getrandom::fill(&mut rand_bytes).expect("getrandom: system CSPRNG failed");
+        let r = u16::from_be_bytes(rand_bytes) as usize;
+        r % (MAX_PADDING_LENGTH - payload_len) + 1
+    } else {
+        0
+    }
+}
 
 /// SS2022 UDP relay implementing [`PacketRelay`].
 ///
@@ -148,22 +174,6 @@ impl SsUdpRelay {
         }
     }
 
-    /// Compute SS2022 UDP padding length.
-    ///
-    /// Padding is only applied to DNS (port 53) packets shorter than
-    /// `MAX_PADDING_LENGTH`. The length is random in `1..=(max - len)`.
-    fn compute_padding_len(payload_len: usize, port: u16) -> usize {
-        if port == 53 && payload_len < MAX_PADDING_LENGTH {
-            let mut rand_bytes = [0u8; 2];
-            getrandom::fill(&mut rand_bytes)
-                .expect("getrandom: system CSPRNG failed");
-            let r = u16::from_be_bytes(rand_bytes) as usize;
-            r % (MAX_PADDING_LENGTH - payload_len) + 1
-        } else {
-            0
-        }
-    }
-
     /// Current Unix timestamp in seconds.
     fn now_secs() -> u64 {
         SystemTime::now()
@@ -175,6 +185,11 @@ impl SsUdpRelay {
     // ── Encrypt (client → server) ───────────────────────────────────────────
 
     /// Build an encrypted AES UDP packet (client → server).
+    ///
+    /// Wire layout (mirrors sing-shadowsocks2 `clientPacketConn`):
+    /// `ECB(sessionId||packetId) || [EIH 块...] || AEAD(请求体)`。多段
+    /// password 时包头后插入 EIH 块（sing 多用户服务器识别用户用）；
+    /// 单段密码无 EIH，与旧布局字节一致。
     fn encrypt_packet_aes(&self, payload: &[u8], dest: &Destination) -> Vec<u8> {
         // 1. Packet header: sessionId(8 BE) || packetId(8 BE)
         let mut hdr = [0u8; 16];
@@ -182,7 +197,7 @@ impl SsUdpRelay {
         hdr[8..16].copy_from_slice(&self.packet_id.to_be_bytes());
 
         // 2. Padding
-        let padding_len = Self::compute_padding_len(payload.len(), dest.port);
+        let padding_len = compute_padding_len(payload.len(), dest.port);
         let padding = vec![0u8; padding_len];
 
         // 3. Body plaintext: type || timestamp || paddingLen || padding || SocksAddr || payload
@@ -197,7 +212,7 @@ impl SsUdpRelay {
         body.extend_from_slice(&addr);
         body.extend_from_slice(payload);
 
-        // 4-5. AEAD seal with nonce = header[4..16]
+        // 4-5. AEAD seal with nonce = header[4..16] (raw, before ECB)
         let nonce = &hdr[4..16];
         let enc_body = self
             .session_aead
@@ -205,13 +220,18 @@ impl SsUdpRelay {
             .expect("session_aead must be Some for AES")
             .seal(nonce, &body);
 
-        // 6. ECB-encrypt the packet header
+        // 6. UDP EIH blocks for multi-PSK passwords, derived from the raw
+        //    header (must run before ECB encryption).
+        let eih = self.method.generate_udp_eih(&hdr);
+
+        // 7. ECB-encrypt the packet header
         let ecb = self.method.udp_block_encryptor();
         ecb.encrypt_block(&mut hdr);
 
-        // 7. Assemble: ECB(header) || AEAD(body)
-        let mut packet = Vec::with_capacity(16 + enc_body.len());
+        // 8. Assemble: ECB(header) || EIH || AEAD(body)
+        let mut packet = Vec::with_capacity(16 + eih.len() + enc_body.len());
         packet.extend_from_slice(&hdr);
+        packet.extend_from_slice(&eih);
         packet.extend_from_slice(&enc_body);
         packet
     }
@@ -225,7 +245,7 @@ impl SsUdpRelay {
         getrandom::fill(&mut nonce).expect("getrandom: system CSPRNG failed");
 
         // 2. Padding
-        let padding_len = Self::compute_padding_len(payload.len(), dest.port);
+        let padding_len = compute_padding_len(payload.len(), dest.port);
         let padding = vec![0u8; padding_len];
 
         // 3. Plaintext: sessionId || packetId || type || timestamp || paddingLen || padding || SocksAddr || payload
@@ -760,6 +780,70 @@ mod tests {
 
         assert_eq!(parsed_dest, dest);
         assert_eq!(parsed_payload, payload);
+    }
+
+    /// 多段 password（iPSK:用户PSK）的加密包：包头后带 EIH 块，请求体用
+    /// 末段 PSK 派生密钥（sing 多用户服务器布局）。
+    #[tokio::test]
+    async fn test_aes_multi_psk_encrypt_round_trip() {
+        use base64::Engine;
+
+        let ipsk = [0x11u8; 32];
+        let user_psk = [0x22u8; 32];
+        let password = format!(
+            "{}:{}",
+            base64::engine::general_purpose::STANDARD.encode(ipsk),
+            base64::engine::general_purpose::STANDARD.encode(user_psk)
+        );
+        let method =
+            CipherMethod::new("2022-blake3-aes-256-gcm", &password).unwrap();
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let relay = SsUdpRelay::new(socket, method.clone());
+
+        let expected_session_id = relay.session_id;
+        let dest = Destination::new(Address::Ipv4([1, 1, 1, 1]), 443);
+        let payload = b"multi-psk udp eih";
+
+        let packet = relay.encrypt_packet_aes(payload, &dest);
+
+        // 1. ECB 解包头（首段 PSK 加密，udp_block_encryptor 同钥）。
+        let mut hdr = [0u8; 16];
+        hdr.copy_from_slice(&packet[..16]);
+        method.udp_block_encryptor().decrypt_block(&mut hdr);
+        let session_id = u64::from_be_bytes(hdr[0..8].try_into().unwrap());
+        let packet_id = u64::from_be_bytes(hdr[8..16].try_into().unwrap());
+        assert_eq!(session_id, expected_session_id);
+        assert_eq!(packet_id, 0);
+
+        // 2. EIH 块校验：AES_dec(psk_0, block) ⊕ hdr == blake3(psk_1)[:16]。
+        let mut block = [0u8; 16];
+        block.copy_from_slice(&packet[16..32]);
+        let ecb = crate::outbound::shadowsocks::cipher::AesEcb::new(&ipsk);
+        ecb.decrypt_block(&mut block);
+        for (b, h) in block.iter_mut().zip(hdr.iter()) {
+            *b ^= h;
+        }
+        let expected_hash = {
+            use blake3::Hasher;
+            let mut hasher = Hasher::new();
+            hasher.update(&user_psk);
+            let mut out = [0u8; 16];
+            out.copy_from_slice(&hasher.finalize().as_bytes()[..16]);
+            out
+        };
+        assert_eq!(block, expected_hash, "UDP EIH block mismatch");
+
+        // 3. 请求体 AEAD（末段 PSK 派生密钥，nonce = 包头[4..16]）。
+        let sk = method.session_key(&hdr[0..8]);
+        let aead = method.create_aead(&sk);
+        let plain = aead.open(&hdr[4..16], &packet[32..]).unwrap();
+        assert_eq!(plain[0], HEADER_TYPE_CLIENT);
+        let padding_len = u16::from_be_bytes([plain[9], plain[10]]) as usize;
+        let offset = 11 + padding_len;
+        let (parsed_dest, addr_len) =
+            deserialize_socks_addr(&plain[offset..]).unwrap();
+        assert_eq!(parsed_dest, dest);
+        assert_eq!(&plain[offset + addr_len..], payload);
     }
 
     #[tokio::test]

@@ -391,19 +391,21 @@ def self_tag(inbound: dict) -> str:
     return f"self:{t}"
 
 
-def paired_outbound(inbound: dict, uuid: str, reality_pub: str | None) -> dict:
+def gen_psk(method: str) -> str:
+    """Shadowsocks-2022 PSK: base64 of the cipher's key length."""
+    n = 16 if "128" in method else 32
+    return base64.b64encode(secrets.token_bytes(n)).decode()
+
+
+def paired_outbound(inbound: dict, password: str, reality_pub: str | None) -> dict:
     """Client outbound matching the inbound under test."""
     listen = inbound["listen"]
     host, port = listen.rsplit(":", 1)
     ob: dict = {"type": inbound["type"], "tag": TEST_TAG,
-                "server": f"{host}:{port}", "password": uuid}
+                "server": f"{host}:{port}", "password": password}
     if inbound["type"] == "shadowsocks":
-        # ss auth is method+psk, not the users UUID; 2022 ciphers need a
-        # base64 PSK of the key length (16 for aes-128, else 32)
-        method = inbound.get("method", "")
-        if method.startswith("2022"):
-            n = 16 if "128" in method else 32
-            ob["password"] = base64.b64encode(secrets.token_bytes(n)).decode()
+        # ss-2022: the caller passes the "iPSK:userPSK" composite, identical
+        # to the server-side [[users]] password (unified users contract)
         for k in ("method", "plugin", "plugin_opts"):
             if inbound.get(k):
                 ob[k] = inbound[k]
@@ -431,8 +433,16 @@ def assemble_self(server_tpl: dict, client_tpl: dict, inbound: dict,
     Both round-trip checked like assemble()."""
     tag = self_tag(inbound)
     reality_pub = None
+    # unified [[users]] password: a uuid for the TLS protocols, the
+    # "iPSK:userPSK" composite for shadowsocks-2022 — same string on both
+    # sides (server users table and client outbound)
+    if inbound["type"] == "shadowsocks":
+        method = inbound.get("method", "")
+        password = f"{gen_psk(method)}:{gen_psk(method)}"
+    else:
+        password = uuid
     srv = copy.deepcopy(server_tpl)
-    srv.setdefault("users", [{"name": "self"}])[0]["password"] = uuid
+    srv.setdefault("users", [{"name": "self"}])[0]["password"] = password
     if inbound.get("reality"):
         priv, reality_pub = gen_x25519_pair()
         srv_in = copy.deepcopy(inbound)
@@ -446,7 +456,7 @@ def assemble_self(server_tpl: dict, client_tpl: dict, inbound: dict,
     srv.setdefault("inbounds", []).append(srv_in)
 
     cli = copy.deepcopy(client_tpl)
-    cli.setdefault("outbounds", []).insert(0, paired_outbound(inbound, uuid, reality_pub))
+    cli.setdefault("outbounds", []).insert(0, paired_outbound(inbound, password, reality_pub))
 
     server_text, client_text = toml_dumps(srv), toml_dumps(cli)
     if tomllib.loads(server_text) != srv:
@@ -1456,7 +1466,6 @@ def run_platform(platform: str, cfgdir: Path, releases: Path | None, params: dic
 
     runner = None
     bin_tgz = None
-    binary = None
     if not dry_run:
         bin_tgz = stage_binary_tgz(platform, binary, run_dir) if platform != "mac" else None
         ui_tgz = resolve_ui_tgz(releases) if platform in ("windows", "linux") else None

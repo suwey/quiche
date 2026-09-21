@@ -63,6 +63,7 @@ use crate::relay::PacketRelay;
 use crate::relay::StreamRelay;
 use crate::transport::reality_server::PrefixStream;
 use crate::transport::reality_server::RealityPeek;
+use crate::transport::reality_server::BorrowedServerHello;
 use crate::transport::reality_server::RealityServer;
 use crate::transport::ws::compute_accept;
 use crate::transport::ws::header_value;
@@ -459,9 +460,17 @@ enum TlsMode {
     None,
     Cert(Arc<SslContext>),
     /// Authenticated REALITY: the server (builds the per-connection SSL),
-    /// this connection's AuthKey (drives the one-time certificate) and the
-    /// consumed ClientHello prefix to replay into `SSL_accept`.
-    Reality(Arc<RealityServer>, [u8; 32], Vec<u8>),
+    /// this connection's AuthKey (drives the one-time certificate), the
+    /// consumed ClientHello prefix to replay into `SSL_accept`, and — when
+    /// the destination site answered the mirrored ClientHello with a usable
+    /// TLS 1.3 ServerHello — the borrowed handshake parameters (xtls/reality
+    /// ServerHello borrowing). `None` keeps boring's own selection.
+    Reality(
+        Arc<RealityServer>,
+        [u8; 32],
+        Vec<u8>,
+        Option<BorrowedServerHello>,
+    ),
 }
 
 // ---------------------------------------------------------------------------
@@ -1259,12 +1268,15 @@ fn handle_vless_conn(
             tls13 = stream.ssl().version2() == Some(SslVersion::TLS1_3);
             Box::new(stream)
         },
-        TlsMode::Reality(server, auth_key, prefix) => {
+        TlsMode::Reality(server, auth_key, prefix, borrowed) => {
             // The ClientHello was authenticated pre-handshake
             // (RealityServer::authenticate); finish a standard TLS 1.3
             // accept over the replayed prefix with the one-time
-            // HMAC-signed Ed25519 certificate for this AuthKey.
-            let ssl = match server.new_ssl() {
+            // HMAC-signed Ed25519 certificate for this AuthKey. When the
+            // ServerHello borrow succeeded, the SSL is pinned to the
+            // destination site's key-share group and cipher suite so the
+            // handshake's visible parameters match the camouflage site.
+            let ssl = match server.new_ssl(borrowed.as_ref()) {
                 Ok(s) => s,
                 Err(e) => {
                     log::warn!("vless inbound: reality SSL from {peer} failed: {e}");
@@ -1592,16 +1604,27 @@ impl VlessInbound {
                             Ok(RealityPeek::Authenticated {
                                 auth_key,
                                 prefix,
+                                borrow_ctx,
                             }) => {
                                 log::debug!(
                                     "vless inbound: REALITY client from {peer}"
                                 );
+                                // ServerHello borrow attempt: mirror the
+                                // ClientHello to the real destination and
+                                // adopt its handshake parameters; degrade
+                                // to the local handshake when unusable.
+                                let borrowed = server
+                                    .borrow_server_hello(&prefix, &borrow_ctx)
+                                    .await;
                                 tokio::task::spawn_blocking(move || {
                                     handle_vless_conn(
                                         tcp,
                                         peer,
                                         TlsMode::Reality(
-                                            server, auth_key, prefix,
+                                            server,
+                                            auth_key,
+                                            prefix,
+                                            borrowed,
                                         ),
                                         ws,
                                         uuids,

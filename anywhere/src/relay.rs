@@ -520,7 +520,8 @@ async fn copy_packets_one_way(
             },
             Ok(Ok((0, _))) => break,
             Ok(Ok((n, dest))) => {
-                if dst.write_packet(&buf[..n], &dest).await.is_err() {
+                if let Err(e) = dst.write_packet(&buf[..n], &dest).await {
+                    log::debug!("packet relay: dst write error: {e}");
                     break;
                 }
             },

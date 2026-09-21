@@ -4,6 +4,12 @@
 # （签名值 = HMAC-SHA512(AuthKey, 公钥)），未通过认证的连接透明转发到
 # dest 伪装站，探测者看到的是真网站。客户端必须带 flow = "xtls-rprx-vision"。
 #
+# ServerHello 借用（对齐 xtls/reality）：认证通过的连接会把镜像的
+# ClientHello 发给 dest，借用真实站点 ServerHello 的 key-share 组与密码
+# 套件来完成握手——可见握手参数与伪装站一致。dest 必须是支持 TLS 1.3
+# 的站点；不可达/行为异常时自动降级为本地握手，服务不中断（每个连接
+# 会因此多一次到 dest 的拨号，与 xray/utls 相同）。
+#
 # 密钥生成（x25519 私钥/公钥对；有 xray 时直接 `xray x25519` 即可，其输出
 # 的 "Private key"/"Public key" 就是下面两个字段要的 base64url 值）。
 # openssl 等价写法：
@@ -62,6 +68,8 @@ server_names = ["www.example.com"]
 # X25519 私钥，base64url（xray privateKey；生成方式见文件头注释）。
 private_key = ""
 # 允许的 short_id（xray shortIds，hex，每条 ≤ 8 字节；"" 为全零 id）。
+# 可整体省略：缺省 = 只接受全零 short_id（sing-box 行为，客户端不填
+# short_id 时发的就是全零）。
 short_ids = ["", "0123abcd"]
 # session_id 时间窗（毫秒）；0/缺省 = 不校验（xray 默认）。建议 60000。
 max_time_diff_ms = 60000

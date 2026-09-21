@@ -11,6 +11,7 @@ use crate::relay::StreamRelay;
 pub mod anytls;
 pub mod mless;
 pub mod quic;
+pub mod shadowsocks;
 pub mod socks5;
 pub mod tun;
 pub mod vless;

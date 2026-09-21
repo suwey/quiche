@@ -530,6 +530,15 @@ fn ensure_patches_applied(config: &Config) -> io::Result<()> {
     println!("cargo:warning=applying REALITY server signature algorithm patch to boringssl");
     apply_patch(config, "reality-server-sigalg.patch")?;
 
+    // REALITY ServerHello borrowing hook: lets a REALITY server pin the
+    // ServerHello's key-share group and cipher suite to the destination
+    // site's choices (xtls/reality borrows the destination's ServerHello so
+    // the handshake's visible parameters match the camouflage site). Opt-in
+    // per SSL; every other handshake keeps boring's own selection. Always
+    // applied in this vendored copy.
+    println!("cargo:warning=applying REALITY ServerHello borrow patch to boringssl");
+    apply_patch(config, "reality-server-sh-borrow.patch")?;
+
     Ok(())
 }
 
