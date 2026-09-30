@@ -738,6 +738,7 @@ export class TlsClient {
 	private async handshakeTls12(reader: ReadableStreamDefaultReader<Uint8Array>, writer: WritableStreamDefaultWriter<Uint8Array>): Promise<void> {
 		let serverKeyExchange: ServerKeyExchangeParsed | null = null;
 		let sawServerHelloDone = false;
+		let clientCertRequested = false;
 		await this.readHandshakeUntil(reader, async (message) => {
 			switch (message.type) {
 				case HANDSHAKE_TYPE_CERTIFICATE: {
@@ -756,7 +757,9 @@ export class TlsClient {
 					sawServerHelloDone = true;
 					return true;
 				case HANDSHAKE_TYPE_CERTIFICATE_REQUEST:
-					throw new Error('Client certificate is not supported');
+					this.recordHandshake(message.raw);
+					clientCertRequested = true;
+					break;
 				default:
 					this.recordHandshake(message.raw);
 			}
@@ -771,6 +774,11 @@ export class TlsClient {
 		if (!keyShare) throw new Error(`Missing key pair for curve: 0x${ske.namedCurve.toString(16)}`);
 		const preMaster = await deriveSharedSecret(keyShare.keyPair.privateKey, ske.serverPublicKey, curveName);
 		const cke = buildHandshakeMessage(HANDSHAKE_TYPE_CLIENT_KEY_EXCHANGE, tlsBytes(keyShare.publicKeyRaw.length, keyShare.publicKeyRaw));
+		if (clientCertRequested) {
+			const emptyCertificate = buildHandshakeMessage(HANDSHAKE_TYPE_CERTIFICATE, tlsBytes(0, 0, 0));
+			this.recordHandshake(emptyCertificate);
+			await writer.write(buildTlsRecord(CONTENT_TYPE_HANDSHAKE, emptyCertificate));
+		}
 		this.recordHandshake(cke);
 		const cfg = this.cipherConfig;
 		if (!cfg || !this.serverRandom) throw new Error('TLS 1.2 missing parameters');
@@ -837,6 +845,7 @@ export class TlsClient {
 		}
 		const serverFinishedKey = await hkdfExpandLabel(hashName, sHsTraffic, 'finished', EMPTY_BYTES, hashLen);
 		let serverFinishedReceived = false;
+		let clientCertRequested = false;
 		const handleHandshakeMessage = async (message: HandshakeMessage): Promise<void> => {
 			switch (message.type) {
 				case HANDSHAKE_TYPE_ENCRYPTED_EXTENSIONS: {
@@ -853,7 +862,9 @@ export class TlsClient {
 					break;
 				}
 				case HANDSHAKE_TYPE_CERTIFICATE_REQUEST:
-					throw new Error('Client certificate is not supported');
+					this.recordHandshake(message.raw);
+					clientCertRequested = true;
+					break;
 				case HANDSHAKE_TYPE_CERTIFICATE_VERIFY:
 					this.recordHandshake(message.raw);
 					break;
@@ -896,11 +907,16 @@ export class TlsClient {
 		if (!cfg.chacha) {
 			[this.clientAppCryptoKey, this.serverAppCryptoKey] = await Promise.all([importAesGcmKey(this.clientAppKey, ['encrypt']), importAesGcmKey(this.serverAppKey, ['decrypt'])]);
 		}
+		let clientFlightHandshake: Uint8Array = EMPTY_BYTES;
+		if (clientCertRequested) {
+			clientFlightHandshake = buildHandshakeMessage(HANDSHAKE_TYPE_CERTIFICATE, tlsBytes(0, 0, 0, 0));
+			this.recordHandshake(clientFlightHandshake);
+		}
 		const clientFinishedKey = await hkdfExpandLabel(hashName, cHsTraffic, 'finished', EMPTY_BYTES, hashLen);
 		const clientVerify = await hmac(hashName, clientFinishedKey, await digestBytes(hashName, this.transcript()));
 		const clientFinishedMessage = buildHandshakeMessage(HANDSHAKE_TYPE_FINISHED, clientVerify);
 		this.recordHandshake(clientFinishedMessage);
-		await writer.write(buildTlsRecord(CONTENT_TYPE_APPLICATION_DATA, await this.encryptTls13Handshake(concatBytes(clientFinishedMessage, new Uint8Array([CONTENT_TYPE_HANDSHAKE])))));
+		await writer.write(buildTlsRecord(CONTENT_TYPE_APPLICATION_DATA, await this.encryptTls13Handshake(concatBytes(clientFlightHandshake, clientFinishedMessage, new Uint8Array([CONTENT_TYPE_HANDSHAKE])))));
 		this.clientSeqNum = 0n;
 		this.serverSeqNum = 0n;
 	}

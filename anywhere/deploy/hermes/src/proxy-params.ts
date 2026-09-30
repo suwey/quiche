@@ -12,7 +12,7 @@ export async function 反代参数获取(url: URL, uuid: string): Promise<void> 
 	const 链式代理路径匹配 = pathname.match(/\/video\/(.+)$/i);
 	if (链式代理路径匹配) {
 		try {
-			const 链式代理明文 = base64SecretDecode(链式代理路径匹配[1], uuid);
+			const 链式代理明文 = base64SecretDecode(链式代理路径匹配[1].replace(/\/+$/, ''), uuid);
 			const parsed = JSON.parse(链式代理明文) as { type?: string; username?: string; password?: string; hostname?: string; port?: number | string };
 			const { type, username, password, hostname, port } = parsed;
 			if (!type || !反代协议默认端口[String(type).toLowerCase()]) throw new Error('链式代理类型无效');

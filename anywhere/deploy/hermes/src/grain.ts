@@ -1,6 +1,6 @@
-// 下行 Grain 发送器：批量合包 + microtask/timer flush。
+// 下行 Grain 发送器 + 上行 Grain 合包流：批量合包 + microtask/timer flush。
 
-import { 下行Grain包字节, 下行Grain尾部阈值, 下行Grain静默毫秒 } from './state';
+import { 下行Grain包字节, 下行Grain尾部阈值, 下行Grain静默毫秒, 上行合包目标字节 } from './state';
 import { 数据转Uint8Array, WebSocket发送并等待, closeSocketQuietly } from './utils';
 
 interface SocketLikeSend {
@@ -118,5 +118,93 @@ export function 创建下行Grain发送器(webSocket: SocketLikeSend, headerData
 			}
 		},
 		flush,
+	};
+}
+
+/** 上行合包流（对齐上游 2026-08-11）：小块合并到目标字节再写，pipeTo 直通 socket.writable。 */
+export interface 上行Grain合包流 {
+	readable: ReadableStream<Uint8Array>;
+	写入(chunk: Uint8Array | ArrayBuffer | ArrayBufferView): Promise<void>;
+	结束(): Promise<void>;
+}
+
+export function 创建上行Grain合包流(目标字节: number = 上行合包目标字节): 上行Grain合包流 {
+	const identity = typeof IdentityTransformStream !== 'undefined'
+		? new IdentityTransformStream()
+		: new TransformStream<Uint8Array, Uint8Array>();
+	const writer = identity.writable.getWriter();
+	const 缓冲 = new Uint8Array(目标字节);
+	let 缓冲长度 = 0;
+	let 定时器: ReturnType<typeof setTimeout> | null = null;
+	let 在途写: Promise<void> | null = null;
+	let 冲刷链: Promise<void> = Promise.resolve();
+
+	const 清理定时器 = (): void => {
+		if (定时器) {
+			clearTimeout(定时器);
+			定时器 = null;
+		}
+	};
+
+	const 串行写 = async (chunk: Uint8Array): Promise<void> => {
+		if (在途写) await 在途写;
+		在途写 = writer.write(chunk);
+		try { await 在途写; } finally { 在途写 = null; }
+	};
+
+	const 冲刷 = async (): Promise<void> => {
+		if (缓冲长度) {
+			const chunk = 缓冲.slice(0, 缓冲长度);
+			缓冲长度 = 0;
+			await 串行写(chunk);
+		}
+	};
+
+	const 排队冲刷 = (): void => {
+		冲刷链 = 冲刷链.then(() => 冲刷()).catch(() => { /* ignore */ });
+	};
+
+	const 启动定时器 = (): void => {
+		if (定时器) return;
+		定时器 = setTimeout(() => {
+			定时器 = null;
+			排队冲刷();
+		}, 1);
+	};
+
+	return {
+		readable: identity.readable,
+		async 写入(chunk) {
+			const data = 数据转Uint8Array(chunk);
+			if (!data.byteLength) return;
+			if (data.byteLength >= 目标字节) {
+				清理定时器();
+				if (缓冲长度) await 冲刷();
+				await 串行写(data);
+				return;
+			}
+			if (缓冲长度 + data.byteLength >= 目标字节) {
+				const output = new Uint8Array(缓冲长度 + data.byteLength);
+				output.set(缓冲.subarray(0, 缓冲长度), 0);
+				output.set(data, 缓冲长度);
+				缓冲长度 = 0;
+				清理定时器();
+				await 串行写(output);
+			} else {
+				缓冲.set(data, 缓冲长度);
+				缓冲长度 += data.byteLength;
+				启动定时器();
+			}
+		},
+		async 结束() {
+			清理定时器();
+			try {
+				await 冲刷链;
+				await 冲刷();
+				await writer.close();
+			} finally {
+				try { writer.releaseLock(); } catch { /* ignore */ }
+			}
+		},
 	};
 }

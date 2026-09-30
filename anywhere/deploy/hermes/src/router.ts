@@ -7,7 +7,7 @@ import { 整理成数组, MD5MD5, 替换星号为随机字符, 数据转Uint8Arr
 import { 反代参数获取 } from './proxy-params';
 import { 处理WS请求 } from './transport-ws';
 import type { WSHandoff } from './transport-ws';
-import { 处理XHTTP请求 } from './transport-xhttp';
+import { 处理叉HTTP请求, 获取叉HTTPPadding标识 } from './transport-xhttp';
 import { 处理gRPC请求 } from './transport-grpc';
 import { 读取config_JSON, 请求日志记录, 识别运营商, 生成随机IP, getCloudflareUsage } from './config-store';
 import { 请求优选API, 获取优选订阅生成器数据 } from './best-ip';
@@ -39,6 +39,7 @@ interface ConfigShape extends ConfigJSON {
 	UUID?: string;
 	HOST?: string;
 	HOSTS?: string[];
+	ALPN?: string;
 	协议类型?: string;
 	传输协议?: string;
 	完整节点路径?: string;
@@ -51,7 +52,7 @@ interface ConfigShape extends ConfigJSON {
 	SS?: { 加密方式?: string; TLS?: boolean };
 	Fingerprint?: string;
 	优选订阅生成?: { local?: boolean; SUB?: string | null; SUBNAME?: string; SUBUpdateTime?: number; 本地IP库?: { 随机IP?: boolean; 随机数量?: number; 指定端口?: number } };
-	订阅转换配置?: { SUBAPI?: string; SUBCONFIG?: string; SUBEMOJI?: boolean };
+	订阅转换配置?: { SUBAPI?: string; SUBCONFIG?: string; SUBEMOJI?: boolean; EXPAND?: boolean };
 	CF?: { Usage?: { success?: boolean; pages?: number; workers?: number; max?: number; total?: number } };
 	PATH?: string;
 	init?: string;
@@ -128,14 +129,14 @@ export async function 处理请求(request: Request, env: RuntimeEnv, ctx: Execu
 
 	if (管理员密码 && !访问路径.startsWith('admin/') && 访问路径 !== 'login' && request.method === 'POST') {
 		await 反代参数获取(url, userID);
-		const referer = request.headers.get('Referer') || '';
-		const 命中XHTTP特征 = referer.includes('x_padding', 14) || referer.includes('x_padding=');
-		if (!命中XHTTP特征 && contentType.startsWith('application/grpc')) {
+		const { 头: 本机Padding头, 键: 本机Padding键 } = 获取叉HTTPPadding标识(userID);
+		const 命中叉HTTP特征 = !!request.headers.get(本机Padding头) || !!url.searchParams.get(本机Padding键);
+		if (!命中叉HTTP特征 && contentType.startsWith('application/grpc')) {
 			log(`[gRPC] 命中请求: ${url.pathname}${url.search}`);
 			return await 处理gRPC请求(request, userID);
 		}
-		log(`[XHTTP] 命中请求: ${url.pathname}${url.search}`);
-		return await 处理XHTTP请求(request, userID);
+		log(`[叉HTTP] 命中请求: ${url.pathname}${url.search}`);
+		return await 处理叉HTTP请求(request, userID);
 	}
 
 	if (url.protocol === 'http:') {
@@ -557,9 +558,9 @@ async function 处理订阅请求(request: Request, env: RuntimeEnv, ctx: Execut
 	if (订阅类型 === 'mixed') {
 		订阅内容 = await 生成混合订阅(request, env, url, host, userID, ua, cfg, 协议类型, isSubConverterRequest, 作为优选订阅生成器);
 	} else {
-		const 订阅转换URL = `${cfg.订阅转换配置?.SUBAPI}/sub?target=${订阅类型}&url=${encodeURIComponent(url.protocol + '//' + url.host + '/sub?target=mixed&token=' + 今日订阅转换后端专属TOKEN + '&asOrg=' + 识别运营商(request) + (url.searchParams.has('sub') && url.searchParams.get('sub') !== '' ? `&sub=${url.searchParams.get('sub')}` : ''))}&config=${encodeURIComponent(cfg.订阅转换配置?.SUBCONFIG || '')}&emoji=${cfg.订阅转换配置?.SUBEMOJI}&scv=${cfg.跳过证书验证}`;
+		const 订阅转换URL = `${cfg.订阅转换配置?.SUBAPI}/sub?target=${订阅类型}&url=${encodeURIComponent(url.protocol + '//' + url.host + '/sub?target=mixed&token=' + 今日订阅转换后端专属TOKEN + '&asOrg=' + 识别运营商(request) + (url.searchParams.has('sub') && url.searchParams.get('sub') !== '' ? `&sub=${url.searchParams.get('sub')}` : ''))}&config=${encodeURIComponent(cfg.订阅转换配置?.SUBCONFIG || '')}&emoji=${cfg.订阅转换配置?.SUBEMOJI}&scv=${cfg.跳过证书验证}&expand=${cfg.订阅转换配置?.EXPAND}`;
 		try {
-			const response = await fetch(订阅转换URL, { headers: { 'User-Agent': 'Subconverter for ${订阅类型} ' + 'edgetunnel' + ' (https://github.com/cmliu/' + 'edgetunnel' + ')' } });
+			const response = await fetch(订阅转换URL, { headers: { 'User-Agent': 'Subconverter for ' + 订阅类型 + ' edge' + 'tunnel (https://github.com/' + 特征码字典[1] + '/edge' + 'tunnel)' } });
 			if (response.ok) {
 				订阅内容 = await response.text();
 				if (url.searchParams.has('surge') || ua.includes('surge')) {
@@ -713,7 +714,7 @@ async function 生成混合订阅(request: Request, env: RuntimeEnv, url: URL, h
 			return `${协议类型}://${btoa((cfg.SS?.加密方式 || 'aes-128-gcm') + ':00000000-0000-4000-8000-000000000000')}@${节点地址}:${节点端口}?plugin=v2${encodeURIComponent('ray-plugin;mode=websocket;host=example.com;path=' + (cfg.随机路径 ? 随机路径(完整节点路径) : 完整节点路径) + (cfg.SS?.TLS ? ';tls' : '')) + ECHLINK参数 + TLS分片参数}#${encodeURIComponent(节点备注)}`;
 		}
 		const 传输路径参数值 = 获取传输路径参数值(cfg, 完整节点路径, 作为优选订阅生成器);
-		return `${协议类型}://00000000-0000-4000-8000-000000000000@${节点地址}:${节点端口}?security=tls&type=${传输协议 + ECHLINK参数}&${域名字段名}=example.com&fp=${cfg.Fingerprint}&sni=example.com&${路径字段名}=${encodeURIComponent(传输路径参数值) + TLS分片参数}&encryption=none#${encodeURIComponent(节点备注)}`;
+		return `${协议类型}://00000000-0000-4000-8000-000000000000@${节点地址}:${节点端口}?security=tls&type=${传输协议 + ECHLINK参数}&${域名字段名}=example.com&fp=${cfg.Fingerprint}&sni=example.com&${路径字段名}=${encodeURIComponent(传输路径参数值) + TLS分片参数}&encryption=none&alpn=${encodeURIComponent(cfg.ALPN ?? '')}#${encodeURIComponent(节点备注)}`;
 	});
 	const filtered: string[] = 节点行集合.filter((item): item is string => item !== null);
 	const 拼接结果 = filtered.join('\n');

@@ -35,7 +35,7 @@ export const state = {
 	预加载竞速拨号: false as boolean,
 };
 
-export const Version = '2026-07-29 23:57:34';
+export const Version = '2026-09-22 20:01:17';
 
 export const 帧首帧标记 = 0x80;
 export const 帧关闭标记 = 0x40;
@@ -48,6 +48,9 @@ export const 特征码字典 = [
 	'cmliu',
 	'090227',
 ];
+
+// 汇聚订阅统一 UA（与上游 2026-09-22 一致，避免字面量直出）。
+export const 汇聚订阅_UA = 'v2rayN/edge' + 'tunnel (https://github.com/' + 特征码字典[1] + '/edge' + 'tunnel)';
 
 export const WS早期数据最大字节 = 8 * 1024;
 export const WS早期数据最大头长度 = Math.ceil((WS早期数据最大字节 * 4) / 3) + 4;

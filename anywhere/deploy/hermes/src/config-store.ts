@@ -32,6 +32,7 @@ interface FullConfig extends ConfigJSON {
 	HOSTS?: string[];
 	UUID?: string;
 	PATH?: string;
+	ALPN?: string;
 	协议类型?: string;
 	传输协议?: string;
 	gRPC模式?: string;
@@ -56,7 +57,7 @@ interface FullConfig extends ConfigJSON {
 		SUBUpdateTime?: number;
 		TOKEN?: string;
 	};
-	订阅转换配置?: { SUBAPI?: string; SUBCONFIG?: string; SUBEMOJI?: boolean };
+	订阅转换配置?: { SUBAPI?: string; SUBCONFIG?: string; SUBEMOJI?: boolean; EXPAND?: boolean };
 	反代?: 反代SubObj;
 	TG?: { 启用?: boolean; BotToken?: unknown; ChatID?: unknown };
 	CF?: {
@@ -156,6 +157,7 @@ export async function 读取config_JSON(env: RuntimeEnv, hostname: string, userI
 		HOSTS: [hostname],
 		UUID: userID,
 		PATH: '/',
+		ALPN: '',
 		协议类型: 'vless',
 		传输协议: 'ws',
 		gRPC模式: 'gun',
@@ -180,6 +182,7 @@ export async function 读取config_JSON(env: RuntimeEnv, hostname: string, userI
 			SUBAPI: 'https://SUBAPI.cmliussss.net',
 			SUBCONFIG: 'https://raw.githubusercontent.com/cmliu/ACL4SSR/refs/heads/main/Clash/config/ACL4SSR_Online_Mini_MultiMode_CF.ini',
 			SUBEMOJI: false,
+			EXPAND: true, // 展开规则全文
 		},
 		反代: {
 			[_p]: 'auto',
@@ -224,6 +227,7 @@ export async function 读取config_JSON(env: RuntimeEnv, hostname: string, userI
 	}
 	state.config_JSON = cfg as ConfigJSON;
 
+	if (typeof cfg.订阅转换配置?.EXPAND !== 'boolean') (cfg.订阅转换配置 ||= {}).EXPAND = true;
 	if (!cfg.gRPCUserAgent) cfg.gRPCUserAgent = UA;
 	cfg.HOST = host;
 	if (!cfg.HOSTS) cfg.HOSTS = [hostname];
@@ -234,6 +238,7 @@ export async function 读取config_JSON(env: RuntimeEnv, hostname: string, userI
 
 	if (env.PATH) cfg.PATH = env.PATH.startsWith('/') ? env.PATH : '/' + env.PATH;
 	else if (!cfg.PATH) cfg.PATH = '/';
+	if (!cfg.ALPN) cfg.ALPN = '';
 
 	if (!cfg.gRPC模式) cfg.gRPC模式 = 'gun';
 	if (!cfg.SS) cfg.SS = { 加密方式: 'aes-128-gcm', TLS: false };

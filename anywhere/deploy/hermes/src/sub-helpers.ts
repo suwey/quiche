@@ -1,5 +1,6 @@
 // 订阅链接里要用到的两个共享小工具：传输协议字段名 + 路径参数值。
 
+import { 获取叉HTTPPadding标识 } from './transport-xhttp';
 import { 随机路径 } from './utils';
 
 export interface 传输协议Info {
@@ -8,17 +9,25 @@ export interface 传输协议Info {
 	域名字段名: string;
 }
 
-export function 获取传输协议配置(配置: { 传输协议?: string; gRPC模式?: string; XHTTP模式?: string } = {}): 传输协议Info {
+export function 获取传输协议配置(配置: { UUID?: string; 传输协议?: string; gRPC模式?: string } = {}): 传输协议Info {
 	const 是gRPC = 配置.传输协议 === 'grpc';
-	const 是XHTTP = 配置.传输协议 === 'xhttp';
-	// XHTTP 模式: stream-one (默认) / stream-up / packet-up
-	const xhttpMode = 配置.XHTTP模式 || 'stream-one';
+	// XHTTP 混淆参数（对齐上游 2026-08-10）：tokenish padding + queryInHeader 携带，stream-one 模式。
+	let xhttpType: string | null = null;
+	if (配置.传输协议 === 'xhttp') {
+		const { 头: 本机Padding头, 键: 本机Padding键 } = 获取叉HTTPPadding标识(配置.UUID || '');
+		const 叉混淆JSON = {
+			xPaddingObfsMode: true,
+			xPaddingMethod: 'tokenish',
+			xPaddingPlacement: 'queryInHeader',
+			xPaddingHeader: 本机Padding头,
+			xPaddingKey: 本机Padding键,
+		};
+		xhttpType = `xhttp&mode=stream-one&extra=${encodeURIComponent(JSON.stringify(叉混淆JSON))}`;
+	}
 	return {
 		type: 是gRPC
 			? (配置.gRPC模式 === 'multi' ? 'grpc&mode=multi' : 'grpc&mode=gun')
-			: 是XHTTP
-				? `xhttp&mode=${xhttpMode}`
-				: 'ws',
+			: (xhttpType ?? 'ws'),
 		路径字段名: 是gRPC ? 'serviceName' : 'path',
 		域名字段名: 是gRPC ? 'authority' : 'host',
 	};

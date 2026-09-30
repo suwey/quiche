@@ -172,7 +172,8 @@ export async function forwardataTCP(
 	yourUUID: string,
 	request: Request | null = null,
 	tcpConnector: TCPConnector | null = null,
-): Promise<void> {
+	仅建立连接 = false,
+): Promise<TCPSocket | null> {
 	const 反代IP = state.反代IP;
 	const 启用SOCKS5反代 = state.启用SOCKS5反代;
 	const 启用SOCKS5全局反代 = state.启用SOCKS5全局反代;
@@ -417,6 +418,10 @@ export async function forwardataTCP(
 			if (本次发送首包) 已通过代理发送首包 = true;
 			remoteConnWrapper.socket = newSocket;
 
+			// 仅建立连接模式（XHTTP pipe 直通）：建连并写入首包后直接交还 socket，
+			// 下行由调用方 pipeTo；跳过 connectStreams 的拉黑/重试检测。
+			if (仅建立连接) return { 需要重试: false };
+
 			let proxy被拒绝 = false;
 			let onProxyFailure: (() => void) | null = null;
 			if (proxyKey !== null && 走PROXYIP) {
@@ -461,6 +466,7 @@ export async function forwardataTCP(
 		log(`[TCP转发] 启用 SOCKS5/HTTP/HTTPS/TURN/SSTP 全局代理`);
 		try {
 			await connecttoPry();
+			if (仅建立连接) return remoteConnWrapper.socket;
 		} catch (err) {
 			log(`[TCP转发] SOCKS5/HTTP/HTTPS/TURN/SSTP 代理连接失败: ${(err as { message?: string })?.message ?? err}`);
 			throw err;
@@ -472,6 +478,7 @@ export async function forwardataTCP(
 			log(`[TCP转发] 尝试直连到: ${host}:${portNum}`);
 			const initialSocket = await connectDirect(host, portNum, rawData, true);
 			remoteConnWrapper.socket = initialSocket;
+			if (仅建立连接) return initialSocket;
 			await connectStreams(initialSocket, ws, respHeader, async () => {
 				if (remoteConnWrapper.socket !== initialSocket) return;
 				if (有PROXYIP) await connecttoPry();
@@ -482,9 +489,13 @@ export async function forwardataTCP(
 				closeSocketQuietly(ws as unknown as { readyState?: number; close?: () => void });
 				throw err;
 			}
-			if (有PROXYIP) await connecttoPry();
+			if (有PROXYIP) {
+				await connecttoPry();
+				if (仅建立连接) return remoteConnWrapper.socket;
+			}
 		}
 	}
+	return null;
 }
 
 export { 创建上行写入队列 } from './uplink-queue';

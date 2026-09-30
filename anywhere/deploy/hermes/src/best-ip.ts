@@ -1,6 +1,7 @@
 // 优选订阅生成器拉取 + 优选 API 多源解析。
 
 import { TOKENS } from './tokens';
+import { 汇聚订阅_UA } from './state';
 const 优选IP_IPV6_PATTERN = /^[^\[\]]*:[^\[\]]*:[^\[\]]/;
 
 export interface 优选API结果 {
@@ -27,7 +28,7 @@ export async function 获取优选订阅生成器数据(优选订阅生成器HOS
 	const 优选订阅生成器URL = `${格式化HOST}/sub?host=example.com&uuid=00000000-0000-4000-8000-000000000000`;
 
 	try {
-		const response = await fetch(优选订阅生成器URL, { headers: { 'User-Agent': 'v2rayN/edgetunnel (https://github.com/cmliu/edgetunnel)' } });
+		const response = await fetch(优选订阅生成器URL, { headers: { 'User-Agent': 汇聚订阅_UA } });
 		if (!response.ok) {
 			优选IP.push(`127.0.0.1:1234#${优选订阅生成器HOST}优选订阅生成器异常:${response.statusText}`);
 			return [优选IP, 其他节点LINK];
@@ -102,7 +103,7 @@ export async function 请求优选API(urls: string[], 默认端口: string | num
 		try {
 			const controller = new AbortController();
 			const timeoutId = setTimeout(() => controller.abort(), 超时时间);
-			const response = await fetch(urlWithoutHash, { signal: controller.signal });
+			const response = await fetch(urlWithoutHash, { signal: controller.signal, headers: { 'User-Agent': 汇聚订阅_UA } });
 			clearTimeout(timeoutId);
 			let text = '';
 			try {

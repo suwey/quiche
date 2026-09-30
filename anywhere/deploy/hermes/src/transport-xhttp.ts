@@ -1,24 +1,105 @@
-// XHTTP 传输：可插拔架构（M5 重写）
-//
-// 使用与 WebSocket 相同的 mless 帧协议（stream_id + flags + encrypted payload），
-// 通过 HTTP POST body 上行、HTTP response body 下行。
-//
-// 可插拔层：
-// - ProtocolHandler: VLESS / Trojan 首包解析
-// - CryptoHandler: AheadXor (SHA-256 CTR XOR) / None
-// - ObfuscationHandler: XPadding 校验/生成 / None
+// XHTTP 传输（标准协议，对齐上游 2026-09-22）：
+// VLESS/Trojan 首包 + XPadding 混淆（tokenish/queryInHeader），
+// TCP: request.body → 上行合包流 → socket.writable 直通，socket.readable → IdentityTransformStream 下行直通；
+// UDP: 独立分支（Trojan UDP + DNS 转发）。mless 帧协议只保留在 WebSocket 传输。
 
-import { log } from './state';
-import { 帧首帧标记, 帧关闭标记 } from './state';
-import { TOKENS } from './tokens';
-import { 数据转Uint8Array, 有效数据长度, isSpeedTestSite, sha224, closeSocketQuietly, 编码帧, 解码Varint, 拼接字节数据 } from './utils';
+import { log, state } from './state';
+import { 数据转Uint8Array, 有效数据长度, isSpeedTestSite, sha224, closeSocketQuietly } from './utils';
 import { UUID字节匹配, BLESS文本解码器 } from './protocol';
-import { 创建上行写入队列, forwardataTCP, forwardataudp, 转发木马UDP数据 } from './forward';
+import { forwardataTCP, forwardataudp, 转发木马UDP数据 } from './forward';
 import type { RemoteConnWrapper } from './forward';
 import type { TCPSocket } from './types';
+import { 创建上行Grain合包流 } from './grain';
 
 // ---------------------------------------------------------------------------
-// Types
+// XPadding 混淆（对齐上游：per-UUID 头/键 + HPACK Huffman 长度校验）
+// ---------------------------------------------------------------------------
+
+const HPACKHuffman码长 = [
+	13, 23, 28, 28, 28, 28, 28, 28, 28, 24, 30, 28, 28, 30, 28, 28,
+	28, 28, 28, 28, 28, 28, 30, 28, 28, 28, 28, 28, 28, 28, 28, 28,
+	6, 10, 10, 12, 13, 6, 8, 11, 10, 10, 8, 11, 8, 6, 6, 6,
+	5, 5, 5, 6, 6, 6, 6, 6, 6, 6, 7, 8, 15, 6, 12, 10,
+	13, 6, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
+	7, 7, 7, 7, 7, 7, 7, 7, 8, 7, 8, 13, 19, 13, 14, 6,
+	15, 5, 6, 5, 6, 5, 6, 6, 6, 5, 7, 7, 6, 6, 6, 5,
+	6, 7, 6, 5, 5, 6, 7, 7, 7, 7, 7, 15, 11, 14, 13, 28,
+	20, 22, 20, 20, 22, 22, 22, 23, 22, 23, 23, 23, 23, 23, 24, 23,
+	24, 24, 22, 23, 24, 23, 23, 23, 23, 21, 22, 23, 22, 23, 23, 24,
+	22, 21, 20, 22, 22, 23, 23, 21, 23, 22, 22, 24, 21, 22, 23, 23,
+	21, 21, 22, 21, 23, 22, 23, 23, 20, 22, 22, 22, 23, 22, 22, 23,
+	26, 26, 20, 19, 22, 23, 22, 25, 26, 26, 26, 27, 27, 26, 24, 25,
+	19, 21, 26, 27, 27, 26, 27, 24, 21, 21, 26, 26, 28, 27, 27, 27,
+	20, 24, 20, 21, 22, 21, 21, 23, 22, 22, 25, 25, 24, 24, 26, 23,
+	26, 27, 26, 26, 27, 27, 27, 27, 27, 28, 27, 27, 27, 27, 27, 26,
+	30,
+];
+
+/** 由 UUID 派生本机 XPadding 请求头名与查询参数键。 */
+export function 获取叉HTTPPadding标识(yourUUID: string): { 头: string; 键: string } {
+	return { 头: yourUUID.slice(1, 7), 键: '_' + yourUUID.slice(25, 31) };
+}
+
+function 计算HPACKHuffman字节长度(字符串: string): number {
+	const 字节 = new TextEncoder().encode(字符串);
+	let 总位数 = 0;
+	for (let i = 0; i < 字节.length; i++) {
+		总位数 += HPACKHuffman码长[字节[i]];
+	}
+	return Math.ceil(总位数 / 8);
+}
+
+function 提取叉HTTPPadding值(request: Request, 本机Padding头: string, 本机Padding键: string): string {
+	const 头值 = request.headers.get(本机Padding头);
+	if (头值) {
+		try {
+			const 解析URL = new URL(头值, 'https://x.invalid');
+			const 查询值 = 解析URL.searchParams.get(本机Padding键);
+			if (查询值) return 查询值;
+		} catch { /* 非法头值，按原值处理 */ }
+		return 头值;
+	}
+	const 请求URL = new URL(request.url);
+	return 请求URL.searchParams.get(本机Padding键) || '';
+}
+
+function 校验叉HTTPPadding(request: Request, 本机Padding头: string, 本机Padding键: string): boolean {
+	const padding值 = 提取叉HTTPPadding值(request, 本机Padding头, 本机Padding键);
+	if (!padding值) return true;
+	const huffman长度 = 计算HPACKHuffman字节长度(padding值);
+	return huffman长度 >= 98 && huffman长度 <= 1002;
+}
+
+const 叉HTTPBase62字符集 = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
+
+function 生成叉HTTPPadding串(长度: number): string {
+	const 字符集长度 = 叉HTTPBase62字符集.length;
+	let 结果 = '';
+	for (let i = 0; i < 长度; i++) {
+		结果 += 叉HTTPBase62字符集[Math.floor(Math.random() * 字符集长度)];
+	}
+	return 结果;
+}
+
+/** 本地直出的 204 响应（测速站免出网）。 */
+function 构造本地204响应(respHeader: Uint8Array | null = null): Uint8Array {
+	const 本地204响应 = new TextEncoder().encode(
+		'HTTP/1.1 204 No Content\r\n' +
+		'Content-Length: 0\r\n' +
+		'Connection: close\r\n' +
+		'\r\n',
+	);
+	if (有效数据长度(respHeader) === 0) return 本地204响应;
+	const 协议响应头 = 数据转Uint8Array(respHeader);
+	const response = new Uint8Array(协议响应头.byteLength + 本地204响应.byteLength);
+	response.set(协议响应头, 0);
+	response.set(本地204响应, 协议响应头.byteLength);
+	log(`[TCP转发] 构造本地204响应: ${response.byteLength}B`);
+	return response;
+}
+
+// ---------------------------------------------------------------------------
+// 首包解析（VLESS / Trojan，带 need_more 增量读取）
 // ---------------------------------------------------------------------------
 
 interface XhttpFirstPacket {
@@ -31,64 +112,6 @@ interface XhttpFirstPacket {
 }
 
 type ParsePartial = { 状态: 'need_more' | 'invalid' } | { 状态: 'ok'; 结果: XhttpFirstPacket };
-
-interface ParsedFrame {
-	streamId: number;
-	flags: number;
-	payload: Uint8Array;
-}
-
-// ---------------------------------------------------------------------------
-// Pluggable interfaces
-// ---------------------------------------------------------------------------
-
-/** 协议处理器：解析首包、判断 UDP 权限 */
-interface ProtocolHandler {
-	/** 尝试解析首包 */
-	parseFirstPacket(data: Uint8Array, token: string): ParsePartial;
-	/** 是否允许 UDP */
-	isUDPAllowed(result: XhttpFirstPacket): boolean;
-}
-
-/** 加密处理器 */
-interface CryptoHandler {
-	decrypt(data: Uint8Array): Promise<Uint8Array>;
-	encrypt(data: Uint8Array): Promise<Uint8Array>;
-}
-
-/** 混淆处理器 */
-interface ObfuscationHandler {
-	/** 校验请求 padding */
-	validateRequestPadding(request: Request): boolean;
-	/** 生成响应 padding */
-	generateResponsePadding(): { header: string; value: string } | null;
-}
-
-// ---------------------------------------------------------------------------
-// Protocol handlers (reuse existing parsing logic)
-// ---------------------------------------------------------------------------
-
-class VlessHandler implements ProtocolHandler {
-	parseFirstPacket(data: Uint8Array, token: string): ParsePartial {
-		return 尝试解析魏烈思首包(data, token);
-	}
-	isUDPAllowed(result: XhttpFirstPacket): boolean {
-		return result.port === 53;
-	}
-}
-
-class TrojanHandler implements ProtocolHandler {
-	parseFirstPacket(data: Uint8Array, token: string): ParsePartial {
-		return 尝试解析木马首包(data, token);
-	}
-	isUDPAllowed(result: XhttpFirstPacket): boolean {
-		return true; // Trojan UDP 全端口允许
-	}
-}
-
-// ---------------------------------------------------------------------------
-// VLESS / Trojan first packet parsing (preserved from original)
-// ---------------------------------------------------------------------------
 
 function 尝试解析魏烈思首包(data: Uint8Array, token: string): ParsePartial {
 	const decoder = BLESS文本解码器;
@@ -209,438 +232,218 @@ function 尝试解析木马首包(data: Uint8Array, token: string): ParsePartial
 	};
 }
 
-// ---------------------------------------------------------------------------
-// Crypto handlers (extracted from WebSocketSession)
-// ---------------------------------------------------------------------------
+async function 读取叉HTTP首包(reader: ReadableStreamDefaultReader<Uint8Array>, token: string): Promise<XhttpFirstPacket | null> {
+	let buffer = new Uint8Array(1024);
+	let offset = 0;
 
-class AheadXorHandler implements CryptoHandler {
-	private key: Uint8Array;
-	private sendCounter = 0n;
-	private recvCounter = 0n;
+	const 解析当前缓冲 = (data: Uint8Array): XhttpFirstPacket | 'need_more' | null => {
+		const 木马结果 = 尝试解析木马首包(data, token);
+		if (木马结果.状态 === 'ok') return 木马结果.结果;
+		const 魏烈思结果 = 尝试解析魏烈思首包(data, token);
+		if (魏烈思结果.状态 === 'ok') return 魏烈思结果.结果;
+		if (木马结果.状态 === 'invalid' && 魏烈思结果.状态 === 'invalid') return null;
+		return 'need_more';
+	};
 
-	constructor(uuid: string) {
-		// Key = SHA-256(uuid_string || "anywhere-obfuscation-v1")
-		// Matches client's Obfuscation::new(uuid_str)
-		this.key = new Uint8Array(
-			new ArrayBuffer(0), // placeholder, set in async init
-		);
-		// Store UUID for async key derivation
-		this._uuid = uuid;
-	}
-
-	private _uuid: string;
-	private _initialized = false;
-
-	private async init(): Promise<void> {
-		if (this._initialized) return;
-		this.key = new Uint8Array(
-			await crypto.subtle.digest(
-				'SHA-256',
-				new TextEncoder().encode(this._uuid + 'anywhere-obfuscation-v1'),
-			),
-		);
-		this._initialized = true;
-	}
-
-	async decrypt(data: Uint8Array): Promise<Uint8Array> {
-		if (data.byteLength === 0) return data;
-		await this.init();
-		const counter = this.recvCounter++;
-		return this.xorWithKeystream(counter, data);
-	}
-
-	async encrypt(data: Uint8Array): Promise<Uint8Array> {
-		if (data.byteLength === 0) return data;
-		await this.init();
-		const counter = this.sendCounter++;
-		return this.xorWithKeystream(counter, data);
-	}
-
-	private async xorWithKeystream(counter: bigint, payload: Uint8Array): Promise<Uint8Array> {
-		const counterBytes = new Uint8Array(8);
-		new DataView(counterBytes.buffer).setBigUint64(0, counter, true);
-		const hash = new Uint8Array(
-			await crypto.subtle.digest(
-				'SHA-256',
-				new Uint8Array([...this.key, ...counterBytes]),
-			),
-		);
-		const result = new Uint8Array(payload.byteLength);
-		for (let i = 0; i < payload.byteLength; i++) {
-			result[i] = payload[i] ^ hash[i % 32];
+	while (true) {
+		const { value, done } = await reader.read();
+		if (done) {
+			if (offset === 0) return null;
+			break;
 		}
-		return result;
-	}
-}
 
-class NoCryptoHandler implements CryptoHandler {
-	async decrypt(data: Uint8Array): Promise<Uint8Array> { return data; }
-	async encrypt(data: Uint8Array): Promise<Uint8Array> { return data; }
+		const chunk = value instanceof Uint8Array ? value : new Uint8Array(value);
+		if (offset + chunk.byteLength > buffer.byteLength) {
+			const newBuffer = new Uint8Array(Math.max(buffer.byteLength * 2, offset + chunk.byteLength));
+			newBuffer.set(buffer.subarray(0, offset));
+			buffer = newBuffer;
+		}
+
+		buffer.set(chunk, offset);
+		offset += chunk.byteLength;
+
+		const 解析结果 = 解析当前缓冲(buffer.subarray(0, offset));
+		if (解析结果 === 'need_more') continue;
+		return 解析结果;
+	}
+
+	const 最终结果 = 解析当前缓冲(buffer.subarray(0, offset));
+	return 最终结果 === 'need_more' ? null : 最终结果;
 }
 
 // ---------------------------------------------------------------------------
-// Obfuscation handlers (XPadding auto-detect)
+// 主处理（TCP pipe 直通 / UDP 独立分支）
 // ---------------------------------------------------------------------------
 
-class XPaddingHandler implements ObfuscationHandler {
-	// Default config: matches client's XPaddingConfig::default()
-	private readonly minBytes = 100;
-	private readonly maxBytes = 1000;
-
-	validateRequestPadding(request: Request): boolean {
-		// Auto-detect: check Referer for x_padding query param, or X-Padding header
-		const referer = request.headers.get('Referer') || '';
-		let padding: string | null = null;
-
-		// Try Referer URL query: ?x_padding=...
-		if (referer) {
-			const match = referer.match(/[?&]x_padding=([^&]+)/);
-			if (match) padding = decodeURIComponent(match[1]);
-		}
-
-		// Try X-Padding header
-		if (!padding) {
-			padding = request.headers.get('X-Padding');
-		}
-
-		// No padding present = valid (padding is optional)
-		if (!padding) return true;
-
-		// Validate length range
-		const len = padding.length;
-		return len >= this.minBytes && len <= this.maxBytes;
-	}
-
-	generateResponsePadding(): { header: string; value: string } | null {
-		const len = this.minBytes + Math.floor(Math.random() * (this.maxBytes - this.minBytes + 1));
-		return { header: 'X-Padding', value: 'X'.repeat(len) };
-	}
-}
-
-class NoObfuscationHandler implements ObfuscationHandler {
-	validateRequestPadding(_: Request): boolean { return true; }
-	generateResponsePadding(): { header: string; value: string } | null { return null; }
-}
-
-// ---------------------------------------------------------------------------
-// Frame parser (handles partial frames across chunk boundaries)
-// ---------------------------------------------------------------------------
-
-class FrameParser {
-	private buffer: Uint8Array = new Uint8Array(0);
-
-	/** Append data and return all complete frames parsed from the buffer. */
-	feed(data: Uint8Array): ParsedFrame[] {
-		if (data.byteLength === 0) return [];
-
-		// Append to buffer
-		if (this.buffer.byteLength === 0) {
-			this.buffer = data.slice();
-		} else {
-			this.buffer = 拼接字节数据(this.buffer, data);
-		}
-
-		const frames: ParsedFrame[] = [];
-		let offset = 0;
-
-		while (offset < this.buffer.byteLength) {
-			const frame = this.tryParseFrame(this.buffer, offset);
-			if (!frame) break; // Need more data
-			frames.push(frame.frame);
-			offset += frame.consumed;
-		}
-
-		// Keep remaining bytes
-		if (offset > 0) {
-			this.buffer = this.buffer.slice(offset);
-		}
-
-		return frames;
-	}
-
-	private tryParseFrame(
-		data: Uint8Array,
-		offset: number,
-	): { frame: ParsedFrame; consumed: number } | null {
-		try {
-			const r1 = 解码Varint(data, offset);
-			const streamId = r1.value;
-			const sidLen = r1.bytesRead;
-			const flagsOffset = offset + sidLen;
-
-			if (flagsOffset >= data.byteLength) return null; // Need more data
-			const flags = data[flagsOffset];
-
-			const r2 = 解码Varint(data, flagsOffset + 1);
-			const payloadLen = Number(r2.value);
-			const payloadStart = flagsOffset + 1 + r2.bytesRead;
-			const payloadEnd = payloadStart + payloadLen;
-
-			if (payloadEnd > data.byteLength) return null; // Need more data
-
-			return {
-				frame: {
-					streamId,
-					flags,
-					payload: data.slice(payloadStart, payloadEnd),
-				},
-				consumed: payloadEnd - offset,
-			};
-		} catch {
-			return null; // Invalid varint, need more data
-		}
-	}
-
-	/** Get any remaining buffered data (for debugging). */
-	get remaining(): number {
-		return this.buffer.byteLength;
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Main handler (M5 rewrite: mless frames over HTTP)
-// ---------------------------------------------------------------------------
-
-export async function 处理XHTTP请求(request: Request, yourUUID: string): Promise<Response> {
+export async function 处理叉HTTP请求(request: Request, yourUUID: string): Promise<Response> {
 	if (!request.body) return new Response('Bad Request', { status: 400 });
-
-	// 1. Create pluggable handlers
-	const cryptoHandler: CryptoHandler = new AheadXorHandler(yourUUID);
-	const obfHandler: ObfuscationHandler = new XPaddingHandler();
-	const protocolHandlers: ProtocolHandler[] = [
-		new TrojanHandler(),
-		new VlessHandler(),
-	];
-
-	// 2. Validate request padding
-	if (!obfHandler.validateRequestPadding(request)) {
-		return new Response('Bad Request', { status: 400 });
+	const { 头: 本机Padding头, 键: 本机Padding键 } = 获取叉HTTPPadding标识(yourUUID);
+	if (!校验叉HTTPPadding(request, 本机Padding头, 本机Padding键)) return new Response('Bad Request', { status: 400 });
+	const reader = request.body.getReader();
+	const 首包 = await 读取叉HTTP首包(reader, yourUUID);
+	if (!首包) {
+		try { reader.releaseLock(); } catch { /* ignore */ }
+		return new Response('Invalid request', { status: 400 });
+	}
+	// 测速站本地直出：仅在未使用 SOCKS5/HTTP/HTTPS/TURN/SSTP 代理时（走代理时正常转发以测代理链路）。
+	if (isSpeedTestSite(首包.hostname) && !state.启用SOCKS5反代) {
+		try { reader.releaseLock(); } catch { /* ignore */ }
+		return new Response(构造本地204响应(首包.respHeader), {
+			status: 200,
+			headers: {
+				'Content-Type': 'application/octet-stream',
+				'X-Accel-Buffering': 'no',
+				'Cache-Control': 'no-store',
+			},
+		});
+	}
+	if (首包.isUDP && 首包.协议 !== 'trojan' && 首包.port !== 53) {
+		try { reader.releaseLock(); } catch { /* ignore */ }
+		return new Response('UDP is not supported', { status: 400 });
 	}
 
-	// 3. Build response headers
 	const responseHeaders = new Headers({
 		'Content-Type': 'application/octet-stream',
 		'X-Accel-Buffering': 'no',
 		'Cache-Control': 'no-store',
 	});
-	const padding = obfHandler.generateResponsePadding();
-	if (padding) responseHeaders.set(padding.header, padding.value);
 
-	// 4. Set up streaming response
-	const reader = request.body.getReader();
-	const frameParser = new FrameParser();
+	try {
+		const 响应URL = new URL('https://x.invalid/');
+		响应URL.searchParams.set(本机Padding键, 生成叉HTTPPadding串(100 + Math.floor(Math.random() * 901)));
+		responseHeaders.set(本机Padding头, 响应URL.toString());
+	} catch { /* ignore */ }
 
-	// Remote connection state
-	const remoteConnWrapper: RemoteConnWrapper = {
-		socket: null, connectingPromise: null, retryConnect: null, socketWritePromise: null,
-	};
-	let 当前写入Socket: TCPSocket | null = null;
-	let 远端写入器: WritableStreamDefaultWriter<Uint8Array> | null = null;
+	if (首包.isUDP) return 处理叉HTTPUDP请求(首包, reader, request, responseHeaders);
 
-	const 释放远端写入器 = (): void => {
-		if (远端写入器) {
-			try { 远端写入器.releaseLock(); } catch { /* ignore */ }
-			远端写入器 = null;
-		}
-		当前写入Socket = null;
-	};
+	try { reader.releaseLock(); } catch { /* ignore */ }
 
-	const 获取远端写入器 = (): WritableStreamDefaultWriter<Uint8Array> | null => {
-		const socket = remoteConnWrapper.socket;
-		if (!socket) return null;
-		if (socket !== 当前写入Socket) {
-			释放远端写入器();
-			当前写入Socket = socket;
-			远端写入器 = socket.writable.getWriter();
-		}
-		return 远端写入器;
+	const remoteConnWrapper: RemoteConnWrapper = { socket: null, connectingPromise: null, retryConnect: null, socketWritePromise: null };
+	const abortController = new AbortController();
+	let 已清理 = false;
+	const 清理 = (reason?: unknown): void => {
+		if (已清理) return;
+		已清理 = true;
+		try { abortController.abort(reason); } catch { /* ignore */ }
+		try { remoteConnWrapper.socket?.close(); } catch { /* ignore */ }
 	};
 
-	let XHTTP上行写入队列: ReturnType<typeof 创建上行写入队列> | null = null;
+	const 占位WS = { readyState: WebSocket.OPEN, send: (): void => { }, close: (): void => { } };
 
-	// Stream state (for stream-one: single stream)
-	let firstFrameProcessed = false;
-	let isUDP = false;
-	let respHeader: Uint8Array | null = null;
-	const 木马UDP上下文 = { 缓存: new Uint8Array(0) };
+	let socket: TCPSocket | null;
+	try {
+		socket = await forwardataTCP(首包.hostname, 首包.port, 首包.rawData, 占位WS, 首包.respHeader, remoteConnWrapper, yourUUID, request, null, true);
+	} catch (err) {
+		log(`[叉HTTP-Pipe] 连接失败: ${(err as { message?: string })?.message || err}`);
+		清理(err);
+		return new Response('bad gateway', { status: 502 });
+	}
+	if (!socket) {
+		清理(new Error('socket is null'));
+		return new Response('bad gateway', { status: 502 });
+	}
 
-	return new Response(
-		new ReadableStream<Uint8Array>({
-			async start(controller) {
-				let 已关闭 = false;
-
-				// Bridge: writes encrypted mless frames to the response stream
-				const xhttpBridge = {
-					readyState: WebSocket.OPEN,
-					send(data: Uint8Array | ArrayBuffer | ArrayBufferView): void {
-						if (已关闭) return;
-						try {
-							const chunk = 数据转Uint8Array(data);
-							// Encrypt and encode as DATA frame (streamId=1 for stream-one)
-							cryptoHandler.encrypt(chunk).then((enc) => {
-								const frame = 编码帧(1, 0, enc);
-								try { controller.enqueue(frame); }
-								catch { /* controller closed */ }
-							}).catch(() => {});
-						} catch {
-							已关闭 = true;
-							xhttpBridge.readyState = WebSocket.CLOSED;
-						}
-					},
-					close(): void {
-						if (已关闭) return;
-						已关闭 = true;
-						xhttpBridge.readyState = WebSocket.CLOSED;
-						// Send CLOSE frame
-						const closeFrame = 编码帧(1, 帧关闭标记, new Uint8Array(0));
-						try { controller.enqueue(closeFrame); } catch { /* ignore */ }
-						try { controller.close(); } catch { /* ignore */ }
-					},
-				};
-
-				const 上行写入队列 = (XHTTP上行写入队列 = 创建上行写入队列({
-					获取写入器: 获取远端写入器,
-					释放写入器: 释放远端写入器,
-					重试连接: async () => {
-						if (typeof remoteConnWrapper.retryConnect !== 'function') throw new Error('retry unavailable');
-						await remoteConnWrapper.retryConnect();
-					},
-					关闭连接: () => {
-						try { remoteConnWrapper.socket?.close(); } catch { /* ignore */ }
-						closeSocketQuietly(xhttpBridge);
-					},
-					名称: 'XHTTP上行',
-				}));
-
-				const 写入远端 = async (payload: Uint8Array, allowRetry = true): Promise<boolean> => {
-					const r = 上行写入队列.写入并等待(payload, allowRetry);
-					return r === true ? true : await r;
-				};
-
-				// Process a decrypted FIRST frame: parse protocol, connect remote
-				const processFirstFrame = async (payload: Uint8Array): Promise<void> => {
-					// Try each protocol handler
-					for (const handler of protocolHandlers) {
-						const result = handler.parseFirstPacket(payload, yourUUID);
-						if (result.状态 === 'ok') {
-							const 首包 = result.结果;
-							if (isSpeedTestSite(首包.hostname)) {
-								log(`[XHTTP] 拒绝测速站: ${首包.hostname}`);
-								closeSocketQuietly(xhttpBridge);
-								return;
-							}
-							isUDP = 首包.isUDP;
-							respHeader = 首包.respHeader;
-
-							if (!handler.isUDPAllowed(首包)) {
-								log(`[XHTTP] UDP 不允许: ${首包.hostname}:${首包.port}`);
-								closeSocketQuietly(xhttpBridge);
-								return;
-							}
-
-							log(`[XHTTP] ${首包.协议} ${首包.isUDP ? 'UDP' : 'TCP'} ${首包.hostname}:${首包.port}`);
-
-							if (首包.isUDP) {
-								if (首包.rawData?.byteLength) {
-									if (首包.协议 === 'trojan') {
-										await 转发木马UDP数据(首包.rawData, xhttpBridge as Parameters<typeof 转发木马UDP数据>[1], 木马UDP上下文, request);
-									} else {
-										await forwardataudp(首包.rawData, xhttpBridge as Parameters<typeof forwardataudp>[1], respHeader, request);
-										respHeader = null;
-									}
-								}
-							} else {
-								await forwardataTCP(
-									首包.hostname, 首包.port, 首包.rawData,
-									xhttpBridge as Parameters<typeof forwardataTCP>[3],
-									首包.respHeader, remoteConnWrapper, yourUUID, request,
-								);
-							}
-							return;
-						}
-						if (result.状态 === 'invalid') continue; // Try next handler
-						// 'need_more' - shouldn't happen for FIRST frame, but try next
-					}
-					// All handlers failed
-					log(`[XHTTP] 首包解析失败`);
-					closeSocketQuietly(xhttpBridge);
-				};
-
-				try {
-					// 5. Read HTTP body, parse frames, decrypt, process
-					for (;;) {
-						const { done, value } = await reader.read();
-						if (done) break;
-						if (!value || value.byteLength === 0) continue;
-
-						const frames = frameParser.feed(数据转Uint8Array(value));
-
-						for (const frame of frames) {
-							if (frame.streamId === 0) continue;
-
-							// CLOSE frame
-							if (frame.flags & 帧关闭标记) {
-								try { remoteConnWrapper.socket?.close(); } catch { /* ignore */ }
-								continue;
-							}
-
-							// Decrypt payload
-							const plaintext = frame.payload.byteLength > 0
-								? await cryptoHandler.decrypt(frame.payload)
-								: frame.payload;
-
-							// FIRST frame: parse protocol, establish remote
-							if (frame.flags & 帧首帧标记) {
-								if (!firstFrameProcessed) {
-									firstFrameProcessed = true;
-									await processFirstFrame(plaintext);
-								}
-								continue;
-							}
-
-							// DATA frame: forward to remote
-							if (isUDP) {
-								// For UDP, use the bridge directly
-								const 首包协议 = protocolHandlers[0]; // Determine from firstFrame...
-								// For simplicity, reuse the same UDP forwarding
-								await forwardataudp(plaintext, xhttpBridge as Parameters<typeof forwardataudp>[1], respHeader, request);
-								respHeader = null;
-							} else {
-								if (!(await 写入远端(plaintext))) {
-									throw new Error('Remote socket is not ready');
-								}
-							}
-						}
-					}
-
-					// 6. Flush upload queue and close remote
-					if (!isUDP) {
-						await 上行写入队列.等待空();
-						const writer = 获取远端写入器();
-						if (writer) {
-							try { await writer.close(); } catch { /* ignore */ }
-						}
-					}
-				} catch (err) {
-					log(`[XHTTP转发] 处理失败: ${(err as { message?: string })?.message || err}`);
-					closeSocketQuietly(xhttpBridge);
-				} finally {
-					上行写入队列.清空();
-					释放远端写入器();
-					try { reader.releaseLock(); } catch { /* ignore */ }
-					// Ensure response stream is closed
-					try { controller.close(); } catch { /* ignore */ }
+	const 上行Promise = (async (): Promise<void> => {
+		const 上行合包器 = 创建上行Grain合包流();
+		const 搬运Promise = 上行合包器.readable.pipeTo(socket.writable, { signal: abortController.signal });
+		void 搬运Promise.catch(清理);
+		const 上行reader = request.body!.getReader();
+		const 取消上行reader = (): void => {
+			try { 上行reader.cancel((abortController.signal.reason as Error) ?? undefined).catch(() => { }); } catch { /* ignore */ }
+		};
+		abortController.signal.addEventListener('abort', 取消上行reader, { once: true });
+		try {
+			try {
+				while (true) {
+					const { done, value } = await 上行reader.read();
+					if (done) break;
+					if (value?.byteLength) await 上行合包器.写入(value);
 				}
-				void 有效数据长度;
-				void TOKENS;
-			},
-			cancel() {
-				XHTTP上行写入队列?.清空();
-				try { remoteConnWrapper.socket?.close(); } catch { /* ignore */ }
-				释放远端写入器();
+			} finally {
+				abortController.signal.removeEventListener('abort', 取消上行reader);
+				try { 上行reader.releaseLock(); } catch { /* ignore */ }
+			}
+		} finally {
+			try { await 上行合包器.结束(); } catch { /* ignore */ }
+		}
+		await 搬运Promise;
+	})();
+
+	const 响应流 = typeof IdentityTransformStream !== 'undefined'
+		? new IdentityTransformStream()
+		: new TransformStream<Uint8Array, Uint8Array>();
+	const 下行Promise = (async (): Promise<void> => {
+		const writer = 响应流.writable.getWriter();
+		try {
+			if (首包.respHeader && 有效数据长度(首包.respHeader) > 0) await writer.write(首包.respHeader);
+		} catch (error) {
+			try { await writer.abort(error); } catch { /* ignore */ }
+			throw error;
+		} finally {
+			try { writer.releaseLock(); } catch { /* ignore */ }
+		}
+		await socket.readable.pipeTo(响应流.writable, { signal: abortController.signal });
+	})();
+
+	void 上行Promise.catch(清理);
+	void 下行Promise.then(() => 清理(), 清理);
+	void Promise.allSettled([上行Promise, 下行Promise]);
+
+	return new Response(响应流.readable, { status: 200, headers: responseHeaders });
+}
+
+function 处理叉HTTPUDP请求(首包: XhttpFirstPacket, reader: ReadableStreamDefaultReader<Uint8Array>, request: Request, responseHeaders: Headers): Response {
+	const 木马UDP上下文 = { 缓存: new Uint8Array(0) };
+	return new Response(new ReadableStream<Uint8Array>({
+		async start(controller) {
+			let 已关闭 = false;
+			let udpRespHeader = 首包.respHeader;
+			const 叉桥 = {
+				readyState: WebSocket.OPEN,
+				send(data: Uint8Array | ArrayBuffer | ArrayBufferView): void {
+					if (已关闭) return;
+					try {
+						const chunk = 数据转Uint8Array(data);
+						controller.enqueue(chunk);
+					} catch {
+						已关闭 = true;
+						叉桥.readyState = WebSocket.CLOSED;
+					}
+				},
+				close(): void {
+					if (已关闭) return;
+					已关闭 = true;
+					叉桥.readyState = WebSocket.CLOSED;
+					try { controller.close(); } catch { /* ignore */ }
+				},
+			};
+			try {
+				if (首包.协议 === 'trojan') {
+					if (首包.rawData?.byteLength) await 转发木马UDP数据(首包.rawData, 叉桥, 木马UDP上下文, request);
+				} else if (首包.rawData?.byteLength) {
+					await forwardataudp(首包.rawData, 叉桥, udpRespHeader, request);
+					udpRespHeader = null;
+				}
+				while (true) {
+					const { done, value } = await reader.read();
+					if (done) break;
+					if (!value || value.byteLength === 0) continue;
+					if (首包.协议 === 'trojan') await 转发木马UDP数据(value, 叉桥, 木马UDP上下文, request);
+					else {
+						await forwardataudp(value, 叉桥, udpRespHeader, request);
+						udpRespHeader = null;
+					}
+				}
+			} catch (err) {
+				log(`[叉HTTP转发] 处理失败: ${(err as { message?: string })?.message || err}`);
+				closeSocketQuietly(叉桥);
+			} finally {
+				closeSocketQuietly(叉桥);
 				try { reader.releaseLock(); } catch { /* ignore */ }
-			},
-		}),
-		{ status: 200, headers: responseHeaders },
-	);
+			}
+		},
+		cancel() {
+			try { reader.releaseLock(); } catch { /* ignore */ }
+		},
+	}), { status: 200, headers: responseHeaders });
 }
