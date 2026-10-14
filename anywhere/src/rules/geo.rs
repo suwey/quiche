@@ -763,6 +763,48 @@ pub(super) fn parse_duration_str(s: &str) -> Option<std::time::Duration> {
 // GeoRuleSet — download, cache, refresh
 // ---------------------------------------------------------------------------
 
+/// Addresses tried per geo download. Rule-set hosts are anycast — jsdelivr
+/// answers with several members that round-robin, and one member can refuse
+/// TCP while the next one answers, so the first A record is not privileged.
+/// The cap exists because each unreachable address costs a full
+/// `TCP_CONNECT_TIMEOUT` (5 s) and geo loading happens before the TUN comes
+/// up, so this bounds one download at ~40 s in the all-blackholed case. It is
+/// deliberately above the record count of the shipped sources
+/// (`testingcf.jsdelivr.net` publishes exactly two Cloudflare members) and
+/// only bites for names that publish more, e.g. `fastly.jsdelivr.net` (four).
+const MAX_ADDR_ATTEMPTS: usize = 8;
+
+/// One address attempt of a geo download.
+enum Attempt {
+    /// Body fetched — done.
+    Fetched(Vec<u8>),
+    /// TCP connect failed: another anycast member may answer, so the caller
+    /// should try the next address.
+    Unreachable(String),
+    /// Connected and spoke TLS/HTTP and still failed — every address behind the
+    /// name would give the same verdict, so stop instead of spending another
+    /// TLS+HTTP budget per address.
+    Rejected(String),
+}
+
+/// De-duplicate resolved addresses, keeping DNS answer order, capped at
+/// `limit`.
+fn candidate_addrs(
+    addrs: Vec<std::net::IpAddr>, limit: usize,
+) -> Vec<std::net::IpAddr> {
+    let mut out: Vec<std::net::IpAddr> = Vec::new();
+    for addr in addrs {
+        if out.contains(&addr) {
+            continue;
+        }
+        out.push(addr);
+        if out.len() == limit {
+            break;
+        }
+    }
+    out
+}
+
 /// A managed geo rule-set: downloads, caches, and periodically refreshes an SRS
 /// file.
 pub struct GeoRuleSet {
@@ -909,17 +951,6 @@ impl GeoRuleSet {
     async fn http_get_bypass(
         url: &str, dns_plain: &[std::net::SocketAddr],
     ) -> Result<Vec<u8>, String> {
-        use std::sync::Arc;
-        use std::time::Duration;
-
-        use http_body_util::{BodyExt, Empty};
-        use hyper::Request;
-        use hyper::body::Bytes;
-        use hyper_util::rt::TokioIo;
-        use tokio_rustls::TlsConnector;
-        use tokio_rustls::rustls::ClientConfig;
-        use tokio_rustls::rustls::pki_types::ServerName;
-
         // Parse URL.
         let parsed =
             url::Url::parse(url).map_err(|e| format!("invalid URL: {e}"))?;
@@ -935,34 +966,74 @@ impl GeoRuleSet {
         let query = parsed.query().map(|q| format!("?{q}")).unwrap_or_default();
         let path_query = format!("{path}{query}");
 
-        // Resolve host to an IP. On Android the system resolver is hijacked
-        // by the engine's fake-ip DNS (query source is the TUN address, not
-        // loopback, so local_direct doesn't apply) and returns a non-routable
-        // 198.18.x.x. Try a direct UDP query to a configured plain upstream
-        // over a bypass (protected) socket first; fall back to the system
-        // resolver if that fails or returns a fake-ip (e.g. pf rdr on macOS
-        // still redirected the bypass query to the hijack). On desktop (no
-        // TUN) the system resolver is fine either way.
-        let ip = if !dns_plain.is_empty() {
-            Self::resolve_bypass(host, dns_plain).await
+        // Resolve host to candidate IPs. On Android the system resolver is
+        // hijacked by the engine's fake-ip DNS (query source is the TUN
+        // address, not loopback, so local_direct doesn't apply) and returns a
+        // non-routable 198.18.x.x. Try a direct UDP query to a configured
+        // plain upstream over a bypass (protected) socket first; fall back to
+        // the system resolver if that fails or returns only fake-ip (e.g. pf
+        // rdr on macOS still redirected the bypass query to the hijack). On
+        // desktop (no TUN) the system resolver is fine either way.
+        let bypass = if dns_plain.is_empty() {
+            Vec::new()
         } else {
-            None
+            Self::resolve_bypass(host, dns_plain).await
         };
-        let ip = match ip {
-            Some(ip) => ip,
-            None => tokio::net::lookup_host(format!("{host}:{port}"))
+        let resolved = if bypass.is_empty() {
+            tokio::net::lookup_host(format!("{host}:{port}"))
                 .await
-                .ok()
-                .and_then(|mut it| it.next())
-                .map(|sa| sa.ip())
-                .ok_or_else(|| format!("DNS resolution failed for {host}"))?,
+                .map(|addrs| addrs.map(|sa| sa.ip()).collect())
+                .unwrap_or_default()
+        } else {
+            bypass
         };
-        let addr = std::net::SocketAddr::new(ip, port);
+        let candidates = candidate_addrs(resolved, MAX_ADDR_ATTEMPTS);
+        if candidates.is_empty() {
+            return Err(format!("DNS resolution failed for {host}"));
+        }
+
+        let mut last_err = String::new();
+        for ip in candidates {
+            let addr = std::net::SocketAddr::new(ip, port);
+            match Self::https_get_once(host, &path_query, addr).await {
+                Attempt::Fetched(body) => return Ok(body),
+                Attempt::Unreachable(e) => {
+                    log::debug!("geo: {e}; trying next address");
+                    last_err = e;
+                },
+                Attempt::Rejected(e) => return Err(e),
+            }
+        }
+        Err(last_err)
+    }
+
+    /// One GET against one resolved address. Use [`Attempt::Unreachable`]
+    /// only for the connect phase: an anycast member can refuse while its
+    /// neighbours answer, so the caller should try the next address.
+    async fn https_get_once(
+        host: &str, path_query: &str, addr: std::net::SocketAddr,
+    ) -> Attempt {
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        use http_body_util::{BodyExt, Empty};
+        use hyper::Request;
+        use hyper::body::Bytes;
+        use hyper_util::rt::TokioIo;
+        use tokio_rustls::TlsConnector;
+        use tokio_rustls::rustls::ClientConfig;
+        use tokio_rustls::rustls::pki_types::ServerName;
 
         // TCP connect with bypass (protect on Android / SO_MARK on Linux).
-        let tcp = crate::outbound::common::connect_tcp_bypass(addr)
-            .await
-            .map_err(|e| format!("TCP connect {addr}: {e}"))?;
+        let tcp = match crate::outbound::common::connect_tcp_bypass(addr).await
+        {
+            Ok(tcp) => tcp,
+            Err(e) => {
+                return Attempt::Unreachable(format!(
+                    "TCP connect {addr}: {e}"
+                ));
+            },
+        };
         let _ = tcp.set_nodelay(true);
 
         // TLS handshake with ALPN "http/1.1".
@@ -970,64 +1041,98 @@ impl GeoRuleSet {
         let mut roots = tokio_rustls::rustls::RootCertStore::empty();
         roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
         let mut tls_config =
-            ClientConfig::builder_with_provider(Arc::new(provider))
+            match ClientConfig::builder_with_provider(Arc::new(provider))
                 .with_safe_default_protocol_versions()
-                .map_err(|e| format!("TLS config: {e}"))?
-                .with_root_certificates(roots)
-                .with_no_client_auth();
+            {
+                Ok(builder) => builder
+                    .with_root_certificates(roots)
+                    .with_no_client_auth(),
+                Err(e) => {
+                    return Attempt::Rejected(format!("TLS config: {e}"));
+                },
+            };
         tls_config.alpn_protocols = vec![b"http/1.1".to_vec()];
         let connector = TlsConnector::from(Arc::new(tls_config));
 
-        let server_name = ServerName::try_from(host.to_string())
-            .map_err(|e| format!("invalid server name '{host}': {e}"))?;
-        let tls = tokio::time::timeout(
+        let server_name = match ServerName::try_from(host.to_string()) {
+            Ok(name) => name,
+            Err(e) => {
+                return Attempt::Rejected(format!(
+                    "invalid server name '{host}': {e}"
+                ));
+            },
+        };
+        let tls = match tokio::time::timeout(
             Duration::from_secs(15),
             connector.connect(server_name, tcp),
         )
         .await
-        .map_err(|_| format!("TLS handshake timeout ({host})"))?
-        .map_err(|e| format!("TLS handshake {host}: {e}"))?;
+        {
+            Err(_) => {
+                return Attempt::Rejected(format!(
+                    "TLS handshake timeout ({host})"
+                ));
+            },
+            Ok(Err(e)) => {
+                return Attempt::Rejected(format!("TLS handshake {host}: {e}"));
+            },
+            Ok(Ok(tls)) => tls,
+        };
 
         // HTTP/1.1 GET via hyper.
         let io = TokioIo::new(tls);
-        let (mut sender, conn) = hyper::client::conn::http1::handshake(io)
-            .await
-            .map_err(|e| format!("hyper handshake: {e}"))?;
+        let (mut sender, conn) =
+            match hyper::client::conn::http1::handshake(io).await {
+                Ok(pair) => pair,
+                Err(e) => {
+                    return Attempt::Rejected(format!("hyper handshake: {e}"));
+                },
+            };
 
         // Drive the connection in the background.
         tokio::spawn(async move {
             let _ = conn.await;
         });
 
-        let req = Request::builder()
+        let req = match Request::builder()
             .method("GET")
-            .uri(&path_query)
+            .uri(path_query)
             .header("Host", host)
             .header("User-Agent", "anywhere/geo-rules")
             .header("Connection", "close")
             .body(Empty::<Bytes>::new())
-            .map_err(|e| format!("build request: {e}"))?;
+        {
+            Ok(req) => req,
+            Err(e) => {
+                return Attempt::Rejected(format!("build request: {e}"));
+            },
+        };
 
-        let resp = tokio::time::timeout(
+        let resp = match tokio::time::timeout(
             Duration::from_secs(30),
             sender.send_request(req),
         )
         .await
-        .map_err(|_| "HTTP response timeout".to_string())?
-        .map_err(|e| format!("send request: {e}"))?;
+        {
+            Err(_) => {
+                return Attempt::Rejected("HTTP response timeout".to_string());
+            },
+            Ok(Err(e)) => {
+                return Attempt::Rejected(format!("send request: {e}"));
+            },
+            Ok(Ok(resp)) => resp,
+        };
 
         let status = resp.status();
         if !status.is_success() {
-            return Err(format!("HTTP {status}"));
+            return Attempt::Rejected(format!("HTTP {status}"));
         }
 
         // Collect body.
-        let body = resp
-            .into_body()
-            .collect()
-            .await
-            .map_err(|e| format!("read body: {e}"))?;
-        Ok(body.to_bytes().to_vec())
+        match resp.into_body().collect().await {
+            Ok(body) => Attempt::Fetched(body.to_bytes().to_vec()),
+            Err(e) => Attempt::Rejected(format!("read body: {e}")),
+        }
     }
 
     /// True if `ip` is in the default fake-ip range 198.18.0.0/15 (what the
@@ -1042,13 +1147,15 @@ impl GeoRuleSet {
         }
     }
 
-    /// Resolve `host` to an IP via a direct UDP DNS query to one of
-    /// `dns_plain`, over a bypass (TUN-protected) socket. Returns the first
-    /// A record found; tries each upstream in order.
+    /// Resolve `host` to candidate addresses via a direct UDP DNS query to one
+    /// of `dns_plain`, over a bypass (TUN-protected) socket. Returns every
+    /// non-fake-ip A record of the first upstream that answers, in answer
+    /// order; tries each upstream in order. Empty means "no bypass answer",
+    /// which sends the caller to the system resolver.
     async fn resolve_bypass(
         host: &str, dns_plain: &[std::net::SocketAddr],
-    ) -> Option<std::net::IpAddr> {
-        use crate::dns::wire::{build_a_query, first_a_record};
+    ) -> Vec<std::net::IpAddr> {
+        use crate::dns::wire::build_a_query;
         use crate::outbound::common::bind_udp_bypass;
         use tokio::time::timeout;
 
@@ -1069,15 +1176,32 @@ impl GeoRuleSet {
                 timeout(std::time::Duration::from_secs(3), sock.recv(&mut buf))
                     .await
             {
-                if let Some(ip) = first_a_record(&buf[..n]) {
-                    // Reject fake-ip (198.18.0.0/15): the bypass query didn't
-                    // escape the engine's DNS hijack (e.g. pf rdr on macOS
-                    // still redirected it). Fall through so the caller retries
-                    // via the system resolver.
-                    if !Self::is_fakeip(&ip) {
-                        log::debug!("geo DNS bypass: {host} -> {ip} via {up}");
-                        return Some(ip);
-                    }
+                let records: Vec<std::net::IpAddr> =
+                    crate::inbound::tun::reverse_dns::parse_a_records(
+                        &buf[..n],
+                    )
+                    .into_iter()
+                    .map(|(ip, _)| std::net::IpAddr::V4(ip))
+                    .collect();
+                // Reject fake-ip (198.18.0.0/15): the bypass query didn't
+                // escape the engine's DNS hijack (e.g. pf rdr on macOS
+                // still redirected it). Fall through so the caller retries
+                // via the system resolver.
+                let usable: Vec<_> = records
+                    .iter()
+                    .copied()
+                    .filter(|ip| !Self::is_fakeip(ip))
+                    .collect();
+                if !usable.is_empty() {
+                    let joined = usable
+                        .iter()
+                        .map(|ip| ip.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    log::debug!("geo DNS bypass: {host} -> {joined} via {up}");
+                    return usable;
+                }
+                if let Some(ip) = records.first() {
                     log::warn!(
                         "geo DNS bypass: {host} -> fake-ip {ip} via {up} \
                          (bypass leaked to hijack)"
@@ -1085,7 +1209,7 @@ impl GeoRuleSet {
                 }
             }
         }
-        None
+        Vec::new()
     }
 
     async fn load_cache(
@@ -1157,6 +1281,39 @@ impl GeoRuleSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn candidate_addrs_dedups_and_caps_in_answer_order() {
+        let ips = |list: &[&str]| -> Vec<IpAddr> {
+            list.iter().map(|s| s.parse().unwrap()).collect()
+        };
+
+        // Order is DNS answer order, not sorted: the first answer is the
+        // resolver's preference and must stay first.
+        let got = candidate_addrs(
+            ips(&["104.17.208.5", "104.17.207.5", "104.17.208.5"]),
+            3,
+        );
+        assert_eq!(got, ips(&["104.17.208.5", "104.17.207.5"]));
+
+        // Cap keeps a fully unreachable anycast set from eating the whole
+        // startup budget. Tested with an explicit limit so it does not move
+        // whenever MAX_ADDR_ATTEMPTS is retuned.
+        let many = ips(&["1.1.1.1", "2.2.2.2", "3.3.3.3", "4.4.4.4", "5.5.5.5"]);
+        let got = candidate_addrs(many.clone(), 3);
+        assert_eq!(got, ips(&["1.1.1.1", "2.2.2.2", "3.3.3.3"]));
+        // A name publishing fewer members than the cap is never truncated.
+        assert_eq!(candidate_addrs(many, MAX_ADDR_ATTEMPTS).len(), 5);
+
+        assert!(candidate_addrs(Vec::new(), MAX_ADDR_ATTEMPTS).is_empty());
+    }
+
+    #[test]
+    fn fakeip_addresses_are_still_flagged_for_rejection() {
+        assert!(GeoRuleSet::is_fakeip(&"198.18.0.5".parse().unwrap()));
+        assert!(GeoRuleSet::is_fakeip(&"198.19.255.1".parse().unwrap()));
+        assert!(!GeoRuleSet::is_fakeip(&"104.17.208.5".parse().unwrap()));
+    }
 
     #[test]
     fn test_ip_range_v4() {

@@ -26,8 +26,8 @@ python3 anywhere/harness/conformance.py -c ~/anywhere-test -C 6
 python3 anywhere/harness/conformance.py -c ~/anywhere-test --dry-run
 ```
 
-- `-c` 配置目录（见 config/），`-r` releases 目录（`build_on_mac.sh --releases`
-  的产物；平台段没写 `file=` 时从这里按 arch 取）。
+- `-c` 配置目录（见 config/），`-r` 产物目录（`build_on_mac.sh --release --pack`
+  写到 `packs/release/`；平台段没写 `file=` 时从这里按 arch 取）。
 - HTML 报告（内联 SVG 图表：按站点分组的 p50 柱状对比图 + 逐节点探测
   时间线）写在 `-c` 目录；逐次运行的产物（final 配置、client 日志、
   results.json 含逐次采样序列）在 `<c>/run/<时间戳>/`。退出码 0 仅当

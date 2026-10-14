@@ -13,7 +13,7 @@ reasonix.toml
 .qoder
 **/.wrangler
 **/node_modules
-/releases/
+/packs/
 
 # conformance harness run artifacts (in case config is run in-place)
 anywhere/harness/config/run/

@@ -795,6 +795,27 @@ impl DnsHijack {
             Self::run_listener(this4, addr).await;
         }));
 
+        // Linux: the box's own queries land on 127.0.0.1. The OUTPUT REDIRECT
+        // rewrites the destination to 127.0.0.1:1053 (measured: even when the
+        // nameserver routes out of another interface), so the reply only
+        // matches that conntrack entry, and is only reverse-NAT'ed back to the
+        // nameserver the application actually asked, when it is sent from a
+        // socket bound to 127.0.0.1. From the wildcard socket the kernel picks
+        // the client's own address as source and the resolver drops it. The
+        // wildcard socket above still serves PREROUTING-redirected queries
+        // from LAN clients, whose redirect target is the interface address.
+        #[cfg(target_os = "linux")]
+        {
+            let this_lo = this.clone();
+            handles.push(tokio::spawn(async move {
+                let addr = std::net::SocketAddr::new(
+                    std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                    DNS_REDIRECT_PORT,
+                );
+                Self::run_listener(this_lo, addr).await;
+            }));
+        }
+
         // IPv6 listener (macOS only - pf `rdr inet6` redirects to ::1:1053).
         // Without this, IPv6 DNS queries are redirected to ::1:1053 where
         // nobody listens, causing DNS failure for systems using IPv6 DNS.

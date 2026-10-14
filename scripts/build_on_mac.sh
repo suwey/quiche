@@ -1,17 +1,42 @@
 #!/bin/bash
-# Build script: compile all targets (desktop + Linux musl + Android) and optionally build APK.
+# Build script for the `anywhere` binaries, run from macOS.
 #
-# Usage:
-#   ./scripts/build_on_mac.sh            # build all targets (desktop is debug)
-#   ./scripts/build_on_mac.sh --apk      # also build the Android release APK
-#   ./scripts/build_on_mac.sh --releases # desktop becomes release; collect
-#                                        # anywhere-v<version>-<platform>.(tgz|apk)
-#                                        # for every platform into quiche/releases/
-#                                        # (implies --apk)
+# Three independent switches decide what happens — which platforms, which
+# profile, and whether to package — plus one for the Android APK. Nothing
+# implies anything else; the columns below are the whole story.
+#
+#   command                       platforms  profile  package  APK
+#   -------------------------------------------------------------
+#   (nothing)                     all 5      debug    no       no
+#   --release                     all 5      release  no       no
+#   --pack                        all 5      debug    yes      no
+#   linux-x64                     linux-x64  debug    no       no
+#   linux-x64 --release           linux-x64  release  no       no
+#   linux-x64 --release --pack    linux-x64  release  yes      no
+#   --apk                         android    debug    no       yes
+#   --all                         all 5      debug    no       yes
+#
+#   A full release upload is: --release --pack --all
+#
+# Details:
+#   --pack writes anywhere-v<version>-<platform>.(tgz|apk) into
+#     quiche/packs/<profile>/ (packs/release, packs/debug) for the selected
+#     platforms only; a missing binary is reported and skipped. The profile is
+#     the directory, so artifact names never carry a profile suffix. The UI
+#     bundle (anywhere-v<version>-ui.tgz) is packed with every --pack run.
+#   --apk builds the gradle release APK and limits the run to android; without
+#     --pack the APK stays in the gradle output dir.
+#   --all keeps every platform in scope and additionally builds the APK, so it
+#     needs JAVA_HOME + Android SDK (build_on_mac.sh --all without them stops).
+#   Platform arguments are positional and repeatable:
+#     mac-arm64  linux-aarch64-musl  linux-x64-musl  windows-x64-gnu  android-arm64
+#   The rust target triple and short aliases (linux-x64, windows, android, ...)
+#   also work; anything unrecognized is a hard error.
 #
 # Prerequisites:
 #   - Android NDK installed (ANDROID_NDK_HOME set)
-#   - Rust targets: rustup target add aarch64-linux-android aarch64-unknown-linux-musl
+#   - Rust targets: rustup target add aarch64-linux-android \
+#                        aarch64-unknown-linux-musl x86_64-unknown-linux-musl
 #   - cargo-ndk: cargo install cargo-ndk
 #   - cargo-zigbuild: cargo install cargo-zigbuild
 #   - For APK: Android SDK with build-tools + JDK 17+
@@ -33,22 +58,104 @@ ANDROID_PROJECT="$SCRIPT_DIR/../anywhere-android"
 RUST_PROJECT="$SCRIPT_DIR/../anywhere"
 
 # --- Parse args ---
+# Canonical platform keys — also the <platform> segment of every artifact name.
+ALL_PLATFORMS=(
+    "mac-arm64"
+    "linux-aarch64-musl"
+    "linux-x64-musl"
+    "windows-x64-gnu"
+    "android-arm64"
+)
+
+# Echo the canonical key for a platform argument (canonical key, rust target
+# triple, or short alias), or nothing when the argument is not a platform.
+platform_key() {
+    local p
+    p=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+    case "$p" in
+        mac|mac-arm64|aarch64-apple-darwin)               echo mac-arm64 ;;
+        linux-arm64|linux-aarch64|aarch64-unknown-linux-musl|linux-aarch64-musl)
+            echo linux-aarch64-musl ;;
+        linux-x64|linux-amd64|x86_64-unknown-linux-musl|linux-x64-musl)
+            echo linux-x64-musl ;;
+        windows|windows-x64|x86_64-pc-windows-gnu|windows-x64-gnu)
+            echo windows-x64-gnu ;;
+        android|android-arm64|aarch64-linux-android)
+            echo android-arm64 ;;
+        *)                                                echo "" ;;
+    esac
+}
+
+usage() {
+    sed -n '2,42p' "$0" | sed 's/^# \{0,1\}//'
+}
+
 BUILD_APK=false
-RELEASES=false
-RELEASE_FLAG=""
+PACK=false
+RELEASE_PROFILE=false
+# --apk means "android APK only": it turns the APK on and, when no platform was
+# named, narrows the whole run to android-arm64.
+APK_ONLY=false
+SELECTED=()
 for arg in "$@"; do
     case "$arg" in
-        --apk) BUILD_APK=true ;;
+        -h|--help) usage; exit 0 ;;
+        --apk) BUILD_APK=true; APK_ONLY=true ;;
+        # Everything in scope, APK included.
         --all) BUILD_APK=true ;;
-        # Build release artifacts for every platform and collect them in
-        # quiche/releases/ as anywhere-v<version>-<platform>.(tgz|apk),
-        # ready for a GitHub release upload. Implies --apk.
-        --releases) RELEASES=true; BUILD_APK=true ;;
+        --pack) PACK=true ;;
+        --release) RELEASE_PROFILE=true ;;
+        -*)
+            echo "ERROR: unknown option: $arg"
+            echo "  run with --help for the full matrix"
+            exit 1
+            ;;
+        *)
+            key=$(platform_key "$arg")
+            if [[ -z "$key" ]]; then
+                echo "ERROR: unknown platform: $arg"
+                echo "  pick from: ${ALL_PLATFORMS[*]}"
+                echo "  (the rust target triple or a short alias also works)"
+                exit 1
+            fi
+            SELECTED+=("$key")
+            ;;
     esac
 done
-if [[ "$RELEASES" == "true" ]]; then
-    RELEASE_FLAG="--release"
+
+if [[ "$APK_ONLY" == "true" && "${#SELECTED[@]}" -eq 0 ]]; then
+    SELECTED=("android-arm64")
 fi
+
+# Cargo profile for the selected builds. Debug keeps a small tweak off the
+# multi-target release cycle; only --release asks for release bits.
+if [[ "$RELEASE_PROFILE" == "true" ]]; then
+    PROFILE_FLAG="--release"
+    PROFILE_DIR="release"
+else
+    PROFILE_FLAG=""
+    PROFILE_DIR="debug"
+fi
+
+# True when platform $1 is in scope. No platform arguments means everything.
+wants() {
+    local key="$1" sel
+    [[ "${#SELECTED[@]}" -eq 0 ]] && return 0
+    for sel in "${SELECTED[@]}"; do
+        [[ "$sel" == "$key" ]] && return 0
+    done
+    return 1
+}
+
+# Echo what is about to happen — the matrix has enough dimensions that
+# guessing it from the command line is not worth the debugging session.
+if [[ "${#SELECTED[@]}" -gt 0 ]]; then
+    SCOPE="${SELECTED[*]}"
+else
+    SCOPE="all (${ALL_PLATFORMS[*]})"
+fi
+echo ""
+echo "=== Plan: platforms=$SCOPE profile=$PROFILE_DIR pack=$PACK apk=$BUILD_APK ==="
 
 # Crate version from the [package] section (single source of truth for
 # artifact naming; the Android gradle build reads the same field).
@@ -83,19 +190,31 @@ export CXXFLAGS="${CXXFLAGS:-} -ffile-prefix-map=${HOME}/="
 # ============================================================
 # 1. Desktop build (native)
 # ============================================================
-echo "=== Building desktop (native) ==="
-cargo build -p anywhere $RELEASE_FLAG
+if wants mac-arm64; then
+    echo "=== Building desktop (native) ==="
+    cargo build -p anywhere $PROFILE_FLAG
+fi
 
 # ============================================================
-# 2. Linux musl cross-compile (aarch64) — requires zig
+# 2. Linux musl cross-compile (aarch64 + x86_64) — requires zig
 # ============================================================
+MUSL_PLATFORMS=(
+    "linux-aarch64-musl:aarch64-unknown-linux-musl"
+    "linux-x64-musl:x86_64-unknown-linux-musl"
+)
 if [[ -n "$(command -v zig 2>/dev/null || true)" ]]; then
-    echo ""
-    echo "=== Building aarch64-unknown-linux-musl ==="
-    cargo zigbuild -p anywhere --target aarch64-unknown-linux-musl --release
+    for entry in "${MUSL_PLATFORMS[@]}"; do
+        key="${entry%%:*}"
+        triple="${entry#*:}"
+        wants "$key" || continue
+        echo ""
+        echo "=== Building $triple ==="
+        cargo zigbuild -p anywhere --target "$triple" $PROFILE_FLAG
+    done
 else
     echo ""
-    echo "=== Skipping aarch64-unknown-linux-musl (zig not found in PATH) ==="
+    echo "=== Skipping Linux musl builds (zig not found in PATH) ==="
+    echo "  Targets: ${MUSL_PLATFORMS[*]}"
     echo "  Current PATH: $PATH"
 fi
 
@@ -104,7 +223,7 @@ fi
 # ============================================================
 # Prerequisites: rustup target add x86_64-pc-windows-gnu
 #                brew install mingw-w64 nasm
-if [[ -n "$(command -v x86_64-w64-mingw32-gcc 2>/dev/null || true)" ]]; then
+if wants windows-x64-gnu && [[ -n "$(command -v x86_64-w64-mingw32-gcc 2>/dev/null || true)" ]]; then
     echo ""
     echo "=== Building x86_64-pc-windows-gnu ==="
     # Must build from anywhere/ so .cargo/config.toml (mingw linker/ar/rustflags)
@@ -116,18 +235,21 @@ if [[ -n "$(command -v x86_64-w64-mingw32-gcc 2>/dev/null || true)" ]]; then
     if [[ -d "$MINGW_SYSROOT" ]]; then
         export BINDGEN_EXTRA_CLANG_ARGS="--target=x86_64-pc-windows-gnu -isystem $MINGW_SYSROOT"
     fi
-    cargo build --target x86_64-pc-windows-gnu --release --bin anywhere
+    cargo build --target x86_64-pc-windows-gnu $PROFILE_FLAG --bin anywhere
     cd "$SCRIPT_DIR/.."
-    echo "  Product: target/x86_64-pc-windows-gnu/release/anywhere.exe"
-else
+    echo "  Product: target/x86_64-pc-windows-gnu/$PROFILE_DIR/anywhere.exe"
+elif wants windows-x64-gnu; then
     echo ""
     echo "=== Skipping x86_64-pc-windows-gnu (mingw-w64 not found) ==="
     echo "  Install: brew install mingw-w64 nasm"
     echo "  Target:  rustup target add x86_64-pc-windows-gnu"
 fi
+
 # ============================================================
-# 4. Android cross-compile
+# 4. Android cross-compile (+ 5. APK), wrapped so a platform
+#    selection can skip the whole NDK/gradle leg.
 # ============================================================
+build_android() {
 # --- Determine NDK path ---
 if [[ -z "${ANDROID_NDK_HOME:-}" ]]; then
     # Try auto-detect from default location
@@ -162,14 +284,14 @@ for target in "${TARGETS[@]}"; do
     # cargo-ndk simplifies Android cross-compilation (installs with: cargo install cargo-ndk)
     # It handles setting CC, CXX, and linker for the NDK automatically.
     if command -v cargo-ndk &>/dev/null; then
-        cargo ndk -t "$target" build --release -p anywhere
+        cargo ndk -t "$target" build $PROFILE_FLAG -p anywhere
     else
         # Fallback: manual cargo build with NDK linker
         export CC_aarch64_linux_android="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/darwin-x86_64/bin/aarch64-linux-android24-clang"
         export CC_armv7_linux_androideabi="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/darwin-x86_64/bin/armv7a-linux-androideabi24-clang"
         export CC_x86_64_linux_android="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/darwin-x86_64/bin/x86_64-linux-android24-clang"
 
-        cargo build --target "$target" --release -p anywhere
+        cargo build --target "$target" $PROFILE_FLAG -p anywhere
     fi
 
     # Copy .so to jniLibs
@@ -181,7 +303,7 @@ for target in "${TARGETS[@]}"; do
         *) echo "Unknown ABI for $target"; exit 1 ;;
     esac
 
-    SO_SRC="$SCRIPT_DIR/../target/$target/release/libanywhere.so"
+    SO_SRC="$SCRIPT_DIR/../target/$target/$PROFILE_DIR/libanywhere.so"
     SO_DST="$ANDROID_PROJECT/app/src/main/jniLibs/$ABI_DIR/"
 
     mkdir -p "$SO_DST"
@@ -192,7 +314,10 @@ done
 # ============================================================
 # 5. APK build (optional, pass --apk or --all)
 # ============================================================
-if [[ "$BUILD_APK" == "true" ]]; then
+# The APK is only built when it was asked for (--apk/--all) AND android is in
+# scope: `wants` is true for every platform when nothing was selected, so a
+# platform selection that excludes android skips the (slow) gradle leg.
+if [[ "$BUILD_APK" == "true" ]] && wants android-arm64; then
     echo ""
     echo "=== Building APK ==="
 
@@ -247,20 +372,27 @@ else
     echo "  ./scripts/build_on_mac.sh --apk"
     echo "  (or open the project in Android Studio)"
 fi
+}
+
+if wants android-arm64; then
+    build_android
+fi
 
 # ============================================================
-# 6. Package release artifacts (--releases)
+# 6. Package artifacts (--pack)
 # ============================================================
-# Collect per-platform release artifacts into quiche/releases/ as
-# anywhere-v<version>-<platform>.(tgz|apk), ready for GitHub upload.
-if [[ "$RELEASES" == "true" ]]; then
+# Collect per-platform binaries into quiche/packs/<profile>/ as
+# anywhere-v<version>-<platform>.(tgz|apk), ready for GitHub upload. The
+# profile is the directory, so names stay profile-neutral and a debug pack
+# can never be swept up by `gh release create packs/release/*`.
+if [[ "$PACK" == "true" ]]; then
     echo ""
-    echo "=== Packaging releases (v${VERSION}) ==="
-    REL_DIR="$SCRIPT_DIR/../releases"
+    echo "=== Packaging artifacts (v${VERSION}, $PROFILE_DIR) ==="
+    REL_DIR="$SCRIPT_DIR/../packs/$PROFILE_DIR"
     mkdir -p "$REL_DIR"
     # Stage inside REL_DIR, not the system tmpdir: sandboxed environments
     # can virtualize /var/folders|/tmp writes, which once materialized the
-    # staging copies into releases/ itself. Workspace writes are always real.
+    # staging copies into the output dir itself. Workspace writes are real.
     STAGE="$REL_DIR/.stage.$$"
     mkdir -p "$STAGE"
     trap 'rm -rf "$STAGE"' EXIT
@@ -272,6 +404,8 @@ if [[ "$RELEASES" == "true" ]]; then
     pack_bins() {
         local platform="$1" src="$2" extra_src="$3"
         shift 3
+        # Package only what is in scope; no platform arguments means everything.
+        wants "$platform" || return 0
         local top="anywhere-v${VERSION}-${platform}"
         local bin have=0
         mkdir -p "$STAGE/$top"
@@ -280,7 +414,7 @@ if [[ "$RELEASES" == "true" ]]; then
                 cp "$src/$bin" "$STAGE/$top/"
                 have=1
             else
-                echo "  ⚠ $platform: $bin not found, skipped"
+                echo "  ⚠ $platform: $bin not found in $src, skipped"
             fi
         done
         if [[ -n "$extra_src" ]]; then
@@ -305,25 +439,36 @@ if [[ "$RELEASES" == "true" ]]; then
     }
 
     pack_bins "mac-arm64" \
-        "$SCRIPT_DIR/../target/release" "" \
+        "$SCRIPT_DIR/../target/$PROFILE_DIR" "" \
         anywhere
     pack_bins "linux-aarch64-musl" \
-        "$SCRIPT_DIR/../target/aarch64-unknown-linux-musl/release" "" \
+        "$SCRIPT_DIR/../target/aarch64-unknown-linux-musl/$PROFILE_DIR" \
+        "$SCRIPT_DIR/../anywhere/deploy/linux" \
+        anywhere
+    pack_bins "linux-x64-musl" \
+        "$SCRIPT_DIR/../target/x86_64-unknown-linux-musl/$PROFILE_DIR" \
+        "$SCRIPT_DIR/../anywhere/deploy/linux" \
         anywhere
     pack_bins "windows-x64-gnu" \
-        "$SCRIPT_DIR/../target/x86_64-pc-windows-gnu/release" \
+        "$SCRIPT_DIR/../target/x86_64-pc-windows-gnu/$PROFILE_DIR" \
         "$SCRIPT_DIR/../anywhere/deploy/windows" \
         anywhere.exe
 
     # Android raw executable: the APK carries only the cdylib (not exec'able),
     # while the conformance harness runs this bin via adb shell.
     pack_bins "android-arm64" \
-        "$SCRIPT_DIR/../target/aarch64-linux-android/release" "" \
+        "$SCRIPT_DIR/../target/aarch64-linux-android/$PROFILE_DIR" "" \
         anywhere
 
-    # Android APK
+    # Android APK. Gradle always builds its own release variant, so the archive
+    # name carries no profile suffix — and it is only collected when this run
+    # actually built it (--apk/--all), otherwise a stale artifact would ship.
     APK_SRC="$ANDROID_PROJECT/app/build/outputs/apk/release/app-release.apk"
-    if [[ -f "$APK_SRC" ]]; then
+    if ! wants android-arm64; then
+        echo "  - android-arm64 not in scope, apk skipped"
+    elif [[ "$BUILD_APK" != "true" ]]; then
+        echo "  - apk not built this run (pass --apk or --all), skipped"
+    elif [[ -f "$APK_SRC" ]]; then
         cp "$APK_SRC" "$REL_DIR/anywhere-v${VERSION}-android-arm64.apk"
         echo "  ✅ anywhere-v${VERSION}-android-arm64.apk"
     else
@@ -351,9 +496,13 @@ if [[ "$RELEASES" == "true" ]]; then
     fi
 
     echo ""
-    echo "=== Releases in $REL_DIR ==="
+    echo "=== Artifacts in $REL_DIR ==="
     ls -lh "$REL_DIR"
     echo ""
-    echo "Upload hint:"
-    echo "  gh release create v${VERSION} $REL_DIR/* --generate-notes"
+    if [[ "$PROFILE_DIR" == "release" ]]; then
+        echo "Upload hint:"
+        echo "  gh release create v${VERSION} $REL_DIR/* --generate-notes"
+    else
+        echo "  debug pack only — not for upload; release artifacts live in packs/release/"
+    fi
 fi

@@ -1558,13 +1558,13 @@ pub async fn run_subscription(
         let save_path = std::path::Path::new("sub_error.html");
         let saved = std::fs::write(&save_path, &resp.body).is_ok();
         let saved_msg = if saved {
-            format!("，响应内容已保存到 {}", save_path.display())
+            format!(", response body saved to {}", save_path.display())
         } else {
             String::new()
         };
         return Err(format!(
-            "订阅返回了 HTML 页面（多为\"请升级客户端\"提示）。\
-                 可用 --sub-ua 指定一个被机场识别的 UA 后重试{}",
+            "Subscription returned an HTML page (usually a \"please upgrade client\" notice).\
+                 Retry with --sub-ua set to a UA recognized by the provider{}",
             saved_msg
         )
         .into());

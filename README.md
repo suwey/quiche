@@ -122,7 +122,7 @@ Confirm works fine before reboot, if can't work, ctrl+c or ./anywhere.sh stop, c
 Install apk, click start button, click `Open Web UI` (or open in computer on same local network), then go to config page: upload or edit [anywhere.toml](./anywhere-android/app/src/main/assets/config/anywhere.toml), it will restart.
 
 
-`bash scripts/build.sh --apk` to build apk, see prerequisites in [build_on_mac.sh](./scripts/build_on_mac.sh).
+`bash scripts/build_on_mac.sh --apk` to build the apk (android only, nothing else), see prerequisites in [build_on_mac.sh](./scripts/build_on_mac.sh). Add `--pack` to also drop it into `packs/<profile>/`.
 
 ## Windows
 Download [wintun](https://www.wintun.net), copy your platform's `wintun.dll` to same dir with `anywhere.exe` and [start.bat](./anywhere/deploy/windows/start.bat), right click `start.bat` and run as admin to use tun mode.

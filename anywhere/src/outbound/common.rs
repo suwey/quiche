@@ -295,6 +295,12 @@ pub async fn connect_tcp_bypass(
                     .with_retries(3),
             )?;
             socket.connect_timeout(&addr.into(), TCP_CONNECT_TIMEOUT)?;
+            // `connect_timeout` restores the blocking flag when it returns, and
+            // `TcpStream::from_std` requires a non-blocking fd — handing it a
+            // blocking socket leaves every write past the handshake parked
+            // forever (loopback dials take the early return above and are
+            // unaffected, so only cross-host outbounds showed it).
+            socket.set_nonblocking(true)?;
             let std_stream: std::net::TcpStream = socket.into();
             TcpStream::from_std(std_stream)
         })
