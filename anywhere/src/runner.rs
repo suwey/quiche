@@ -42,10 +42,7 @@ use crate::relay::bidirectional_relay;
 const REJECT_TAG: &str = "reject";
 
 fn is_reject_tag(tag: &str) -> bool {
-    // "none" is a legacy alias: subscription conversion before 2026-10 mapped
-    // Clash REJECT rules to "none", which got persisted into users' TOML
-    // configs. Keep accepting it or those existing rules silently blackhole.
-    tag == REJECT_TAG || tag == "none"
+    tag == REJECT_TAG
 }
 use crate::rules::Rules;
 use crate::rules::SniffInfo;
@@ -1530,10 +1527,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn is_reject_tag_accepts_reject_and_legacy_none() {
+    fn is_reject_tag_accepts_only_reject() {
         assert!(is_reject_tag("reject"));
-        // Legacy alias persisted by pre-2026-10 subscription conversion.
-        assert!(is_reject_tag("none"));
+        // The pre-2026-10 "none" alias was removed; old configs must be
+        // re-imported so their rules regenerate with the "reject" tag.
+        assert!(!is_reject_tag("none"));
         assert!(!is_reject_tag("direct"));
         assert!(!is_reject_tag("auto"));
         assert!(!is_reject_tag(""));

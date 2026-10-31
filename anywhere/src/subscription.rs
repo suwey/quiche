@@ -1618,8 +1618,8 @@ mod tests {
             map_rule_target("REJECT-DROP", &valid_refs, &mut skips),
             Some("reject".to_string())
         );
-        // Must not regress to the legacy "none" tag (unknown outbound in
-        // the runner, i.e. a blackhole).
+        // Must not regress to the removed legacy "none" tag (unknown
+        // outbound in the runner, i.e. a blackhole).
         assert!(skips.is_empty());
         assert_eq!(map_rule_target("PASS", &valid_refs, &mut skips), None);
         assert!(skips.is_empty());

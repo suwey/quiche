@@ -57,9 +57,9 @@ stderr(即日志)产生乱码;② 每条路由一个子进程(启动/关闭 8+ �
 
 - **A1** `subscription.rs:982`:`"REJECT" | "REJECT-DROP" => Some("reject".to_string())`;
   同步更新 `map_rule_target` 的 doc 注释(`REJECT`/`REJECT-DROP` -> `reject`)。
-- **A2** `runner.rs:44-46` `is_reject_tag`:`tag == REJECT_TAG || tag == "none"`,
-  并注释说明 `"none"` 是旧版订阅转换(`subscription.rs` 2026-10 之前)遗留的
-  存量配置兼容,勿删。
+- **A2** `runner.rs` `is_reject_tag`:曾临时接受 `"none"` 作为旧版订阅转换
+  (2026-10 之前)写入存量 TOML 的遗留别名;**2026-11-01 按决议移除**,
+  仅接受 `"reject"`——存量配置需重新导入订阅以重新生成规则(见 §7)。
 - **A3** 未知 tag 兜底(两处调用点):
   - TCP(`runner.rs:1370-1376`):`registry.get` 失败时,先
     `reset_tcp_stream(&mut stream)` 再 return——任何配置笔误都不应造成静默黑洞。
@@ -215,3 +215,16 @@ udp/53 吸进 TUN,`handler.rs` 按 `dst_port == 53` 拦截,与系统 DNS 配置�
 **教训**:修复"失败的路径"之前,先确认该路径此前是否真的成功执行过——
 本例 hijack 的 WARN 在所有历史日志里都存在,而 TUN :53 拦截设计从未依赖它。
 新增功能激活一条从未跑通过的代码路径时,必须在实机验证该路径本身。
+
+## 7. 补录:移除遗留 `none` 别名(2026-11-01 决议)
+
+§1 A2 曾为存量配置兼容让 `is_reject_tag` 同时接受 `"none"`。实机验证通过后,
+按用户决议**移除该别名**,项目内 REJECT 语义统一为唯一的 `"reject"` tag:
+
+- `runner.rs`:`is_reject_tag` 收紧为 `tag == REJECT_TAG`,测试同步更新;
+- 存量影响:旧订阅导入生成的 `outbound = "none"` 规则在升级后不再被识别为
+  reject,会落入"未知 tag"路径——TCP 已是 A3 的 RST 快速失败(非黑洞),
+  UDP 静默丢弃,并有 `No outbound tag 'none' (matched rule ...)` WARN 提示。
+  **处置:在设备上重新导入订阅**即可按新映射重新生成全部规则;
+- `openrung.rs` / `macos.rs` 中的 `"none"` 字面量为无关语义(缺省值标记、
+  路由文本过滤),不属此次统一范围。
