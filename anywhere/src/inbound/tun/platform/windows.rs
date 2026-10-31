@@ -2,54 +2,83 @@
 //!
 //! The Wintun adapter itself is created by the `tun` crate (which loads
 //! `wintun.dll` at runtime) in `TunInbound::new()`. This module handles only
-//! routing, DNS hijacking, and cleanup - mirroring `macos.rs`.
+//! routing and cleanup - mirroring `macos.rs`.
 //!
-//! Routing uses the `route` command with the TUN address as the gateway (like
-//! macOS), so no interface-index resolution is needed for route installation.
+//! Routing is pure iphlpapi v2 via `windows_route.rs`
+//! (`MIB_IPFORWARD_ROW2` + `CreateIpForwardEntry2`/`DeleteIpForwardEntry2`):
+//! no child processes, no text parsing, no OEM code-page garbage.
+//!
+//! DNS is intentionally NOT hijacked via `netsh`: the split-default routes
+//! already pull every udp/53 packet (whatever resolver the system uses) into
+//! the TUN, where the handler intercepts it by port. Pointing the system DNS
+//! at the TUN's own address would send queries down the Windows loopback
+//! path - packets to a local IP never traverse the adapter, so they would
+//! never reach the TUN handler at all (and a crash without cleanup would
+//! leave the system with a dead resolver).
 
-use std::net::IpAddr;
-use std::process::Command;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
-use super::run_cmd;
+use windows_sys::Win32::Networking::WinSock::{AF_INET, AF_INET6};
+
+use super::windows_route;
 
 /// Remove leftover TUN routes from a previous run that crashed without
-/// cleaning up. Best-effort: a missing route is not an error.
+/// cleaning up. Best-effort: a missing route is not an error. Scans the whole
+/// forwarding table by prefix (same global semantics as the old
+/// `route DELETE` calls), so no manager state is needed at startup.
 pub fn cleanup_stale_routing() {
-    let _ = run_cmd("route", &["DELETE", "0.0.0.0", "MASK", "128.0.0.0"]);
-    let _ = run_cmd("route", &["DELETE", "128.0.0.0", "MASK", "128.0.0.0"]);
-    let _ = run_cmd("route", &["-6", "DELETE", "::/1"]);
-    let _ = run_cmd("route", &["-6", "DELETE", "8000::/1"]);
-    log::info!("Windows: stale TUN routes cleaned up");
+    let v4 = windows_route::routes_delete_by_prefix(
+        AF_INET,
+        &[
+            (IpAddr::V4(Ipv4Addr::UNSPECIFIED), 1), // 0.0.0.0/1
+            (IpAddr::V4(Ipv4Addr::new(128, 0, 0, 0)), 1), // 128.0.0.0/1
+        ],
+    );
+    let v6 = windows_route::routes_delete_by_prefix(
+        AF_INET6,
+        &[
+            (IpAddr::V6(Ipv6Addr::UNSPECIFIED), 1), // ::/1
+            // 8000::/1: the top half of the IPv6 space.
+            (IpAddr::V6(Ipv6Addr::new(0x8000, 0, 0, 0, 0, 0, 0, 0)), 1),
+        ],
+    );
+    log::info!(
+        "Windows: stale TUN routes cleaned up ({v4} IPv4 + {v6} IPv6 entries removed)"
+    );
+}
+
+/// One installed split-default route, remembered for exact cleanup.
+#[derive(Clone, Copy)]
+struct InstalledRoute {
+    prefix: IpAddr,
+    prefix_len: u8,
+    iface_index: u32,
+    next_hop: IpAddr,
 }
 
 /// Route manager for the Windows TUN (Wintun) interface.
 ///
 /// Manages:
 /// - Default route via TUN (0.0.0.0/1 + 128.0.0.0/1 split trick)
-/// - DNS hijacking by pointing the system DNS at the TUN address
-/// - Cleanup of routes and DNS on drop
+/// - Cleanup of routes on drop
+///
+/// DNS is deliberately left to the system: the split routes funnel all
+/// udp/53 into the TUN handler regardless of the configured resolver, so
+/// there is nothing to hijack (see the module docs for why `netsh` was
+/// removed).
 pub struct WindowsTunManager {
     pub iface_name: String,
     pub tun_addr: IpAddr,
-    /// Whether split-default routes were installed (for cleanup).
-    routes_installed: bool,
-    /// Whether the system DNS was changed (for restore).
-    dns_changed: bool,
-    /// Backup of the original primary DNS server, restored on cleanup.
-    original_dns: Option<String>,
-    /// Whether DNS hijacking is active (copied from config at startup).
-    auto_hijack: bool,
+    /// Split-default routes installed by `setup_routing` (exact cleanup).
+    installed_routes: Vec<InstalledRoute>,
 }
 
 impl WindowsTunManager {
-    pub fn new(iface_name: String, tun_addr: IpAddr, auto_hijack: bool) -> Self {
+    pub fn new(iface_name: String, tun_addr: IpAddr) -> Self {
         Self {
             iface_name,
             tun_addr,
-            routes_installed: false,
-            dns_changed: false,
-            original_dns: None,
-            auto_hijack,
+            installed_routes: Vec::new(),
         }
     }
 
@@ -68,257 +97,121 @@ impl WindowsTunManager {
     ///
     /// Uses the 0.0.0.0/1 + 128.0.0.0/1 trick: two /1 routes are more specific
     /// than the default 0.0.0.0/0, so all traffic follows them through the TUN
-    /// without touching the original default route. The TUN address is the
-    /// gateway; Windows resolves the egress interface from it.
+    /// without touching the original default route. Routes are keyed to the
+    /// Wintun adapter's IfIndex (resolved once via `GetAdaptersAddresses`)
+    /// with the TUN address as next hop; only the TUN address family is
+    /// touched, same as the old route.exe behavior.
     pub fn setup_routing(
-        &mut self, auto_hijack: bool, _bypass_ips: &[String],
+        &mut self, _bypass_ips: &[String],
     ) -> Result<(), String> {
-        let tun_addr_str = self.tun_addr.to_string();
+        // The Wintun adapter is created by the `tun` crate without a
+        // configured name, so its FriendlyName is the crate default
+        // ("wintun") - NOT the internal "tun0" label this manager holds.
+        // Anchor on the adapter's own unicast address (we assigned it),
+        // falling back to a name match.
+        let tun_addr = self.tun_addr;
+        let (iface_index, matched_by) =
+            windows_route::find_tun_adapter(tun_addr, &self.iface_name)
+                .ok_or_else(|| {
+                    format!(
+                        "TUN adapter not found via GetAdaptersAddresses by \
+                         address {tun_addr} or name '{}' (routing not installed)",
+                        self.iface_name
+                    )
+                })?;
 
-        match self.tun_addr {
-            IpAddr::V4(_) => {
-                run_cmd(
-                    "route",
-                    &["ADD", "0.0.0.0", "MASK", "128.0.0.0", &tun_addr_str],
+        let prefixes: [(IpAddr, u8); 2] = match self.tun_addr {
+            IpAddr::V4(_) => [
+                (IpAddr::V4(Ipv4Addr::UNSPECIFIED), 1), // 0.0.0.0/1
+                (IpAddr::V4(Ipv4Addr::new(128, 0, 0, 0)), 1), // 128.0.0.0/1
+            ],
+            IpAddr::V6(_) => [
+                (IpAddr::V6(Ipv6Addr::UNSPECIFIED), 1), // ::/1
+                (IpAddr::V6(Ipv6Addr::new(0x8000, 0, 0, 0, 0, 0, 0, 0)), 1), // 8000::/1
+            ],
+        };
+
+        for (prefix, prefix_len) in prefixes {
+            windows_route::route_add(
+                prefix,
+                prefix_len,
+                iface_index,
+                self.tun_addr,
+            )
+            .map_err(|e| {
+                format!(
+                    "route add {prefix}/{prefix_len} failed (Win32 error {e})"
                 )
-                .map_err(|e| e.to_string())?;
-                run_cmd(
-                    "route",
-                    &["ADD", "128.0.0.0", "MASK", "128.0.0.0", &tun_addr_str],
-                )
-                .map_err(|e| e.to_string())?;
-            },
-            IpAddr::V6(_) => {
-                run_cmd("route", &["-6", "ADD", "::/1", &tun_addr_str])
-                    .map_err(|e| e.to_string())?;
-                run_cmd("route", &["-6", "ADD", "8000::/1", &tun_addr_str])
-                    .map_err(|e| e.to_string())?;
-            },
+            })?;
+            // Record only after a successful install so cleanup stays exact.
+            self.installed_routes.push(InstalledRoute {
+                prefix,
+                prefix_len,
+                iface_index,
+                next_hop: self.tun_addr,
+            });
         }
 
-        self.routes_installed = true;
         log::info!(
-            "Windows TUN split-default routes installed via {} (gateway {})",
+            "Windows TUN split-default routes installed on {} (matched by {matched_by}, \
+             ifindex {iface_index}, gateway {})",
             self.iface_name,
             self.tun_addr
         );
 
-        // DNS hijacking: point the system DNS at the TUN address so all
-        // queries reach our in-process resolver (which returns fake-IPs).
-        if auto_hijack {
-            if let Err(e) = self.setup_dns_hijack() {
-                log::warn!(
-                    "Windows DNS hijack failed (routing still active): {e}"
-                );
-            }
-        }
+        // No system-DNS change: the split routes already funnel every
+        // udp/53 packet into the TUN, where the handler intercepts it by
+        // port (see module docs for why pointing the system resolver at the
+        // TUN's own address is broken on Windows).
 
         Ok(())
     }
 
-    /// Remove the split-default routes installed by `setup_routing`.
-    ///
-    /// Best-effort: a missing route (already cleaned up) is not an error.
+    /// Remove the split-default routes installed by `setup_routing`, using the
+    /// remembered prefix/iface/next-hop parameters for exact deletion
+    /// (`route_delete` treats a missing route as success).
     pub fn cleanup_routing(&mut self) {
-        if self.routes_installed {
-            let tun_addr_str = self.tun_addr.to_string();
-            match self.tun_addr {
-                IpAddr::V4(_) => {
-                    let _ = run_cmd(
-                        "route",
-                        &[
-                            "DELETE",
-                            "0.0.0.0",
-                            "MASK",
-                            "128.0.0.0",
-                            &tun_addr_str,
-                        ],
+        if !self.installed_routes.is_empty() {
+            for route in self.installed_routes.drain(..) {
+                if let Err(e) = windows_route::route_delete(
+                    route.prefix,
+                    route.prefix_len,
+                    route.iface_index,
+                    route.next_hop,
+                ) {
+                    log::warn!(
+                        "Windows TUN route delete {}/{} failed (Win32 error {})",
+                        route.prefix,
+                        route.prefix_len,
+                        e
                     );
-                    let _ = run_cmd(
-                        "route",
-                        &[
-                            "DELETE",
-                            "128.0.0.0",
-                            "MASK",
-                            "128.0.0.0",
-                            &tun_addr_str,
-                        ],
-                    );
-                },
-                IpAddr::V6(_) => {
-                    let _ = run_cmd(
-                        "route",
-                        &["-6", "DELETE", "::/1", &tun_addr_str],
-                    );
-                    let _ = run_cmd(
-                        "route",
-                        &["-6", "DELETE", "8000::/1", &tun_addr_str],
-                    );
-                },
+                }
             }
-            self.routes_installed = false;
             log::info!("Windows TUN routes removed");
         }
-
-        self.restore_dns();
     }
 
-    /// Enable TUN routing (install split-default routes + DNS hijack).
+    /// Enable TUN routing (install split-default routes).
     /// Idempotent: no-op if already enabled. Used by the runtime
     /// `tun_routing_enable` API; the TUN interface itself stays up.
     pub fn enable_routing(&mut self) -> Result<(), String> {
-        if self.routes_installed {
+        if !self.installed_routes.is_empty() {
             return Ok(());
         }
-        self.setup_routing(self.auto_hijack, &[])
+        self.setup_routing(&[])
     }
 
     /// Disable TUN routing (remove routes + restore DNS).
     /// Idempotent: no-op if already disabled. The TUN interface stays up.
     pub fn disable_routing(&mut self) {
-        if !self.routes_installed {
+        if self.installed_routes.is_empty() {
             return;
         }
         self.cleanup_routing()
     }
 
-    /// Whether TUN routing (routes + DNS hijack) is currently active.
+    /// Whether TUN routing (split-default routes) is currently active.
     pub fn is_routing_enabled(&self) -> bool {
-        self.routes_installed
+        !self.installed_routes.is_empty()
     }
-
-    /// Point the system DNS at the TUN address.
-    ///
-    /// Uses `netsh interface ip set dns` on the primary interface. The original
-    /// DNS is captured first so it can be restored on cleanup. This affects the
-    /// whole system, so robust restore (and startup cleanup) is essential.
-    fn setup_dns_hijack(&mut self) -> Result<(), String> {
-        let iface = match primary_interface() {
-            Some(i) => i,
-            None => return Err("could not determine primary interface".into()),
-        };
-
-        // Back up the current DNS for restore on shutdown.
-        self.original_dns = get_dns(&iface);
-        let tun_addr_str = self.tun_addr.to_string();
-
-        // Set the TUN address as the DNS server on the primary interface.
-        let out = Command::new("netsh")
-            .args([
-                "interface",
-                "ip",
-                "set",
-                "dns",
-                &iface,
-                "static",
-                &tun_addr_str,
-            ])
-            .output()
-            .map_err(|e| format!("netsh set dns failed: {e}"))?;
-        if !out.status.success() {
-            return Err(format!(
-                "netsh set dns failed: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
-            ));
-        }
-
-        self.dns_changed = true;
-        log::info!(
-            "Windows DNS hijack: set {} DNS to {} (was {:?})",
-            iface,
-            self.tun_addr,
-            self.original_dns
-        );
-        Ok(())
-    }
-
-    /// Restore the original DNS settings if we changed them.
-    fn restore_dns(&mut self) {
-        if !self.dns_changed {
-            return;
-        }
-        let iface = match primary_interface() {
-            Some(i) => i,
-            None => {
-                log::warn!("Windows DNS restore: cannot find primary interface");
-                return;
-            },
-        };
-        match self.original_dns.take() {
-            Some(dns) => {
-                let _ = Command::new("netsh")
-                    .args([
-                        "interface",
-                        "ip",
-                        "set",
-                        "dns",
-                        &iface,
-                        "static",
-                        &dns,
-                    ])
-                    .output();
-                log::info!("Windows DNS restored to {dns} on {iface}");
-            },
-            None => {
-                // No backup recorded: reset to DHCP.
-                let _ = Command::new("netsh")
-                    .args(["interface", "ip", "set", "dns", &iface, "dhcp"])
-                    .output();
-                log::info!("Windows DNS reset to DHCP on {iface}");
-            },
-        }
-        self.dns_changed = false;
-    }
-}
-
-/// Find the primary (default-route) interface name via `route print`.
-///
-/// Returns the interface name suitable for `netsh interface ip set dns`.
-fn primary_interface() -> Option<String> {
-    // `route print 0.0.0.0` lists the default route; the trailing column is
-    // the interface name. We take the first default route's interface.
-    let out = Command::new("route")
-        .args(["print", "0.0.0.0"])
-        .output()
-        .ok()?;
-    let text = String::from_utf8_lossy(&out.stdout);
-    for line in text.lines() {
-        let line = line.trim();
-        // Default route lines look like:
-        //   0.0.0.0  0.0.0.0  <gateway>  <iface>  <metric>
-        if line.starts_with("0.0.0.0") {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            // The interface name is the last-but-one or last field; interface
-            // names can contain spaces, so rejoin from index 3 onward.
-            if parts.len() >= 4 {
-                return Some(parts[3..].join(" "));
-            }
-        }
-    }
-    None
-}
-
-/// Read the current DNS server of an interface via `netsh`.
-fn get_dns(iface: &str) -> Option<String> {
-    let out = Command::new("netsh")
-        .args(["interface", "ip", "show", "dns", iface])
-        .output()
-        .ok()?;
-    let text = String::from_utf8_lossy(&out.stdout);
-    // Output contains lines like `    192.168.1.1` under the interface header.
-    for line in text.lines() {
-        let line = line.trim();
-        if !line.is_empty()
-            && line
-                .chars()
-                .next()
-                .map(|c| c.is_ascii_digit())
-                .unwrap_or(false)
-        {
-            return Some(
-                line.split_whitespace().next().unwrap_or(line).to_string(),
-            );
-        }
-    }
-    None
 }

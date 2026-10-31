@@ -95,10 +95,13 @@ android_logger = "0.15"
 [target.'cfg(target_os = "windows")'.dependencies]
 # windows-sys: GetIpForwardTable (default-route interface index for
 # IP_UNICAST_IF bypass) and Win32 socket constants. Zero-runtime FFI bindings.
+# Win32_NetworkManagement_Ndis: MIB_IPFORWARD_ROW2/IP_ADAPTER_ADDRESSES_LH/
+# IfOperStatusUp for the iphlpapi v2 routing in tun/platform/windows_route.rs.
 # Win32_System_ProcessStatus + Win32_System_Threading: GetProcessMemoryInfo for
 # RSS memory display in the UI stats ticker.
 windows-sys = { version = "0.61", features = [
     "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
     "Win32_Networking_WinSock",
     "Win32_Foundation",
     "Win32_System_ProcessStatus",

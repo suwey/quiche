@@ -597,20 +597,18 @@ impl TunInbound {
             TunGuard { _inner: Some(mgr) }
         };
 
-        // Windows: manage routes + DNS via shell commands (route/netsh).
+        // Windows: routes via iphlpapi; DNS relies on the TUN :53 port
+        // interception, so the system resolver is never modified.
         #[cfg(target_os = "windows")]
         let guard = {
-            let mut mgr =
-                WindowsTunManager::new(name.clone(), addr, config.auto_hijack);
+            let mut mgr = WindowsTunManager::new(name.clone(), addr);
 
             if let Err(e) = mgr.setup_interface() {
                 log::warn!("Failed to setup TUN interface: {e}");
             }
 
             if config.auto_route {
-                if let Err(e) =
-                    mgr.setup_routing(config.auto_hijack, &config.bypass_ips)
-                {
+                if let Err(e) = mgr.setup_routing(&config.bypass_ips) {
                     log::warn!("Failed to set up routing: {e}");
                 }
             }

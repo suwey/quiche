@@ -18,6 +18,12 @@ pub mod macos;
 #[cfg(target_os = "windows")]
 pub mod windows;
 
+/// Pure-iphlpapi routing primitives for the Windows TUN (no subprocesses).
+/// Windows-only: all types come from windows-sys behind Windows-specific
+/// Cargo features, so the module is only compiled on Windows.
+#[cfg(target_os = "windows")]
+pub(super) mod windows_route;
+
 /// Run an arbitrary command, returning an error on non-zero exit.
 /// All shell commands from TUN routing should go through this so
 /// there is a single place with debug logging and error formatting.
