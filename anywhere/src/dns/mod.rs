@@ -427,7 +427,7 @@ impl DnsHijack {
     ) -> bool {
         match self.resolve_query(query, src_ip).await {
             Some(response) => {
-                log::info!(
+                log::debug!(
                     "DNS handle_query: resolved {} bytes, sending via TUN to {src_ip}:{src_port}",
                     response.len()
                 );
@@ -457,7 +457,7 @@ impl DnsHijack {
     ) -> Option<Vec<u8>> {
         let q = parse_dns_query(query)?;
 
-        log::info!(
+        log::debug!(
             "DNS resolve: name={} qtype={} src={}",
             q.name,
             q.qtype,
@@ -466,7 +466,7 @@ impl DnsHijack {
 
         // AAAA -> empty answer (no v6 end-to-end yet).
         if q.qtype == 28 {
-            log::info!("DNS resolve: {} type AAAA -> empty (no v6)", q.name);
+            log::debug!("DNS resolve: {} type AAAA -> empty (no v6)", q.name);
             return build_empty_response(query);
         }
 
@@ -582,7 +582,7 @@ impl DnsHijack {
         &self, query: &[u8], upstream: &Destination,
     ) -> Option<Vec<u8>> {
         let addr: std::net::SocketAddr = upstream.to_string().parse().ok()?;
-        log::info!("resolve_direct_udp: upstream={addr}");
+        log::debug!("resolve_direct_udp: upstream={addr}");
         let (result, timed_out) =
             self.resolve_direct_udp_attempt(query, addr, true).await;
         if !timed_out {
@@ -612,7 +612,7 @@ impl DnsHijack {
         };
         let sock = match sock {
             Some(s) => {
-                log::info!("resolve_direct_udp: reused pooled socket");
+                log::debug!("resolve_direct_udp: reused pooled socket");
                 s
             },
             None => {
@@ -633,7 +633,7 @@ impl DnsHijack {
                         return (None, false);
                     },
                 }
-                log::info!("resolve_direct_udp: socket connected to {addr}");
+                log::debug!("resolve_direct_udp: socket connected to {addr}");
                 s
             },
         };
@@ -689,7 +689,7 @@ impl DnsHijack {
                 }
             },
         }
-        log::info!(
+        log::debug!(
             "resolve_direct_udp: sent {len} bytes to {addr}",
             len = query.len()
         );
@@ -697,7 +697,7 @@ impl DnsHijack {
         let mut timed_out = false;
         let result = match timeout(QUERY_TIMEOUT, sock.recv(&mut buf)).await {
             Ok(Ok(n)) => {
-                log::info!("resolve_direct_udp: got {n} bytes from {addr}");
+                log::debug!("resolve_direct_udp: got {n} bytes from {addr}");
                 Some(buf[..n].to_vec())
             },
             Ok(Err(e)) => {
@@ -866,7 +866,7 @@ impl DnsHijack {
                 },
             };
             let query = buf[..n].to_vec();
-            log::info!("DNS listener: received {n} bytes from {src}");
+            log::debug!("DNS listener: received {n} bytes from {src}");
             let this = this.clone();
             let sock = socket.clone();
             tokio::spawn(async move {
@@ -880,7 +880,7 @@ impl DnsHijack {
                             .await
                             .or_else(|| build_refused_response(&query));
                         if let Some(r) = response {
-                            log::info!("DNS listener: sending {} bytes to {src}", r.len());
+                            log::debug!("DNS listener: sending {} bytes to {src}", r.len());
                             let _ = sock.send_to(&r, src).await;
                         } else {
                             log::warn!("DNS listener: no response for {src}");
@@ -937,7 +937,7 @@ impl DnsHijack {
                 _ => "",
             };
             if let Some(resp) = self.doh.resolve(query, up).await {
-                log::info!("DNS: {qname} (type {qtype}) -> DoH({host}) OK");
+                log::debug!("DNS: {qname} (type {qtype}) -> DoH({host}) OK");
                 return Some(resp);
             }
             // DoH failed - fall through to plain UDP fallback.
@@ -950,7 +950,7 @@ impl DnsHijack {
                     let d = dest.to_string();
                     if let Some(resp) = self.resolve_direct_udp(query, dest).await
                     {
-                        log::info!("DNS: {qname} (type {qtype}) -> UDP({d}) OK");
+                        log::debug!("DNS: {qname} (type {qtype}) -> UDP({d}) OK");
                         return Some(resp);
                     }
                 }
@@ -974,7 +974,7 @@ impl DnsHijack {
                     if let Some(resp) =
                         self.resolve_via_outbound(query, dest, c).await
                     {
-                        log::info!(
+                        log::debug!(
                             "DNS: {qname} (type {qtype}) -> via {tag}({d}) OK"
                         );
                         return Some(resp);
@@ -1007,7 +1007,7 @@ impl DnsHijack {
                 ));
             },
         };
-        log::info!(
+        log::debug!(
             "DNS send_response: {} bytes, src={}:53 dst={}:{} via TUN writer",
             raw.len(),
             src_ip,
