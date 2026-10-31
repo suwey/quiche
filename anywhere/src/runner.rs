@@ -42,7 +42,10 @@ use crate::relay::bidirectional_relay;
 const REJECT_TAG: &str = "reject";
 
 fn is_reject_tag(tag: &str) -> bool {
-    tag == REJECT_TAG
+    // "none" is a legacy alias: subscription conversion before 2026-10 mapped
+    // Clash REJECT rules to "none", which got persisted into users' TOML
+    // configs. Keep accepting it or those existing rules silently blackhole.
+    tag == REJECT_TAG || tag == "none"
 }
 use crate::rules::Rules;
 use crate::rules::SniffInfo;
@@ -1244,7 +1247,10 @@ async fn run_inbound(mut inbound: impl Inbound + 'static, ctx: AppContext) {
                     let client = match ctx.registry.get(&tag) {
                         Some(c) => c,
                         None => {
-                            log::warn!("No outbound tag '{tag}'");
+                            log::warn!(
+                                "No outbound tag '{tag}' (matched rule '{}')",
+                                rule_match.description
+                            );
                             return;
                         },
                     };
@@ -1370,7 +1376,13 @@ async fn run_inbound(mut inbound: impl Inbound + 'static, ctx: AppContext) {
             let client = match ctx.registry.get(&tag) {
                 Some(c) => c,
                 None => {
-                    log::warn!("No outbound tag '{tag}'");
+                    log::warn!(
+                        "No outbound tag '{tag}' (matched rule '{}')",
+                        rule_match.description
+                    );
+                    // Unknown tag is a config error; reset the client
+                    // connection so it fails fast instead of blackholing.
+                    reset_tcp_stream(&mut stream).await;
                     return;
                 },
             };
@@ -1511,4 +1523,19 @@ async fn reset_tcp_stream(stream: &mut Box<dyn crate::relay::StreamRelay>) {
     // TcpRelay overrides it to set SO_LINGER=0 before closing, which
     // causes the kernel to send RST on drop.
     stream.reset().await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_reject_tag_accepts_reject_and_legacy_none() {
+        assert!(is_reject_tag("reject"));
+        // Legacy alias persisted by pre-2026-10 subscription conversion.
+        assert!(is_reject_tag("none"));
+        assert!(!is_reject_tag("direct"));
+        assert!(!is_reject_tag("auto"));
+        assert!(!is_reject_tag(""));
+    }
 }

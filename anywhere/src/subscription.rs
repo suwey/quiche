@@ -971,7 +971,7 @@ fn parse_clash_rules(
 }
 
 /// Map a Clash rule TARGET to an anywhere `outbound` value.
-/// `DIRECT` -> `direct`, `REJECT`/`REJECT-DROP` -> `none`, `PASS` dropped,
+/// `DIRECT` -> `direct`, `REJECT`/`REJECT-DROP` -> `reject`, `PASS` dropped,
 /// proxy/group names must exist in `valid_refs` else recorded in `skips`.
 fn map_rule_target(
     target: &str, valid_refs: &std::collections::HashSet<String>,
@@ -979,7 +979,7 @@ fn map_rule_target(
 ) -> Option<String> {
     match target {
         "DIRECT" => Some("direct".to_string()),
-        "REJECT" | "REJECT-DROP" => Some("none".to_string()),
+        "REJECT" | "REJECT-DROP" => Some("reject".to_string()),
         "PASS" => None,
         other => {
             if valid_refs.contains(other) {
@@ -1595,4 +1595,42 @@ pub async fn run_subscription(
     );
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn map_reject_targets_to_reject_tag() {
+        let valid_refs = std::collections::HashSet::from(["proxy".to_string()]);
+        let mut skips = Vec::new();
+
+        assert_eq!(
+            map_rule_target("DIRECT", &valid_refs, &mut skips),
+            Some("direct".to_string())
+        );
+        assert_eq!(
+            map_rule_target("REJECT", &valid_refs, &mut skips),
+            Some("reject".to_string())
+        );
+        assert_eq!(
+            map_rule_target("REJECT-DROP", &valid_refs, &mut skips),
+            Some("reject".to_string())
+        );
+        // Must not regress to the legacy "none" tag (unknown outbound in
+        // the runner, i.e. a blackhole).
+        assert!(skips.is_empty());
+        assert_eq!(map_rule_target("PASS", &valid_refs, &mut skips), None);
+        assert!(skips.is_empty());
+    }
+
+    #[test]
+    fn map_unknown_group_recorded_in_skips() {
+        let valid_refs = std::collections::HashSet::new();
+        let mut skips = Vec::new();
+
+        assert_eq!(map_rule_target("NopeGroup", &valid_refs, &mut skips), None);
+        assert_eq!(skips, vec!["rule-target:NopeGroup".to_string()]);
+    }
 }
