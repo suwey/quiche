@@ -1294,7 +1294,17 @@ async fn run_inbound(mut inbound: impl Inbound + 'static, ctx: AppContext) {
                     let out = match dial_result {
                         Ok(o) => o,
                         Err(msg) => {
-                            log::error!("{msg}");
+                            // Expected UDP rejection (e.g. QUIC/443 on a
+                            // mless-only group): the packet gets an ICMP
+                            // port-unreachable below and the browser falls
+                            // back to TCP — routine, not an error.
+                            if msg.contains(
+                                crate::outbound::common::ERR_UDP_NOT_SUPPORTED,
+                            ) {
+                                log::debug!("{msg}");
+                            } else {
+                                log::error!("{msg}");
+                            }
                             // The outbound refused this UDP session (e.g.
                             // QUIC/443 unsupported by the vless leg). Tell
                             // the client via ICMP port-unreachable so it

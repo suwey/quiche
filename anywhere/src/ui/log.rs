@@ -56,6 +56,15 @@ impl log::Log for ChannelLogger {
     }
 
     fn log(&self, record: &Record) {
+        let guard = LOG_CHANNEL.lock();
+        let Some(tx) = guard.as_ref() else {
+            return;
+        };
+        // No WS log subscribers attached: skip the (expensive) formatting
+        // entirely — the env_logger side already wrote the record.
+        if tx.receiver_count() == 0 {
+            return;
+        }
         let elapsed = self.start.elapsed();
         let tid = std::thread::current().id();
         let payload = format!(
@@ -68,10 +77,7 @@ impl log::Log for ChannelLogger {
             level: record.level().to_string().to_lowercase(),
             payload,
         };
-        let guard = LOG_CHANNEL.lock();
-        if let Some(tx) = guard.as_ref() {
-            let _ = tx.send(msg);
-        }
+        let _ = tx.send(msg);
     }
 
     fn flush(&self) {}

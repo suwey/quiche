@@ -320,7 +320,7 @@ impl MlessMultiplexer {
             .map(|b| format!("{:02x}", b))
             .collect::<Vec<_>>()
             .join(" ");
-        log::debug!(
+        log::trace!(
             "mless: DATA stream#{} {}B [{}] -> channel",
             stream_id,
             payload.len(),
@@ -480,7 +480,7 @@ async fn io_loop(
                                         break;
                                     }
                                 };
-                            log::debug!(
+                            log::trace!(
                                 "mless: recv stream#{} flags={:#x} payload={}B",
                                 stream_id,
                                 flags,

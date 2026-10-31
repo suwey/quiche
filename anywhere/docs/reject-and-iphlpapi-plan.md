@@ -228,3 +228,29 @@ udp/53 吸进 TUN,`handler.rs` 按 `dst_port == 53` 拦截,与系统 DNS 配置�
   **处置:在设备上重新导入订阅**即可按新映射重新生成全部规则;
 - `openrung.rs` / `macos.rs` 中的 `"none"` 字面量为无关语义(缺省值标记、
   路由文本过滤),不属此次统一范围。
+
+## 8. 补录:日志与 UDP 拨号优化批次(2026-11-01)
+
+实机 8 分钟日志(§7 之后的验证)确认链路稳定后,落地一批低风险优化:
+
+- **urltest 缓存 UDP 不可用**(`urltest.rs`):`UrlTestState` 新增
+  `udp_unsupported` 位图,子节点 `dial_udp` 返回 `ERR_UDP_NOT_SUPPORTED` 时置位,
+  后续 QUIC 拨号直接跳过——全 mless 组从"每次 UDP 拨号轮询全部子节点"变为
+  "每组每节点只试一次"。**刻意不在 `test_latency` 时清除**(UDP 能力是结构性
+  的,不会恢复;`failed` 位仍按原语义清除)。全员不可用(或全部命中缓存)时
+  返回 canonical 的 `ERR_UDP_NOT_SUPPORTED` 而非笼统的
+  "all urltest children unavailable",供调用方精准分级;真实错误仍返回后者,
+  保持 ERROR 可见性。
+- **runner QUIC 失败日志降级**(`runner.rs`):`dial_udp` 失败消息含
+  `ERR_UDP_NOT_SUPPORTED` 时降为 debug(ICMP port-unreachable 注入逻辑不变,
+  浏览器照常快速回退 TCP);其余失败维持 ERROR。
+- **ChannelLogger 零订阅者跳过格式化**(`ui/log.rs`):广播通道无接收者时直接
+  返回,不再为每条日志做双份格式化(env_logger 侧照常输出)。
+- **mless 热路径日志降 trace**(`multiplexer.rs`):每 32KB 下行块的
+  `recv stream#` 与 `DATA stream# [hex]` 改 `trace!`(DEBUG 级日志从
+  ~2.5MB/43min 量级回落;诊断时用 `RUST_LOG=trace` 仍可见)。
+- **TUN `FWD/REV` 日志维持 debug**:核查确认其已按连接级事件(SYN/FIN/RST)
+  过滤而非逐包,6.7k 行/43min ≈ 连接数,诊断价值高,不降级。
+- 未做(留档):mless 池掉线 slot 后台保温重连(现有按需重连已满足);
+  微软遥测直连超时属订阅规则层(建议对 `events.data.microsoft.com` 等加
+  REJECT);netsh→iphlpapi 读 DNS 随 §6 的 netsh 整体移除而失效。

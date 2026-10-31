@@ -75,6 +75,11 @@ pub struct UrlTestState {
     pub records: Vec<RwLock<Option<LatencyRecord>>>,
     /// Failed children, tracked per-dial for immediate fallback.
     pub failed: Vec<AtomicBool>,
+    /// Children whose dial_udp answered ERR_UDP_NOT_SUPPORTED. Cached so a
+    /// QUIC-incapable group (e.g. all-mless) fails fast instead of re-walking
+    /// every child on each dial. Unlike `failed`, deliberately NOT cleared by
+    /// `test_latency`: UDP capability is structural, it does not recover.
+    pub udp_unsupported: Vec<AtomicBool>,
     /// Pinned child index (`usize::MAX` = not fixed / auto mode).
     /// When set, `dial` uses this child first. If the pinned child is
     /// marked failed, dial falls back to mode-based selection until the
@@ -146,6 +151,10 @@ impl UrlTestOutboundClient {
             current: AtomicUsize::new(0),
             records: children.iter().map(|_| RwLock::new(None)).collect(),
             failed: children.iter().map(|_| AtomicBool::new(false)).collect(),
+            udp_unsupported: children
+                .iter()
+                .map(|_| AtomicBool::new(false))
+                .collect(),
             fixed: AtomicUsize::new(usize::MAX),
             mode,
         });
@@ -294,21 +303,35 @@ impl OutboundClient for UrlTestOutboundClient {
         &self, initial_dest: &Destination,
     ) -> Result<Box<dyn PacketRelay>, Box<dyn std::error::Error>> {
         let idx = self.dial_index();
-        match self.children[idx].dial_udp(initial_dest).await {
-            Ok(relay) => {
-                self.state.current.store(idx, Ordering::Relaxed);
-                return Ok(relay);
-            },
-            Err(e) => {
-                let msg = e.to_string();
-                if !is_udp_expected(&msg) {
-                    log::warn!(
-                        "urltest: child '{}' dial_udp failed: {msg}",
-                        self.state.children[idx]
-                    );
-                }
-                // Do NOT mark child as failed — UDP support is optional.
-            },
+        // Skip children already known to lack UDP support (e.g. mless
+        // rejecting QUIC): re-dialing them on every packet flow just burns
+        // cycles and spams the log.
+        if !self.state.udp_unsupported[idx].load(Ordering::Relaxed) {
+            match self.children[idx].dial_udp(initial_dest).await {
+                Ok(relay) => {
+                    self.state.current.store(idx, Ordering::Relaxed);
+                    return Ok(relay);
+                },
+                Err(e) => {
+                    let msg = e.to_string();
+                    if is_udp_expected(&msg) {
+                        // UDP support is optional — cache the negative
+                        // answer instead of re-asking on every dial. Do NOT
+                        // mark the child as failed: TCP still works.
+                        self.state.udp_unsupported[idx]
+                            .store(true, Ordering::Relaxed);
+                        log::debug!(
+                            "urltest: child '{}' has no UDP support (cached)",
+                            self.state.children[idx]
+                        );
+                    } else {
+                        log::warn!(
+                            "urltest: child '{}' dial_udp failed: {msg}",
+                            self.state.children[idx]
+                        );
+                    }
+                },
+            }
         }
 
         // Select mode: no fallback for UDP either.
@@ -320,6 +343,7 @@ impl OutboundClient for UrlTestOutboundClient {
             .into());
         }
 
+        let mut all_expected = true;
         for (i, child) in self.children.iter().enumerate() {
             if i == idx {
                 continue;
@@ -328,6 +352,9 @@ impl OutboundClient for UrlTestOutboundClient {
                 continue;
             }
             if self.state.children[i] == "direct" {
+                continue;
+            }
+            if self.state.udp_unsupported[i].load(Ordering::Relaxed) {
                 continue;
             }
 
@@ -343,11 +370,14 @@ impl OutboundClient for UrlTestOutboundClient {
                 Err(e) => {
                     let msg = e.to_string();
                     if is_udp_expected(&msg) {
-                        log::warn!(
-                            "urltest: udp fallback child '{}': {msg}",
+                        self.state.udp_unsupported[i]
+                            .store(true, Ordering::Relaxed);
+                        log::debug!(
+                            "urltest: child '{}' has no UDP support (cached)",
                             self.state.children[i]
                         );
                     } else {
+                        all_expected = false;
                         log::error!(
                             "urltest: udp fallback child '{}' failed: {msg}",
                             self.state.children[i]
@@ -357,6 +387,13 @@ impl OutboundClient for UrlTestOutboundClient {
             }
         }
 
+        if all_expected {
+            // Every child refused UDP for a known reason (or was already
+            // cached as such): report the canonical not-supported error so
+            // the caller can downgrade logging. The packet still gets an
+            // ICMP port-unreachable so the client falls back to TCP.
+            return Err(crate::outbound::common::ERR_UDP_NOT_SUPPORTED.into());
+        }
         Err("all urltest children unavailable".into())
     }
 
