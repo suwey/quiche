@@ -720,6 +720,15 @@ fn copy_main_non_default_routes(
         if line.is_empty() || line.starts_with("default ") {
             continue;
         }
+        // `ip route show` flags a route whose nexthop device has no carrier
+        // (a stopped docker0, a disconnected ethernet) with `linkdown`, and
+        // `ip route replace` refuses to install it — skip instead of failing.
+        if line.split_whitespace().any(|token| token == "linkdown") {
+            log::debug!(
+                "Skipping linkdown route for table {table}: {line}"
+            );
+            continue;
+        }
         log::debug!("Copying route to table {table}: {line}");
         let tokens: Vec<&str> = line.split_whitespace().collect();
         let mut args = vec!["route", "replace", "table", table];

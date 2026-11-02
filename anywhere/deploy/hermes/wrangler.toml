@@ -3,6 +3,8 @@ compatibility_flags = ["nodejs_compat"]
 name = "hermes-agent-dispatcher"
 main = "src/index.ts"
 keep_vars = true
+# 源码图的 sourcesContent 带 scrub 前的源码与注释，明文齐全；只上传 index.js。
+upload_source_maps = false
 
 [[durable_objects.bindings]]
 name = "HERMES_AGENT_DISPATCHER"

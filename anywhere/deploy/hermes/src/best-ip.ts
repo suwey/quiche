@@ -1,6 +1,5 @@
 // 优选订阅生成器拉取 + 优选 API 多源解析。
 
-import { TOKENS } from './tokens';
 import { 汇聚订阅_UA } from './state';
 const 优选IP_IPV6_PATTERN = /^[^\[\]]*:[^\[\]]*:[^\[\]]/;
 

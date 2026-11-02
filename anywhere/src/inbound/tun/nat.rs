@@ -82,6 +82,21 @@ impl TCPNat {
         self.port_map.get(&nat_port)
     }
 
+    /// Look up the NAT port already allocated for a `(client, target)` pair,
+    /// without allocating one when the mapping is missing.
+    ///
+    /// Used by teardown paths: a packet that only *removes* state must not
+    /// resurrect it via `lookup`, which allocates a fresh port for any unseen
+    /// 5-tuple.
+    pub fn lookup_existing(
+        &self, client_addr: SocketAddr, target_addr: SocketAddr,
+    ) -> Option<u16> {
+        self.addr_map
+            .get(&(client_addr, target_addr))
+            .copied()
+            .filter(|port| self.port_map.contains_key(port))
+    }
+
     /// Return whether a NAT port is still mapped.
     pub fn contains_port(&self, nat_port: u16) -> bool {
         self.port_map.contains_key(&nat_port)
@@ -222,6 +237,38 @@ mod tests {
     fn test_lookup_back_nonexistent() {
         let nat = TCPNat::new(Duration::from_secs(30));
         assert!(nat.lookup_back(9999).is_none());
+    }
+
+    #[test]
+    fn test_lookup_existing_never_allocates() {
+        let mut nat = TCPNat::new(Duration::from_secs(30));
+        let client = sa([192, 168, 1, 100], 40000);
+        let target = sa([1, 2, 3, 4], 80);
+
+        // Unknown 5-tuple: no port, and no side effects.
+        assert_eq!(nat.lookup_existing(client, target), None);
+        assert!(nat.port_map.is_empty());
+        assert!(nat.addr_map.is_empty());
+
+        let port = nat.lookup(client, target);
+        assert_eq!(nat.lookup_existing(client, target), Some(port));
+
+        // After removal the mapping is gone and must not come back.
+        nat.remove(port);
+        assert_eq!(nat.lookup_existing(client, target), None);
+    }
+
+    #[test]
+    fn test_lookup_existing_rejects_dangling_addr_map() {
+        let mut nat = TCPNat::new(Duration::from_secs(30));
+        let client = sa([192, 168, 1, 100], 40000);
+        let target = sa([1, 2, 3, 4], 80);
+        let port = nat.lookup(client, target);
+
+        // Simulate a stale addr_map whose port was taken over by another
+        // session: lookup_existing must not report it as a live session.
+        nat.port_map.remove(&port);
+        assert_eq!(nat.lookup_existing(client, target), None);
     }
 
     #[test]

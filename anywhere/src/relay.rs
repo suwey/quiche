@@ -27,9 +27,11 @@ const HALF_CLOSE_TIMEOUT: std::time::Duration =
 /// If the remote side of a TCP relay sends nothing within this window after
 /// the relay starts, the connection is torn down (client gets a RST) instead
 /// of hanging forever. Covers dead upstream proxy sessions and unreachable
-/// targets that never answer.
+/// targets that never answer. 5 s is already several times a healthy
+/// round trip through the proxy, so a longer window only holds a dead
+/// session open.
 const FIRST_BYTE_TIMEOUT: std::time::Duration =
-    std::time::Duration::from_secs(15);
+    std::time::Duration::from_secs(5);
 
 /// Returns the UDP idle timeout for a given sniffed protocol.
 ///

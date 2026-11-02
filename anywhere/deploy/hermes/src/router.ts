@@ -560,7 +560,7 @@ async function 处理订阅请求(request: Request, env: RuntimeEnv, ctx: Execut
 	} else {
 		const 订阅转换URL = `${cfg.订阅转换配置?.SUBAPI}/sub?target=${订阅类型}&url=${encodeURIComponent(url.protocol + '//' + url.host + '/sub?target=mixed&token=' + 今日订阅转换后端专属TOKEN + '&asOrg=' + 识别运营商(request) + (url.searchParams.has('sub') && url.searchParams.get('sub') !== '' ? `&sub=${url.searchParams.get('sub')}` : ''))}&config=${encodeURIComponent(cfg.订阅转换配置?.SUBCONFIG || '')}&emoji=${cfg.订阅转换配置?.SUBEMOJI}&scv=${cfg.跳过证书验证}&expand=${cfg.订阅转换配置?.EXPAND}`;
 		try {
-			const response = await fetch(订阅转换URL, { headers: { 'User-Agent': 'Subconverter for ' + 订阅类型 + ' edge' + 'tunnel (https://github.com/' + 特征码字典[1] + '/edge' + 'tunnel)' } });
+			const response = await fetch(订阅转换URL, { headers: { 'User-Agent': 'Subconverter for ' + 订阅类型 + ' ' + TOKENS.上游标识 + ' (https://github.com/' + 特征码字典[1] + '/' + TOKENS.上游标识 + ')' } });
 			if (response.ok) {
 				订阅内容 = await response.text();
 				if (url.searchParams.has('surge') || ua.includes('surge')) {

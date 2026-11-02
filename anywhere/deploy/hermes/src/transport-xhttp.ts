@@ -4,6 +4,7 @@
 // UDP: 独立分支（Trojan UDP + DNS 转发）。mless 帧协议只保留在 WebSocket 传输。
 
 import { log, state } from './state';
+import { TOKENS } from './tokens';
 import { 数据转Uint8Array, 有效数据长度, isSpeedTestSite, sha224, closeSocketQuietly } from './utils';
 import { UUID字节匹配, BLESS文本解码器 } from './protocol';
 import { forwardataTCP, forwardataudp, 转发木马UDP数据 } from './forward';

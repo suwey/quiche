@@ -181,7 +181,9 @@ pub struct XmuxConfig {
     pub keep_alive_period: u64,
     /// Number of parallel WS connections for vless/mless outbounds.
     /// vless: number of pre-built WS connections to keep ready (default: 15).
-    /// mless: number of multiplexer instances, each with its own WS + crypto (default: 1).
+    /// mless: size of the multiplexer pool, each slot with its own WS +
+    /// crypto (default: 5). A background task revives any slot whose tunnel
+    /// dies, so this is the number of connections the pool holds steady.
     /// Ignored by XHTTP transport.
     #[serde(default)]
     pub pool_size: Option<usize>,

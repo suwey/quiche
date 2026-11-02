@@ -1,27 +1,17 @@
 #!/usr/bin/env node
-import { readdir, readFile, writeFile } from 'node:fs/promises';
-import { join, relative } from 'node:path';
+import { mkdir, readFile, readdir, writeFile } from 'node:fs/promises';
+import { dirname, join, relative } from 'node:path';
 import { argv, exit } from 'node:process';
+import { SENSITIVE, STATE } from './sensitive.mjs';
 
 const DRY_RUN = argv.includes('--dry-run');
 const ROOT = new URL('../src/', import.meta.url).pathname;
 
-const REPLACEMENTS = [
-	{ name: 'vless single', from: /'vless'/g, to: 'TOKENS.vless' },
-	{ name: 'vless double', from: /"vless"/g, to: 'TOKENS.vless' },
-	{ name: 'trojan single', from: /'trojan'/g, to: 'TOKENS.trojan' },
-	{ name: 'trojan double', from: /"trojan"/g, to: 'TOKENS.trojan' },
-	{ name: 'tro+jan single', from: /'tro'\s*\+\s*'jan'/g, to: 'TOKENS.trojan' },
-	{ name: 'tro+jan double', from: /"tro"\s*\+\s*"jan"/g, to: 'TOKENS.trojan' },
-	{ name: 'edgetunnel single', from: /'edgetunnel'/g, to: 'TOKENS.edgetunnel' },
-	{ name: 'edgetunnel double', from: /"edgetunnel"/g, to: 'TOKENS.edgetunnel' },
-	{ name: 'edge+tunnel single', from: /'edge'\s*\+\s*'tunnel'/g, to: 'TOKENS.edgetunnel' },
-	{ name: 'cmliu/edge single', from: /'cmliu\/edge'/g, to: 'TOKENS.cmliuEdge' },
-	{ name: 'cmliu/edge double', from: /"cmliu\/edge"/g, to: 'TOKENS.cmliuEdge' },
-	{ name: 'subconverter UA', from: /'Subconverter for \$\{订阅类型\} edgetunnel \(https:\/\/github\.com\/cmliu\/edgetunnel\)'/g, to: "'Subconverter for ${订阅类型} ' + TOKENS.edgetunnel + ' (https://github.com/cmliu/' + TOKENS.edgetunnel + ')'" },
-	{ name: 'subconverter fragment', from: /' edgetunnel \(https:\/\/github\.com\/cmliu\/edgetunnel\)'/g, to: "' ' + TOKENS.edgetunnel + ' (https://github.com/cmliu/' + TOKENS.edgetunnel + ')'" },
-	{ name: 'github UA fragment', from: /'tunnel \(https:\/\/github\.com\/cmliu\/edge'/g, to: "'tunnel (https://github.com/' + TOKENS.cmliuEdge" },
-];
+const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&');
+const RULES = SENSITIVE.map(({ word, field }) => ({
+	from: new RegExp(`(['"])${escapeRe(word)}\\1`, 'g'),
+	to: `TOKENS.${field}`,
+}));
 
 async function walk(dir) {
 	const out = [];
@@ -36,31 +26,40 @@ async function walk(dir) {
 	return out;
 }
 
-const files = await walk(ROOT);
-let touched = 0;
+const changed = new Map();
 let hits = 0;
 
-for (const file of files) {
-	const content = await readFile(file, 'utf8');
-	let current = content;
+for (const file of await walk(ROOT)) {
+	const original = await readFile(file, 'utf8');
+	let current = original;
 	let fileHits = 0;
-	for (const { from, to } of REPLACEMENTS) {
+	for (const { from, to } of RULES) {
 		const matches = current.match(from);
 		if (!matches) continue;
 		fileHits += matches.length;
 		current = current.replace(from, to);
 	}
 	if (fileHits === 0) continue;
-	touched += 1;
+	changed.set(file, { original, scrubbed: current, hits: fileHits });
 	hits += fileHits;
-	const rel = relative(process.cwd(), file);
-	if (DRY_RUN) console.log(`  [dry-run] ${rel}: ${fileHits} hits`);
-	else {
-		await writeFile(file, current);
-		console.log(`  ${rel}: ${fileHits} hits`);
-	}
 }
 
-if (DRY_RUN) console.log(`(dry-run) ${hits} replacements in ${touched} files`);
-else console.log(`Done: ${hits} replacements in ${touched} files`);
-if (DRY_RUN) exit(0);
+const rel = (f) => relative(process.cwd(), f);
+for (const [file, { hits: n }] of changed) {
+	console.log(DRY_RUN ? `  [dry-run] ${rel(file)}: ${n} hits` : `  ${rel(file)}: ${n} hits`);
+}
+
+if (DRY_RUN) {
+	console.log(`(dry-run) ${hits} replacements in ${changed.size} files`);
+	exit(0);
+}
+
+// 快照必须先落盘，再动源码：中途被杀也还能按字节还原。
+if (changed.size > 0) {
+	await mkdir(dirname(STATE), { recursive: true });
+	const snapshot = Object.fromEntries([...changed].map(([f, { original }]) => [f, original]));
+	await writeFile(STATE, JSON.stringify(snapshot));
+}
+for (const [file, { scrubbed }] of changed) await writeFile(file, scrubbed);
+
+console.log(`Done: ${hits} replacements in ${changed.size} files`);

@@ -168,10 +168,19 @@ impl OutboundRegistry {
             }
         }
 
+        // Background loops that `shutdown_test_loops` aborts on in-process
+        // reload, so the mux connections they hold get released.
+        let mut test_loop_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+
         for cfg in config.outbounds.iter().filter(|o| o.type_ == "mless") {
             match MlessOutboundClient::from_config(vec![cfg]).await {
                 Ok(client) => {
-                    clients.insert(Self::tag(&cfg)?.to_string(), Arc::new(client));
+                    let tag = Self::tag(&cfg)?.to_string();
+                    let client = Arc::new(client);
+                    test_loop_handles.push(MlessOutboundClient::spawn_pool_keepalive(
+                        Arc::clone(&client),
+                    ));
+                    clients.insert(tag, client as Arc<dyn OutboundClient>);
                 },
                 Err(e) => {
                     log::error!(
@@ -204,7 +213,6 @@ impl OutboundRegistry {
         // is true (i.e. mode is latency or seq, not select).
         let mut urltest_states: HashMap<String, Arc<UrlTestState>> =
             HashMap::new();
-        let mut test_loop_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
         for cfg in config
             .outbounds

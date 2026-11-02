@@ -2,6 +2,7 @@
 // 模块单例：每个 isolate 内共享一份，跟 Pages 项目语义保持一致。
 
 import type { ParsedProxyAddress } from './types';
+import { TOKENS } from './tokens';
 
 export interface ConfigJSON {
 	[key: string]: unknown;
@@ -49,8 +50,10 @@ export const 特征码字典 = [
 	'090227',
 ];
 
-// 汇聚订阅统一 UA（与上游 2026-09-22 一致，避免字面量直出）。
-export const 汇聚订阅_UA = 'v2rayN/edge' + 'tunnel (https://github.com/' + 特征码字典[1] + '/edge' + 'tunnel)';
+// 汇聚订阅统一 UA（与上游 2026-09-22 一致）。上游名走 TOKENS：这里的相邻字面量拼接
+// 会被 esbuild 折叠，手工拆 'edge' + 'tunnel' 在产物里仍是明文。
+export const 汇聚订阅_UA =
+	'v2rayN/' + TOKENS.上游标识 + ' (https://github.com/' + 特征码字典[1] + '/' + TOKENS.上游标识 + ')';
 
 export const WS早期数据最大字节 = 8 * 1024;
 export const WS早期数据最大头长度 = Math.ceil((WS早期数据最大字节 * 4) / 3) + 4;

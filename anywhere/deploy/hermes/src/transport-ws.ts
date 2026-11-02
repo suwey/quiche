@@ -6,12 +6,14 @@ import { 帧首帧标记, 帧关闭标记, WS早期数据最大字节, WS早期�
 import { 编码帧, 解码Varint, 数据转Uint8Array, 拼接字节数据, isSpeedTestSite, closeSocketQuietly } from './utils';
 import { 解析魏烈思请求, 解码WS早期数据 } from './protocol';
 import { forwardataTCP, forwardataudp, 创建请求TCP连接器 } from './forward';
-import type { RemoteConnWrapper } from './forward';
+import type { RemoteConnWrapper, 中止状态 } from './forward';
 import type { TCPSocket, TCPConnector } from './types';
 
 interface StreamRecord {
 	remoteConn: RemoteConnWrapper;
 	关闭标记: boolean;
+	// 下行泵中止状态：与本流 StreamWS 共享，CLOSE/关闭流 置位后 connectStreams 停推。
+	中止: 中止状态;
 	// 上行写入串行链：保证同一流的多个 ws 帧按到达顺序写入远端 socket。
 	// WritableStream writer 是独占锁，并发 getWriter() 会抛错丢数据。
 	上行写入链: Promise<void>;
@@ -221,20 +223,29 @@ export class WebSocketSession {
 				try { this.serverSock.send(frame); } catch { /* ignore */ }
 			});
 			this.发送串行链 = closeTask.catch(() => { /* ignore */ });
-			try { s.remoteConn.socket?.close(); } catch { /* ignore */ }
-			this.流映射.delete(streamId);
-			this.流待发队列.delete(streamId);
+			this.拆除流(streamId, s);
 		}
 		this.重置空闲超时();
 	}
 
-	private 创建StreamWS(streamId: number) {
+	/** 关闭流与客户端 CLOSE 共用的拆除动作：中止下行泵、关远端 socket、清映射。CLOSE 帧顺序由调用方保证。 */
+	private 拆除流(streamId: number, s: StreamRecord): void {
+		s.中止.已中止 = true;
+		try { s.remoteConn.socket?.close(); } catch { /* ignore */ }
+		this.流映射.delete(streamId);
+		this.流待发队列.delete(streamId);
+	}
+
+	private 创建StreamWS(streamId: number, 中止: 中止状态) {
 		const self = this;
 		return {
+			中止,
 			get readyState(): number { return self.serverSock.readyState; },
 			send: (
 				data: Uint8Array | ArrayBuffer | ArrayBufferView,
 			): Promise<void> => {
+				// 中止后丢弃下行帧：不再向客户端已销毁的流推数据。
+				if (中止.已中止) return Promise.resolve();
 				return self.发送帧到客户端(
 					streamId, 0, 数据转Uint8Array(data),
 				);
@@ -310,10 +321,11 @@ export class WebSocketSession {
 	private async 处理首帧(
 		streamId: number, payload: Uint8Array,
 	): Promise<void> {
-		const 流WS = this.创建StreamWS(streamId);
+		const 中止: 中止状态 = { 已中止: false };
+		const 流WS = this.创建StreamWS(streamId, 中止);
 		const 流remoteConn = this.创建RemoteConn(streamId);
 		this.流映射.set(streamId, {
-			remoteConn: 流remoteConn, 关闭标记: false,
+			remoteConn: 流remoteConn, 关闭标记: false, 中止,
 			上行写入链: Promise.resolve(),
 		});
 
@@ -427,11 +439,7 @@ export class WebSocketSession {
 
 		if (flags & 帧关闭标记) {
 			const s = this.流映射.get(流ID);
-			if (s) {
-				try { s.remoteConn.socket?.close(); } catch { /* ignore */ }
-			}
-			this.流映射.delete(流ID);
-			this.流待发队列.delete(流ID);
+			if (s) this.拆除流(流ID, s);
 			this.重置空闲超时();
 			return;
 		}

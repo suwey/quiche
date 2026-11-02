@@ -206,26 +206,51 @@ impl MlessOutboundClient {
         let crypto_factory: Arc<dyn CryptoFactory> =
             Arc::new(self::crypto::AheadXorFactory);
 
-        // Connect all multiplexer instances in the pool.
-        // Each gets its own WS connection and independent crypto state.
-        let mut slots = Vec::with_capacity(pool_size);
-        for i in 0..pool_size {
-            let mux = MlessMultiplexer::connect_pluggable(
-                conn_mgr.clone(),
-                crypto_factory.clone(),
-                &uuid_str,
-                max_streams,
-                capacity_notify.clone(),
-            )
-            .await?;
-            if pool_size > 1 {
-                log::info!("mless: pool slot {}/{} connected", i + 1, pool_size);
-            }
-            slots.push(MuxSlot {
+        // Connect all multiplexer instances in the pool concurrently.
+        // Each slot does its own TCP+TLS+WS (or XHTTP stream) handshake with
+        // its own independent crypto state, so there is no ordering
+        // dependency between them: serializing them costs one full round trip
+        // per slot (~2s each in the field) before any traffic is proxied.
+        // `try_join_all` preserves slot order — the round-robin index `next`
+        // indexes into this Vec — and propagates the first error, so any slot
+        // failing still fails construction as before.
+        let muxes = futures_util::future::try_join_all(
+            (0..pool_size).map(|i| {
+                let conn_mgr = conn_mgr.clone();
+                let crypto_factory = crypto_factory.clone();
+                let capacity_notify = capacity_notify.clone();
+                let uuid_str = uuid_str.clone();
+                async move {
+                    let mux = MlessMultiplexer::connect_pluggable(
+                        conn_mgr,
+                        crypto_factory,
+                        &uuid_str,
+                        max_streams,
+                        capacity_notify,
+                    )
+                    .await?;
+                    // Completion lines may interleave now that the slots
+                    // connect in parallel; the slot number is what matters.
+                    if pool_size > 1 {
+                        log::info!(
+                            "mless: pool slot {}/{} connected",
+                            i + 1,
+                            pool_size
+                        );
+                    }
+                    Ok::<_, Box<dyn std::error::Error>>(mux)
+                }
+            }),
+        )
+        .await?;
+
+        let slots: Vec<MuxSlot> = muxes
+            .into_iter()
+            .map(|mux| MuxSlot {
                 mux,
                 consecutive_fails: AtomicU32::new(0),
-            });
-        }
+            })
+            .collect();
 
         Ok(Self {
             pool: tokio::sync::Mutex::new(slots),
@@ -319,6 +344,53 @@ impl MlessOutboundClient {
             log::warn!("{}: pool slot {} reconnect failed", self.log_tag(), idx);
             None
         }
+    }
+
+    /// Spawns the pool keepalive task: every 10 s it revives every slot whose
+    /// tunnel has died.
+    ///
+    /// Without it a dead slot is only reconnected when `open_stream` finds no
+    /// live slot left, and because `max_streams` defaults to unlimited a
+    /// single surviving connection always has capacity — so a pool that lost
+    /// 4 of 5 connections kept serving everything off the last one, head-of-
+    /// line blocking every stream on one tunnel.
+    ///
+    /// Goes through `claim_dead_slot`, so it cannot double-reconnect a slot
+    /// the dial path is already reviving, and `reconnect_slot` keeps its
+    /// exponential backoff when the server itself is down.
+    pub fn spawn_pool_keepalive(
+        client: Arc<Self>,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                let mut dead: Vec<usize> = Vec::new();
+                while dead.len() < client.pool_size {
+                    match client.claim_dead_slot().await.0 {
+                        Some(idx) => dead.push(idx),
+                        None => break,
+                    }
+                }
+                // Revive concurrently and at staggered times: a peer that
+                // recycles tunnels kills several slots at once, and a serial
+                // loop left the last slot down for ~20 s. The jitter also
+                // stops the replacements from sharing a birth time, which is
+                // what made them all get recycled together again.
+                futures_util::future::join_all(dead.into_iter().map(|idx| {
+                    let client = Arc::clone(&client);
+                    async move {
+                        let jitter =
+                            crate::obfuscation::range::rand_range(0, 4_000);
+                        tokio::time::sleep(
+                            std::time::Duration::from_millis(jitter as u64),
+                        )
+                        .await;
+                        client.reconnect_slot(idx).await;
+                    }
+                }))
+                .await;
+            }
+        })
     }
 
     async fn open_stream(

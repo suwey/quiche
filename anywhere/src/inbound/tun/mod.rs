@@ -284,6 +284,23 @@ impl Inbound for TunInbound {
 pub struct TunLifecycle {
     shutdown: CancellationToken,
     handles: Vec<JoinHandle<()>>,
+    tcp_sessions: TcpCancelRegistry,
+}
+
+/// Cancel and forget every registered TCP relay session.
+///
+/// Relay tasks are owned by the runner, not by `handles`, so aborting the
+/// TUN tasks alone would leave them relaying through the outbound after an
+/// in-process reload. Their `TunTcpRelay` observes the cancelled token and
+/// ends the copy loop, which drops the loopback socket and the outbound.
+async fn cancel_all_tcp_sessions(registry: &TcpCancelRegistry) -> usize {
+    let sessions: Vec<CancellationToken> =
+        registry.lock().await.drain().map(|(_, t)| t).collect();
+    let n = sessions.len();
+    for token in sessions {
+        token.cancel();
+    }
+    n
 }
 
 impl TunLifecycle {
@@ -309,6 +326,15 @@ impl TunLifecycle {
             futures_util::future::join_all(handles),
         )
         .await;
+        // Last, because the relay tasks belong to the runner rather than
+        // `handles`: cancelling their tokens after the accept loop is dead
+        // also guarantees no session can be registered behind the drain.
+        let sessions = cancel_all_tcp_sessions(&self.tcp_sessions).await;
+        if sessions > 0 {
+            log::info!(
+                "TUN lifecycle shutdown: cancelled {sessions} TCP relay session(s)"
+            );
+        }
         log::info!(
             "TUN lifecycle shutdown: complete (device handle should be released)"
         );
@@ -324,6 +350,14 @@ impl Drop for TunLifecycle {
         self.shutdown.cancel();
         for handle in &self.handles {
             handle.abort();
+        }
+        // `try_lock` because blocking a tokio mutex from Drop can panic when
+        // Drop runs on an async thread; the awaited shutdown() path above is
+        // the one that guarantees the drain.
+        if let Ok(mut sessions) = self.tcp_sessions.try_lock() {
+            for (_, token) in sessions.drain() {
+                token.cancel();
+            }
         }
     }
 }
@@ -635,6 +669,13 @@ impl TunInbound {
         // 5. Create channels.
         let (conn_tx, conn_rx) = mpsc::channel::<InboundConn>(1024);
 
+        // Shared TCP session registry: nat_port -> relay cancel token. The
+        // accept loop fills it and clears entries when a relay finishes, and
+        // TunLifecycle drains it on shutdown so relay tasks cannot outlive the
+        // TUN device they are associated with.
+        let cancel_registry: TcpCancelRegistry =
+            Arc::new(Mutex::new(HashMap::new()));
+
         // 6. Spawn the TUN I/O handler.
         let tun_clone = device.clone();
         let nat_clone = nat.clone();
@@ -656,8 +697,6 @@ impl TunInbound {
         }));
 
         // 7. Spawn the accept loop.
-        let cancel_registry: TcpCancelRegistry =
-            Arc::new(Mutex::new(HashMap::new()));
         let nat_accept = nat.clone();
         let cancel_accept = cancel_registry.clone();
         let conn_tx_accept = conn_tx.clone();
@@ -711,6 +750,7 @@ impl TunInbound {
             TunLifecycle {
                 shutdown,
                 handles: tun_handles,
+                tcp_sessions: cancel_registry,
             },
         ))
     }
@@ -823,6 +863,10 @@ async fn accept_loop(
                     sniff: sniff_enabled,
                 };
                 if conn_tx.try_send(conn).is_err() {
+                    // No task owns this session: drop the registry token too,
+                    // otherwise it outlives its NAT entry (the expiry loop
+                    // only visits ports still mapped).
+                    cancel_registry.lock().await.remove(&nat_port);
                     let mut guard = nat.lock().await;
                     guard.remove(nat_port);
                     continue;
@@ -1048,4 +1092,26 @@ fn find_utun_by_addr(addr: std::net::IpAddr) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn shutdown_drains_the_tcp_session_registry() {
+        let registry: TcpCancelRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let first = CancellationToken::new();
+        let second = CancellationToken::new();
+        registry.lock().await.insert(10001, first.clone());
+        registry.lock().await.insert(10002, second.clone());
+
+        assert_eq!(cancel_all_tcp_sessions(&registry).await, 2);
+        assert!(first.is_cancelled());
+        assert!(second.is_cancelled());
+        assert!(registry.lock().await.is_empty());
+
+        // Draining an empty registry stays quiet (idempotent shutdown).
+        assert_eq!(cancel_all_tcp_sessions(&registry).await, 0);
+    }
 }

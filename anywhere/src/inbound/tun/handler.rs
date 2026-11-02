@@ -404,6 +404,23 @@ async fn handle_tcp_packet(
         return;
     }
 
+    // A bare RST for a 5-tuple with no session must not allocate one — the
+    // connection it refers to is already gone, and `lookup` below would hand
+    // it a fresh NAT port. RSTs for a live session keep flowing as before.
+    //
+    // Deliberately not a relay-teardown signal: with fake-ip the target is a
+    // shared 198.18.0.x:443 and local ports get reused, so an RST left over
+    // from the previous connection on a 4-tuple kills the *new* session that
+    // just claimed it.
+    if tcp_flags.contains('R')
+        && {
+            let guard = nat.lock().await;
+            guard.lookup_existing(client_addr, target_addr).is_none()
+        }
+    {
+        return;
+    }
+
     let nat_port = {
         let mut guard = nat.lock().await;
         guard.lookup(client_addr, target_addr)
@@ -806,5 +823,22 @@ impl PacketRelay for TunUdpSessionRelay {
         };
         self.writer.write(&raw).await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::SocketAddrV4;
+
+    fn sa(ip: [u8; 4], port: u16) -> SocketAddr {
+        SocketAddr::V4(SocketAddrV4::new(
+            Ipv4Addr::new(ip[0], ip[1], ip[2], ip[3]),
+            port,
+        ))
+    }
+
+    fn new_nat() -> Arc<Mutex<TCPNat>> {
+        Arc::new(Mutex::new(TCPNat::new(Duration::from_secs(30))))
     }
 }

@@ -39,9 +39,10 @@ use crate::relay::bidirectional_relay;
 /// When a rule's outbound is this value, the connection is refused:
 /// - TCP: sends RST (via SO_LINGER=0) instead of FIN
 /// - UDP: silently dropped
-const REJECT_TAG: &str = "reject";
+/// - DNS: answered with an empty NOERROR response (see `dns::DnsHijack`)
+pub(crate) const REJECT_TAG: &str = "reject";
 
-fn is_reject_tag(tag: &str) -> bool {
+pub(crate) fn is_reject_tag(tag: &str) -> bool {
     tag == REJECT_TAG
 }
 use crate::rules::Rules;

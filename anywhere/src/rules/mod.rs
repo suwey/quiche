@@ -205,6 +205,70 @@ fn display_rule_list(values: &[String], max_items: usize) -> String {
     format!("{},…(+{hidden})", values[..max_items].join(","))
 }
 
+/// A geo rule set fetched ahead of the ordered rule loop in
+/// [`Rules::from_config`]. Returned positionally aligned with `configs` so the
+/// loop can splice it back without changing rule order.
+struct PreloadedGeoSet {
+    geo_set: GeoRuleSet,
+    source_name: String,
+    /// Load-time matcher snapshot; `None` when the rule set failed to load.
+    matcher: Option<GeoMatcher>,
+}
+
+/// Loads every rule set with a `geo_url` concurrently.
+///
+/// Safe to overlap: `GeoRuleSet::new` resolves its own host over its own
+/// bypass socket and touches only its own
+/// `cache_dir/rule_set/<sanitised-url>.srs` file — no shared table.
+///
+/// `join_all`, not `try_join_all`: a rule set that fails to load must not
+/// abort the others. The caller drops just that rule, exactly as the
+/// sequential loop did.
+async fn preload_geo_rule_sets(
+    configs: &[RuleConfig], cache_dir: &Path,
+    dns_plain: &[std::net::SocketAddr],
+) -> Vec<Option<PreloadedGeoSet>> {
+    let loaded = futures_util::future::join_all(
+        configs
+            .iter()
+            .enumerate()
+            .filter_map(|(i, config)| {
+                let url = config.geo_url.clone()?;
+                let update_interval = config.update_interval.clone();
+                let cache_dir = cache_dir.to_path_buf();
+                let dns_plain = dns_plain.to_vec();
+                Some(async move {
+                    log::info!("Loading geo rule set: {url}");
+                    let geo_set = GeoRuleSet::new(
+                        &url,
+                        update_interval.as_deref(),
+                        &cache_dir,
+                        dns_plain,
+                    )
+                    .await;
+                    let source_name = geo_set.source_name().to_string();
+                    let matcher = geo_set.matcher().await;
+                    (
+                        i,
+                        PreloadedGeoSet {
+                            geo_set,
+                            source_name,
+                            matcher,
+                        },
+                    )
+                })
+            }),
+    )
+    .await;
+
+    let mut preloaded: Vec<Option<PreloadedGeoSet>> =
+        (0..configs.len()).map(|_| None).collect();
+    for (i, set) in loaded {
+        preloaded[i] = Some(set);
+    }
+    preloaded
+}
+
 impl Rules {
     /// Create an empty rule set with only built-in private CIDR rules.
     /// Used as a fallback when full rule loading fails.
@@ -323,20 +387,15 @@ impl Rules {
             }
         }
         let mut geo_sets: Vec<Arc<GeoRuleSet>> = Vec::new();
+        let mut preloaded =
+            preload_geo_rule_sets(configs, cache_dir, dns_plain).await;
 
-        for config in configs {
+        for (idx, config) in configs.iter().enumerate() {
             if let Some(url) = &config.geo_url {
-                log::info!("Loading geo rule set: {url}");
-                let geo_set = GeoRuleSet::new(
-                    url,
-                    config.update_interval.as_deref(),
-                    cache_dir,
-                    dns_plain.to_vec(),
-                )
-                .await;
-                let source_name = geo_set.source_name().to_string();
-                let matcher = geo_set.matcher().await;
-                match matcher {
+                let Some(pre) = preloaded[idx].take() else { continue };
+                let geo_set = pre.geo_set;
+                let source_name = pre.source_name;
+                match pre.matcher {
                     Some(gm) => {
                         rules.push(Rule {
                             type_: config.type_.clone(),

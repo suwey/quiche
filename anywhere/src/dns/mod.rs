@@ -260,6 +260,27 @@ struct Plan {
     upstreams: Vec<Upstream>,
 }
 
+/// The response for a reject-tagged plan: NOERROR with zero answers, or
+/// `None` when the tag isn't a reject tag and resolution should continue.
+///
+/// `reject` is a pseudo-tag with no registered outbound, so the registry
+/// lookup in `resolve_query` can never serve it; answering REFUSED instead
+/// makes resolvers retry the same query.
+fn reject_plan_response(outbound_tag: &str, query: &[u8]) -> Option<Vec<u8>> {
+    crate::runner::is_reject_tag(outbound_tag)
+        .then(|| build_empty_response(query))
+        .flatten()
+}
+
+/// True for an HTTPS/SVCB (type 65) query on a proxy plan: the record only
+/// exists upstream, and proxy outbounds refuse UDP relay (`dial_udp` →
+/// ERR_UDP_NOT_SUPPORTED), so the attempt can never succeed and answering
+/// REFUSED only makes resolvers retry. Direct plans do get the record, over
+/// DoH.
+fn proxy_plan_cannot_answer_svcb(qtype: u16, outbound_tag: &str) -> bool {
+    qtype == 65 && outbound_tag != "direct"
+}
+
 /// DNS hijack handler. One instance per TUN inbound, shared by reference.
 pub struct DnsHijack {
     remote_upstreams: Vec<Upstream>,
@@ -504,6 +525,29 @@ impl DnsHijack {
                 }
                 return Some(apply_txn_id(&cached, txn_id(query)));
             }
+        }
+
+        if let Some(resp) = reject_plan_response(&plan.outbound_tag, query) {
+            self.cache
+                .lock()
+                .await
+                .put(cache_key, (Instant::now(), resp.clone()));
+            log::debug!("DNS: {} (type {}) → reject", q.name, q.qtype);
+            return Some(resp);
+        }
+
+        if proxy_plan_cannot_answer_svcb(q.qtype, &plan.outbound_tag)
+            && let Some(resp) = build_empty_response(query)
+        {
+            self.cache
+                .lock()
+                .await
+                .put(cache_key, (Instant::now(), resp.clone()));
+            log::debug!(
+                "DNS: {} (type 65) → empty (no proxy SVCB)",
+                q.name
+            );
+            return Some(resp);
         }
 
         if q.qtype == 1
@@ -1081,5 +1125,44 @@ mod tests {
         );
         assert_eq!(cfg.remote, vec!["8.8.8.8", "1.1.1.1"]);
         assert_eq!(cfg.fakeip, Some("198.18.0.0/15".to_string()));
+    }
+
+    #[test]
+    fn reject_plan_answers_noerror_with_zero_answers() {
+        let query = wire::build_dns_query("ads.example.com", 1);
+
+        let resp = reject_plan_response("reject", &query).expect("reject must be answered");
+        assert_eq!(resp[2] & 0x80, 0x80, "QR must be set");
+        assert_eq!(resp[3] & 0x0f, 0, "RCODE must be NOERROR");
+        assert_eq!(u16::from_be_bytes([resp[6], resp[7]]), 0, "ANCOUNT must be 0");
+
+        // Any other tag goes through the normal resolution path.
+        for tag in ["direct", "remote", "reject "] {
+            assert!(reject_plan_response(tag, &query).is_none());
+        }
+    }
+
+    #[test]
+    fn proxy_plan_svcb_queries_are_answered_empty() {
+        assert!(proxy_plan_cannot_answer_svcb(65, "remote"));
+        // Only the literal "direct" tag is exempt, so a near-miss tag is
+        // still a proxy plan — same exact compare as the fake-ip branch.
+        assert!(proxy_plan_cannot_answer_svcb(65, "direct "));
+        assert!(proxy_plan_cannot_answer_svcb(65, "direct-auto"));
+
+        // Direct plans resolve type 65 over DoH, and every other qtype keeps
+        // its existing path.
+        for (qtype, tag) in [
+            (65u16, "direct"),
+            (1, "remote"),
+            (28, "remote"),
+            (64, "remote"),
+            (66, "remote"),
+        ] {
+            assert!(
+                !proxy_plan_cannot_answer_svcb(qtype, tag),
+                "qtype={qtype} tag={tag:?}"
+            );
+        }
     }
 }

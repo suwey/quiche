@@ -33,10 +33,17 @@ export function 创建请求TCP连接器(request?: Request): TCPConnector {
 		init === undefined ? fetcher.connect(options) : fetcher.connect(options, init);
 }
 
+/** 每流中止状态：客户端/服务端关闭流时置位，connectStreams 泵在下一次发送前观察到即停止推数据。 */
+export interface 中止状态 {
+	已中止: boolean;
+}
+
 interface ConnectStreamsWebSocket {
 	readyState: number;
 	send(data: ArrayBuffer | ArrayBufferView | Uint8Array): unknown;
 	close(): void;
+	// 缺省表示无中止源（UDP / 占位 WS 走该分支）。
+	中止?: 中止状态;
 }
 
 export async function connectStreams(
@@ -48,6 +55,7 @@ export async function connectStreams(
 ): Promise<void> {
 	const BYOB单次读取上限 = 64 * 1024;
 	const 下行发送器 = 创建下行Grain发送器(webSocket, headerData);
+	const 中止 = webSocket.中止;
 	let useBYOB = false;
 	let byobReader: ReadableStreamBYOBReader | null = null;
 	let defaultReader: ReadableStreamDefaultReader<Uint8Array> | null = null;
@@ -70,6 +78,7 @@ export async function connectStreams(
 	try {
 		if (!useBYOB && defaultReader) {
 			for (;;) {
+				if (中止?.已中止) break;
 				const { done, value } = await defaultReader.read();
 				if (done) {
 					// BYOB done 误报检测：若 socket 未关闭则继续读
@@ -78,6 +87,8 @@ export async function connectStreams(
 						new Promise<boolean>(resolve => setTimeout(() => resolve(false), 50)),
 					]);
 					if (已关闭) break;
+					// 客户端已 CLOSE：done 误报重试不得把已销毁的流重新拉起来
+					if (中止?.已中止) break;
 					continue;
 				}
 				if (!value || value.byteLength === 0) continue;
@@ -90,11 +101,13 @@ export async function connectStreams(
 					const hex = Array.from(value).map(b => b.toString(16).padStart(2, '0')).join(' ');
 					log(`[connectStreams] hex#${readCount} (${value.byteLength}B): ${hex}`);
 				}
+				if (中止?.已中止) break;
 				await 下行发送器.发送(value);
 			}
 		} else if (byobReader) {
 			let readBuffer = new ArrayBuffer(BYOB单次读取上限);
 			for (;;) {
+				if (中止?.已中止) break;
 				const { done, value } = await byobReader.read(
 					new Uint8Array(readBuffer, 0, BYOB单次读取上限),
 				);
@@ -104,6 +117,8 @@ export async function connectStreams(
 						new Promise<boolean>(resolve => setTimeout(() => resolve(false), 50)),
 					]);
 					if (已关闭) break;
+					// 客户端已 CLOSE：done 误报重试不得把已销毁的流重新拉起来
+					if (中止?.已中止) break;
 					continue;
 				}
 				if (!value || value.byteLength === 0) continue;
@@ -116,6 +131,7 @@ export async function connectStreams(
 					const hex = Array.from(value).map(b => b.toString(16).padStart(2, '0')).join(' ');
 					log(`[connectStreams] hex#${readCount} (${value.byteLength}B): ${hex}`);
 				}
+				if (中止?.已中止) break;
 				if (value.byteLength >= 下行Grain包字节) {
 					await 下行发送器.flush();
 					await 下行发送器.直接发送(value);
@@ -128,7 +144,7 @@ export async function connectStreams(
 				}
 			}
 		}
-		await 下行发送器.flush();
+		if (!中止?.已中止) await 下行发送器.flush();
 	} catch (err) {
 		log(`[connectStreams] read error: ${(err as { message?: string })?.message ?? err}`);
 	} finally {
@@ -148,7 +164,7 @@ export async function connectStreams(
 		log(`[connectStreams] 检测到 PROXYIP 返回 TLS handshake_failure，拉黑该节点`);
 		onProxyFailure();
 	}
-	if (retryFunc && (!hasData || 疑似反代失败)) await retryFunc();
+	if (retryFunc && !中止?.已中止 && (!hasData || 疑似反代失败)) await retryFunc();
 }
 
 export interface ForwardataTCPOptions {
