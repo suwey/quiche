@@ -92,6 +92,9 @@ impl MlessStreamHandle {
 /// Shared multiplexer state.
 pub(crate) struct MlessStreamEntry {
     pub(crate) sender: mpsc::UnboundedSender<Vec<u8>>,
+    /// Set once the server has delivered data on this stream. Dials that never
+    /// get a first byte are what the unanswered-dial streak counts.
+    pub(crate) answered: bool,
     _permit: MlessStreamPermit,
 }
 
@@ -116,6 +119,9 @@ pub(crate) struct MlessMultiplexerInner {
 /// M4: Uses pluggable `ConnectionManager` + `CryptoFactory`. The io_loop
 /// is async and operates on `TransportSession` + `CryptoLayer` trait objects.
 pub struct MlessMultiplexer {
+    /// 1-based pool slot, carried on every log line. Stream IDs restart at 1
+    /// for each tunnel, so an untagged `stream#7` is ambiguous across the pool.
+    pub(crate) slot: usize,
     pub(crate) inner: Mutex<MlessMultiplexerInner>,
     pub(crate) ws_tx: mpsc::UnboundedSender<MlessMessage>,
     stream_slots: Option<Arc<Semaphore>>,
@@ -124,8 +130,15 @@ pub struct MlessMultiplexer {
     pub(crate) next_stream_id: AtomicU64,
     pub(crate) dead: AtomicBool,
     pub(crate) reject_count: AtomicU32,
+    unanswered_streak: AtomicU32,
     pub(crate) reconnecting: AtomicBool,
 }
+
+/// Dials on one tunnel that went unanswered back to back before the tunnel is
+/// recycled. Two field runs put the threshold between the two populations:
+/// healthy tunnels topped out at streaks of 2-3 (66-77% dial answer rate) while
+/// dud tunnels ran 12 and 14 (35-61%).
+const UNANSWERED_DIAL_LIMIT: u32 = 6;
 
 impl MlessMultiplexer {
     /// Connect using pluggable components.
@@ -136,21 +149,22 @@ impl MlessMultiplexer {
     pub async fn connect_pluggable(
         conn_mgr: Arc<dyn ConnectionManager>,
         crypto_factory: Arc<dyn CryptoFactory>, uuid_str: &str,
-        max_streams: usize, capacity_notify: Arc<Notify>,
+        max_streams: usize, capacity_notify: Arc<Notify>, slot: usize,
     ) -> Result<Arc<Self>, Box<dyn std::error::Error>> {
-        log::debug!("mless: acquiring transport session...");
+        log::debug!("mless: [slot {slot}] acquiring transport session...");
         let session = conn_mgr
             .acquire_uplink()
             .await
             .map_err(|e| format!("mless: acquire transport failed: {e}"))?;
 
-        log::debug!("mless: creating crypto layer...");
+        log::debug!("mless: [slot {slot}] creating crypto layer...");
         let crypto = crypto_factory.create(uuid_str);
 
         let (ws_tx, ws_rx): (mpsc::UnboundedSender<MlessMessage>, _) =
             mpsc::unbounded_channel();
 
         let mux = Arc::new(Self {
+            slot,
             inner: Mutex::new(MlessMultiplexerInner {
                 streams: HashMap::new(),
                 active_streams: std::collections::HashSet::new(),
@@ -163,13 +177,14 @@ impl MlessMultiplexer {
             next_stream_id: AtomicU64::new(1),
             dead: AtomicBool::new(false),
             reject_count: AtomicU32::new(0),
+            unanswered_streak: AtomicU32::new(0),
             reconnecting: AtomicBool::new(false),
         });
 
-        log::debug!("mless: spawning async io_loop...");
+        log::debug!("mless: [slot {slot}] spawning async io_loop...");
         let mux_clone = Arc::downgrade(&mux);
         tokio::spawn(async move {
-            io_loop(session, crypto, ws_rx, mux_clone).await;
+            io_loop(session, crypto, ws_rx, mux_clone, slot).await;
         });
 
         Ok(mux)
@@ -209,6 +224,7 @@ impl MlessMultiplexer {
             uuid_str,
             0,
             Arc::new(Notify::new()),
+            1,
         )
         .await
     }
@@ -231,6 +247,7 @@ impl MlessMultiplexer {
                 stream_id,
                 MlessStreamEntry {
                     sender: tx,
+                    answered: false,
                     _permit: MlessStreamPermit {
                         _permit: permit,
                         capacity_notify: self.capacity_notify.clone(),
@@ -238,7 +255,8 @@ impl MlessMultiplexer {
                 },
             );
             log::debug!(
-                "mless: NEW stream#{} (active: {})",
+                "mless: [slot {}] NEW stream#{} (active: {})",
+                self.slot,
                 stream_id,
                 inner.streams.len(),
             );
@@ -247,23 +265,53 @@ impl MlessMultiplexer {
     }
 
     pub fn close_stream(&self, stream_id: u64) {
-        let removed = {
+        let (entry, active) = {
             let mut inner = self.inner.lock();
-            inner.streams.remove(&stream_id)
+            let entry = inner.streams.remove(&stream_id);
+            let active = inner.streams.len();
+            (entry, active)
         };
-        if removed.is_none() {
+        let Some(entry) = entry else {
             return;
-        }
-        let active = {
-            let inner = self.inner.lock();
-            inner.streams.len()
         };
         log::debug!(
-            "mless: CLOSE stream#{} sent (active: {})",
+            "mless: [slot {}] CLOSE stream#{} sent (active: {})",
+            self.slot,
             stream_id,
             active,
         );
+        self.note_dial_outcome(entry.answered);
         let _ = self.ws_tx.send(MlessMessage::Close { stream_id });
+    }
+
+    /// Record how one dial ended, taken from the stream being destroyed.
+    /// Whoever removes the entry from `streams` owns the accounting, so our own
+    /// close and a server CLOSE frame can never both count it.
+    ///
+    /// This exists alongside the CLOSE-rejection detector because that one only
+    /// reacts to frames naming unknown streams; a tunnel that simply stops
+    /// answering dials keeps its table clean and so never trips it.
+    fn note_dial_outcome(&self, answered: bool) {
+        if answered {
+            self.unanswered_streak.store(0, Ordering::Relaxed);
+            return;
+        }
+        let streak =
+            self.unanswered_streak.fetch_add(1, Ordering::Relaxed) + 1;
+        if streak < UNANSWERED_DIAL_LIMIT {
+            return;
+        }
+        self.unanswered_streak.store(0, Ordering::Relaxed);
+        log::warn!(
+            "mless: [slot {}] {streak} consecutive unanswered dials, retiring tunnel",
+            self.slot,
+        );
+        // Replacing the slot drops the pool's only strong Arc, so this
+        // multiplexer is freed immediately: in-flight streams EOF on their next
+        // read and the WebSocket closes. That cut is the point, and the server
+        // frees this tunnel's origin sockets from its own close handler, so no
+        // per-stream CLOSE is needed here.
+        self.dead.store(true, Ordering::Relaxed);
     }
 
     /// Send plaintext data - the io_loop handles encryption.
@@ -282,21 +330,26 @@ impl MlessMultiplexer {
         }
 
         if flags & FLAG_CLOSE != 0 {
-            let mut inner = self.inner.lock();
-            let was_active = inner.active_streams.remove(&stream_id);
-            inner.streams.remove(&stream_id);
+            let (entry, was_active, active) = {
+                let mut inner = self.inner.lock();
+                let was_active = inner.active_streams.remove(&stream_id);
+                let entry = inner.streams.remove(&stream_id);
+                (entry, was_active, inner.streams.len())
+            };
             if !was_active {
                 let rejects =
                     self.reject_count.fetch_add(1, Ordering::Relaxed) + 1;
                 log::warn!(
-                    "mless: CLOSE stream#{} rejected ({}, active: {})",
+                    "mless: [slot {}] CLOSE stream#{} rejected ({}, active: {})",
+                    self.slot,
                     stream_id,
                     rejects,
-                    inner.streams.len(),
+                    active,
                 );
                 if rejects >= 30 {
                     log::warn!(
-                        "mless: {} consecutive rejections, marking dead",
+                        "mless: [slot {}] {} consecutive rejections, marking dead",
+                        self.slot,
                         rejects
                     );
                     self.dead.store(true, Ordering::Relaxed);
@@ -305,10 +358,18 @@ impl MlessMultiplexer {
             } else {
                 self.reject_count.store(0, Ordering::Relaxed);
                 log::debug!(
-                    "mless: CLOSE stream#{} (active: {})",
+                    "mless: [slot {}] CLOSE stream#{} (active: {})",
+                    self.slot,
                     stream_id,
-                    inner.streams.len(),
+                    active,
                 );
+            }
+            // A server CLOSE ends the dial as much as our own close does, so
+            // the streak is accounted here whenever the server owned the
+            // stream's removal. `close_stream` returns early for the same
+            // stream afterwards, which is what keeps this counted once.
+            if let Some(entry) = entry {
+                self.note_dial_outcome(entry.answered);
             }
             return;
         }
@@ -321,7 +382,8 @@ impl MlessMultiplexer {
             .collect::<Vec<_>>()
             .join(" ");
         log::trace!(
-            "mless: DATA stream#{} {}B [{}] -> channel",
+            "mless: [slot {}] DATA stream#{} {}B [{}] -> channel",
+            self.slot,
             stream_id,
             payload.len(),
             hex_preview,
@@ -331,14 +393,16 @@ impl MlessMultiplexer {
         // Only insert into active_streams if the stream channel still exists.
         // If the stream was already closed (CLOSE sent/received), the channel
         // is gone and we should not re-activate it.
-        if let Some(entry) = inner.streams.get(&stream_id) {
+        if let Some(entry) = inner.streams.get_mut(&stream_id) {
             let tx = entry.sender.clone();
+            entry.answered = true;
             inner.active_streams.insert(stream_id);
             let _ = tx.send(payload);
         } else {
             // Stream already closed — silently discard late data from server.
             log::debug!(
-                "mless: DATA stream#{} {}B discarded (stream closed)",
+                "mless: [slot {}] DATA stream#{} {}B discarded (stream closed)",
+                self.slot,
                 stream_id,
                 payload.len(),
             );
@@ -349,7 +413,8 @@ impl MlessMultiplexer {
         self.dead.store(true, Ordering::Relaxed);
         let mut inner = self.inner.lock();
         log::warn!(
-            "mless: DISCONNECTED, clearing {} streams",
+            "mless: [slot {}] DISCONNECTED, clearing {} streams",
+            self.slot,
             inner.streams.len(),
         );
         inner.streams.clear();
@@ -370,14 +435,14 @@ impl MlessMultiplexer {
 async fn io_loop(
     mut session: Box<dyn TransportSession>, mut crypto: Box<dyn CryptoLayer>,
     mut ws_rx: mpsc::UnboundedReceiver<MlessMessage>,
-    mux: Weak<MlessMultiplexer>,
+    mux: Weak<MlessMultiplexer>, slot: usize,
 ) {
-    log::debug!("mless: io_loop starting, getting uplink/downlink...");
+    log::debug!("mless: [slot {slot}] io_loop starting, getting uplink/downlink...");
 
     let mut uplink = match session.uplink().await {
         Ok(u) => u,
         Err(e) => {
-            log::warn!("mless: uplink failed: {e}");
+            log::warn!("mless: [slot {slot}] uplink failed: {e}");
             if let Some(m) = mux.upgrade() {
                 m.on_disconnect();
             }
@@ -388,7 +453,7 @@ async fn io_loop(
     let mut downlink = match session.downlink().await {
         Ok(d) => d,
         Err(e) => {
-            log::warn!("mless: downlink failed: {e}");
+            log::warn!("mless: [slot {slot}] downlink failed: {e}");
             if let Some(m) = mux.upgrade() {
                 m.on_disconnect();
             }
@@ -406,7 +471,7 @@ async fn io_loop(
     // prepend it to the next read.
     let mut accum: Vec<u8> = Vec::new();
 
-    log::debug!("mless: io_loop ready, entering select loop");
+    log::debug!("mless: [slot {slot}] io_loop ready, entering select loop");
 
     loop {
         tokio::select! {
@@ -423,28 +488,49 @@ async fn io_loop(
                         let encrypted = match crypto.encrypt(&payload).await {
                             Ok(e) => e,
                             Err(e) => {
-                                log::warn!("mless: encrypt error: {e}");
+                                log::warn!(
+                                    "mless: [slot {slot}] encrypt error: {e}"
+                                );
                                 m.on_disconnect();
                                 return;
                             }
                         };
                         let frame = encode_frame(stream_id, flags, &encrypted);
                         if let Err(e) = uplink.write(&frame).await {
-                            log::warn!("mless: transport write error: {e}");
+                            log::warn!(
+                                "mless: [slot {slot}] transport write error: {e}"
+                            );
                             m.on_disconnect();
                             return;
+                        }
+                        // Confirms the dial request actually reached the
+                        // transport. Without this, a stream that never gets
+                        // answered is ambiguous between "the request stalled in
+                        // our own write queue" and "the server ignored it".
+                        if flags & FLAG_FIRST != 0 {
+                            log::debug!(
+                                "mless: [slot {slot}] FIRST stream#{stream_id} written to tunnel ({}B)",
+                                encrypted.len(),
+                            );
                         }
                     }
                     Some(MlessMessage::Close { stream_id }) => {
                         let frame = encode_frame(stream_id, FLAG_CLOSE, &[]);
                         if let Err(e) = uplink.write(&frame).await {
-                            log::warn!("mless: transport write error (close): {e}");
+                            log::warn!(
+                                "mless: [slot {slot}] transport write error (close): {e}"
+                            );
                             m.on_disconnect();
                             return;
                         }
+                        log::debug!(
+                            "mless: [slot {slot}] CLOSE stream#{stream_id} written to tunnel",
+                        );
                     }
                     None => {
-                        log::debug!("mless: ws_tx channel closed, io_loop exiting");
+                        log::debug!(
+                            "mless: [slot {slot}] ws_tx channel closed, io_loop exiting"
+                        );
                         return;
                     }
                 }
@@ -454,7 +540,7 @@ async fn io_loop(
                 let Some(m) = mux.upgrade() else { return; };
                 match result {
                     Ok(0) => {
-                        log::warn!("mless: transport EOF");
+                        log::warn!("mless: [slot {slot}] transport EOF");
                         m.on_disconnect();
                         return;
                     }
@@ -481,7 +567,7 @@ async fn io_loop(
                                     }
                                 };
                             log::trace!(
-                                "mless: recv stream#{} flags={:#x} payload={}B",
+                                "mless: [slot {slot}] recv stream#{} flags={:#x} payload={}B",
                                 stream_id,
                                 flags,
                                 payload.len(),
@@ -492,7 +578,9 @@ async fn io_loop(
                                 match crypto.decrypt(payload).await {
                                     Ok(d) => d,
                                     Err(e) => {
-                                        log::warn!("mless: decrypt error: {e}");
+                                        log::warn!(
+                                            "mless: [slot {slot}] decrypt error: {e}"
+                                        );
                                         m.on_disconnect();
                                         return;
                                     }
@@ -524,7 +612,10 @@ async fn io_loop(
                         continue;
                     }
                     Err(e) => {
-                        log::warn!("mless: transport read error: {e} ({:?})", e.kind());
+                        log::warn!(
+                            "mless: [slot {slot}] transport read error: {e} ({:?})",
+                            e.kind()
+                        );
                         m.on_disconnect();
                         return;
                     }
@@ -541,6 +632,7 @@ mod tests {
     fn multiplexer(max_streams: usize) -> Arc<MlessMultiplexer> {
         let (ws_tx, _ws_rx) = mpsc::unbounded_channel();
         Arc::new(MlessMultiplexer {
+            slot: 1,
             inner: Mutex::new(MlessMultiplexerInner {
                 streams: HashMap::new(),
                 active_streams: std::collections::HashSet::new(),
@@ -553,8 +645,63 @@ mod tests {
             next_stream_id: AtomicU64::new(1),
             dead: AtomicBool::new(false),
             reject_count: AtomicU32::new(0),
+            unanswered_streak: AtomicU32::new(0),
             reconnecting: AtomicBool::new(false),
         })
+    }
+
+    /// Six dials on one tunnel that never saw a single byte back retire it;
+    /// five do not. The threshold sits between the two populations seen in the
+    /// field (healthy streaks of 2-3, dud tunnels at 12 and 14).
+    #[test]
+    fn unanswered_dial_streak_retires_tunnel() {
+        let mux = multiplexer(0);
+        for _ in 0..UNANSWERED_DIAL_LIMIT - 1 {
+            let (stream_id, _rx) = mux.try_register_stream().unwrap();
+            mux.close_stream(stream_id);
+        }
+        assert!(!mux.dead.load(Ordering::Relaxed));
+
+        let (stream_id, _rx) = mux.try_register_stream().unwrap();
+        mux.close_stream(stream_id);
+        assert!(mux.dead.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn answered_dial_clears_the_unanswered_streak() {
+        let mux = multiplexer(0);
+        for _ in 0..UNANSWERED_DIAL_LIMIT - 1 {
+            let (stream_id, _rx) = mux.try_register_stream().unwrap();
+            mux.close_stream(stream_id);
+        }
+        // A dial the server did answer, even one byte, resets the count.
+        let (answered, _rx) = mux.try_register_stream().unwrap();
+        mux.on_frame(answered, 0, vec![0, 0]); // 0 == FLAG_DATA
+        mux.close_stream(answered);
+
+        for _ in 0..UNANSWERED_DIAL_LIMIT - 1 {
+            let (stream_id, _rx) = mux.try_register_stream().unwrap();
+            mux.close_stream(stream_id);
+        }
+        assert!(!mux.dead.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn server_close_of_an_unanswered_dial_counts_once() {
+        let mux = multiplexer(0);
+        for _ in 0..UNANSWERED_DIAL_LIMIT - 1 {
+            let (stream_id, _rx) = mux.try_register_stream().unwrap();
+            // The server ends the stream instead of us, then our relay drop
+            // calls close_stream for the same id again.
+            mux.on_frame(stream_id, FLAG_CLOSE, Vec::new());
+            mux.close_stream(stream_id);
+        }
+        assert!(!mux.dead.load(Ordering::Relaxed));
+
+        let (stream_id, _rx) = mux.try_register_stream().unwrap();
+        mux.on_frame(stream_id, FLAG_CLOSE, Vec::new());
+        mux.close_stream(stream_id);
+        assert!(mux.dead.load(Ordering::Relaxed));
     }
 
     #[test]

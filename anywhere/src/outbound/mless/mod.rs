@@ -220,6 +220,7 @@ impl MlessOutboundClient {
                 let crypto_factory = crypto_factory.clone();
                 let capacity_notify = capacity_notify.clone();
                 let uuid_str = uuid_str.clone();
+                let slot = i + 1;
                 async move {
                     let mux = MlessMultiplexer::connect_pluggable(
                         conn_mgr,
@@ -227,15 +228,14 @@ impl MlessOutboundClient {
                         &uuid_str,
                         max_streams,
                         capacity_notify,
+                        slot,
                     )
                     .await?;
                     // Completion lines may interleave now that the slots
                     // connect in parallel; the slot number is what matters.
                     if pool_size > 1 {
                         log::info!(
-                            "mless: pool slot {}/{} connected",
-                            i + 1,
-                            pool_size
+                            "mless: [slot {slot}] pool connected ({slot}/{pool_size})",
                         );
                     }
                     Ok::<_, Box<dyn std::error::Error>>(mux)
@@ -309,10 +309,10 @@ impl MlessOutboundClient {
             pool[idx].consecutive_fails.fetch_add(1, Ordering::Relaxed)
         };
         let delay_secs = (2u64).pow(fails.min(5)).min(30);
+        let slot = idx + 1;
         log::info!(
-            "{}: pool slot {} reconnecting... (attempt {}, backoff {}s)",
+            "{}: [slot {slot}] pool reconnecting... (attempt {}, backoff {}s)",
             self.log_tag(),
-            idx,
             fails + 1,
             delay_secs,
         );
@@ -324,6 +324,7 @@ impl MlessOutboundClient {
             &self.uuid_str,
             self.max_streams,
             self.capacity_notify.clone(),
+            slot,
         )
         .await;
 
@@ -338,10 +339,16 @@ impl MlessOutboundClient {
             pool[idx].consecutive_fails.store(0, Ordering::Relaxed);
             pool[idx].mux = new_mux.clone();
             drop(pool);
-            log::info!("{}: pool slot {} reconnected", self.log_tag(), idx);
+            log::info!(
+                "{}: [slot {slot}] pool reconnected",
+                self.log_tag()
+            );
             Some(new_mux)
         } else {
-            log::warn!("{}: pool slot {} reconnect failed", self.log_tag(), idx);
+            log::warn!(
+                "{}: [slot {slot}] pool reconnect failed",
+                self.log_tag()
+            );
             None
         }
     }
@@ -445,11 +452,12 @@ impl OutboundClient for MlessOutboundClient {
         let (mux, stream_id, rx) = self.open_stream().await?;
         let vless_header = build_vless_header(&self.uuid, dest, false);
         log::debug!(
-            "{}: dial tcp {dest} -> stream#{}",
+            "{}: [slot {}] dial tcp {dest} -> stream#{stream_id}",
             self.log_tag(),
-            stream_id
+            mux.slot
         );
         Ok(Box::new(MlessStreamRelay {
+            slot: mux.slot,
             stream_id,
             rx,
             multiplexer: Arc::downgrade(&mux),
@@ -482,9 +490,9 @@ impl OutboundClient for MlessOutboundClient {
                 let (mux, stream_id, rx) = self.open_stream().await?;
                 let header = build_vless_header(&self.uuid, dest, true);
                 log::debug!(
-                    "{}: dial udp {dest} -> stream#{}",
+                    "{}: [slot {}] dial udp {dest} -> stream#{stream_id}",
                     self.log_tag(),
-                    stream_id
+                    mux.slot
                 );
                 Ok(Box::new(MlessPacketRelay {
                     handle: MlessStreamHandle {
@@ -528,6 +536,8 @@ impl OutboundClient for MlessOutboundClient {
 /// to the first data frame. We must consume and discard it before returning
 /// payload bytes to the caller.
 pub struct MlessStreamRelay {
+    /// Pool slot of the tunnel carrying this stream, for log attribution.
+    slot: usize,
     stream_id: u64,
     rx: mpsc::UnboundedReceiver<Vec<u8>>,
     multiplexer: Weak<MlessMultiplexer>,
@@ -586,7 +596,8 @@ impl StreamRelay for MlessStreamRelay {
                             self.vless_resp_prefix.extend_from_slice(header_rest);
                             let header = &self.vless_resp_prefix;
                             log::debug!(
-                                "mless: stream#{} vless response head={:02x?}",
+                                "mless: [slot {}] stream#{} vless response head={:02x?}",
+                                self.slot,
                                 self.stream_id,
                                 header,
                             );
@@ -614,14 +625,16 @@ impl StreamRelay for MlessStreamRelay {
                     },
                     Ok(None) => {
                         log::debug!(
-                            "mless: stream#{} rx channel closed (server sent CLOSE or disconnected)",
+                            "mless: [slot {}] stream#{} rx channel closed (server sent CLOSE or disconnected)",
+                            self.slot,
                             self.stream_id,
                         );
                         return Ok(0);
                     },
                     Err(_) => {
                         log::debug!(
-                            "mless: stream#{} timeout ({}s), closing",
+                            "mless: [slot {}] stream#{} timeout ({}s), closing",
+                            self.slot,
                             self.stream_id,
                             if self.ever_received { 300 } else { 30 },
                         );
@@ -754,6 +767,7 @@ mod tests {
 
     fn new_relay(rx: mpsc::UnboundedReceiver<Vec<u8>>) -> MlessStreamRelay {
         MlessStreamRelay {
+            slot: 1,
             stream_id: 1,
             rx,
             multiplexer: Weak::new(),
