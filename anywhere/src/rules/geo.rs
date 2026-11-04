@@ -124,17 +124,14 @@ impl DomainMatcher {
     pub fn dump(&self) -> (Vec<String>, Vec<String>) {
         let mut keys = Vec::new();
         let mut current_key: Vec<u8> = Vec::new();
-        extract_keys(
-            &self.leaves,
-            &self.label_bitmap,
-            &self.labels,
-            &self.ranks,
-            &self.selects,
-            0,
-            0,
-            &mut current_key,
-            &mut keys,
-        );
+        let idx = TrieIndex {
+            leaves: &self.leaves,
+            label_bitmap: &self.label_bitmap,
+            labels: &self.labels,
+            ranks: &self.ranks,
+            selects: &self.selects,
+        };
+        extract_keys(&idx, 0, 0, &mut current_key, &mut keys);
 
         let mut domains = Vec::new();
         let mut suffixes = Vec::new();
@@ -556,42 +553,47 @@ fn read_domain_item(buf: &[u8], pos: &mut usize) -> Option<DomainMatcher> {
 // Trie traversal for dump()
 // ---------------------------------------------------------------------------
 
-#[allow(clippy::too_many_arguments)] // relay plumbing; grouping would obscure the call sites
+/// The louds-encoded trie's static index arrays, grouped so the recursive
+/// dump traversal passes one borrowed reference instead of five parallel
+/// slices.
+struct TrieIndex<'a> {
+    leaves: &'a [u64],
+    label_bitmap: &'a [u64],
+    labels: &'a [u8],
+    ranks: &'a [i32],
+    selects: &'a [i32],
+}
+
 fn extract_keys(
-    leaves: &[u64], label_bitmap: &[u64], labels: &[u8], ranks: &[i32],
-    selects: &[i32], node_id: usize, bm_idx: usize, current_key: &mut Vec<u8>,
-    keys: &mut Vec<String>,
+    idx: &TrieIndex<'_>, node_id: usize, bm_idx: usize,
+    current_key: &mut Vec<u8>, keys: &mut Vec<String>,
 ) {
-    if node_id >> 6 < leaves.len() && get_bit(leaves, node_id) != 0 {
+    if node_id >> 6 < idx.leaves.len() && get_bit(idx.leaves, node_id) != 0 {
         keys.push(String::from_utf8_lossy(current_key).to_string());
     }
 
     let mut bm_idx = bm_idx;
     loop {
-        if bm_idx >> 6 >= label_bitmap.len() {
+        if bm_idx >> 6 >= idx.label_bitmap.len() {
             return;
         }
-        if get_bit(label_bitmap, bm_idx) != 0 {
+        if get_bit(idx.label_bitmap, bm_idx) != 0 {
             return;
         }
         let label_idx = bm_idx - node_id;
-        if label_idx >= labels.len() {
+        if label_idx >= idx.labels.len() {
             return;
         }
-        let next_label = labels[label_idx];
+        let next_label = idx.labels[label_idx];
         current_key.push(next_label);
-        let next_node = count_zeros(label_bitmap, ranks, bm_idx + 1);
+        let next_node = count_zeros(idx.label_bitmap, idx.ranks, bm_idx + 1);
         let prev_one = if next_node == 0 {
             !0usize
         } else {
-            select_ith_one(label_bitmap, ranks, selects, next_node - 1)
+            select_ith_one(idx.label_bitmap, idx.ranks, idx.selects, next_node - 1)
         };
         extract_keys(
-            leaves,
-            label_bitmap,
-            labels,
-            ranks,
-            selects,
+            idx,
             next_node,
             prev_one.wrapping_add(1),
             current_key,

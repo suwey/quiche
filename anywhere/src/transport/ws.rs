@@ -1401,18 +1401,18 @@ impl TransportFactory for WsTransportFactory {
         let tcp = crate::outbound::common::connect_tcp_bypass(addr)
             .await
             .map_err(|e| TransportError::Connect(e.to_string()))?;
-        let ws = crate::outbound::vless::build_ws_async(
-            tcp,
-            &ctx.tls_server,
-            ctx.insecure,
-            ctx.tls_fp,
-            ctx.fragment.as_ref(),
-            &crate::ech::EchOffer::None,
-            &ctx.path,
-            &ctx.headers,
-        )
-        .await
-        .map_err(|e| TransportError::Connect(e.to_string()))?;
+        let params = crate::outbound::vless::WsDialParams {
+            tls_server: &ctx.tls_server,
+            insecure: ctx.insecure,
+            tls_fp: ctx.tls_fp,
+            fragment: ctx.fragment.as_ref(),
+            ech: crate::ech::EchOffer::None,
+            path: &ctx.path,
+            headers: &ctx.headers,
+        };
+        let ws = crate::outbound::vless::build_ws_async(tcp, params)
+            .await
+            .map_err(|e| TransportError::Connect(e.to_string()))?;
 
         let session = WsTransportSession::new(ws);
         Ok(Box::new(session))

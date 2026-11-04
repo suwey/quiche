@@ -437,33 +437,33 @@ pub async fn run(opts: RunOptions) -> Result<(), Box<dyn std::error::Error>> {
                 }
         }
 
-        AppContext::new(
-            registry.clone(),
-            rules.clone(),
-            stats.clone(),
+        AppContext::new(crate::context::AppContextDeps {
+            registry: registry.clone(),
+            rules: rules.clone(),
+            stats: stats.clone(),
             logs_tx,
             start_cmd,
             outbound_tags,
             urltest_states,
-            cache.clone(),
+            cache: cache.clone(),
             cmd_tx,
             event_tx,
-        )
+        })
     } else {
         let (logs_tx, _) =
             tokio::sync::broadcast::channel::<crate::ui::log::LogMsg>(1);
-        AppContext::new(
-            registry.clone(),
-            rules.clone(),
-            AppStats::new(|| 0),
+        AppContext::new(crate::context::AppContextDeps {
+            registry: registry.clone(),
+            rules: rules.clone(),
+            stats: AppStats::new(|| 0),
             logs_tx,
-            None,
-            Vec::new(),
-            HashMap::new(),
-            cache.clone(),
+            start_cmd: None,
+            outbound_tags: Vec::new(),
+            urltest_states: HashMap::new(),
+            cache: cache.clone(),
             cmd_tx,
             event_tx,
-        )
+        })
     };
 
     // --- TUN inbounds ---

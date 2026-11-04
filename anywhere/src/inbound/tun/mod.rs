@@ -676,8 +676,12 @@ impl TunInbound {
         // 6. Spawn the TUN I/O handler.
         let tun_clone = device.clone();
         let nat_clone = nat.clone();
-        let conn_tx_handler = conn_tx.clone();
-        let dns_hijack_clone = dns_hijack.clone();
+        let relay_ctx = handler::TunRelayCtx {
+            conn_tx: conn_tx.clone(),
+            reverse_dns: Some(reverse_dns_for_handler),
+            dns_hijack: dns_hijack.clone(),
+        };
+        let relay_ctx_accept = relay_ctx.clone();
         let shutdown_handler = shutdown.clone();
         tun_handles.push(tokio::spawn(async move {
             handler::run_tun_handler(
@@ -685,9 +689,7 @@ impl TunInbound {
                 addr,
                 nat_clone,
                 listener_port,
-                conn_tx_handler,
-                dns_hijack,
-                Some(reverse_dns_for_handler),
+                relay_ctx,
                 shutdown_handler,
             )
             .await;
@@ -696,8 +698,6 @@ impl TunInbound {
         // 7. Spawn the accept loop.
         let nat_accept = nat.clone();
         let cancel_accept = cancel_registry.clone();
-        let conn_tx_accept = conn_tx.clone();
-        let reverse_dns_accept = reverse_dns.clone();
         let sniff_enabled = config.sniff;
         let shutdown_accept = shutdown.clone();
         tun_handles.push(tokio::spawn(async move {
@@ -705,9 +705,7 @@ impl TunInbound {
                 listener,
                 nat_accept,
                 cancel_accept,
-                conn_tx_accept,
-                Some(reverse_dns_accept),
-                dns_hijack_clone,
+                relay_ctx_accept,
                 sniff_enabled,
                 shutdown_accept,
             )
@@ -753,15 +751,12 @@ impl TunInbound {
     }
 }
 
-#[allow(clippy::too_many_arguments)] // relay plumbing; grouping would obscure the call sites
 /// Accept TCP connections from the NAT listener and forward them as
 /// InboundConns.
 async fn accept_loop(
     listener: tokio::net::TcpListener, nat: Arc<Mutex<TCPNat>>,
-    cancel_registry: TcpCancelRegistry, conn_tx: mpsc::Sender<InboundConn>,
-    reverse_dns: Option<Arc<ReverseDnsCache>>,
-    dns_hijack: Option<Arc<DnsHijack>>, sniff_enabled: bool,
-    shutdown: CancellationToken,
+    cancel_registry: TcpCancelRegistry, ctx: handler::TunRelayCtx,
+    sniff_enabled: bool, shutdown: CancellationToken,
 ) {
     let mut backoff = Duration::from_millis(100);
     loop {
@@ -799,7 +794,8 @@ async fn accept_loop(
 
         match session {
             Some(session) => {
-                let address = match (session.target_addr.ip(), &reverse_dns) {
+                let address = match (session.target_addr.ip(), &ctx.reverse_dns)
+                {
                     (std::net::IpAddr::V4(v4), Some(rev)) => {
                         match rev.lookup_ipv4(v4).await {
                             Some(domain) => {
@@ -813,7 +809,7 @@ async fn accept_loop(
                                 Address::Domain(domain)
                             },
                             None => {
-                                let is_fakeip = match &dns_hijack {
+                                let is_fakeip = match &ctx.dns_hijack {
                                     Some(hj) => hj.fakeip_contains(v4),
                                     None => false,
                                 };
@@ -860,7 +856,7 @@ async fn accept_loop(
                     type_: "tun".into(),
                     sniff: sniff_enabled,
                 };
-                if conn_tx.try_send(conn).is_err() {
+                if ctx.conn_tx.try_send(conn).is_err() {
                     // No task owns this session: drop the registry token too,
                     // otherwise it outlives its NAT entry (the expiry loop
                     // only visits ports still mapped).

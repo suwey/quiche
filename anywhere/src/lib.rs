@@ -20,6 +20,7 @@ pub mod runner;
 pub mod sniff;
 pub mod subscription;
 pub mod tlsfragment;
+pub mod tlsresume;
 pub mod transport;
 pub mod ui;
 pub mod wssfront;

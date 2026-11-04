@@ -246,18 +246,20 @@ impl VlessPool {
         }
         let tcp = connect_tcp_bypass(self.addr).await?;
         match &self.builder {
-            TransportBuilder::Ws { path, headers, ech } => build_ws_async(
-                tcp,
-                &self.tls_server,
-                self.insecure,
-                self.tls_fp,
-                self.fragment.as_ref(),
-                ech,
-                path,
-                headers,
-            )
-            .await
-            .map(VlessStream::Ws),
+            TransportBuilder::Ws { path, headers, ech } => {
+                let params = WsDialParams {
+                    tls_server: &self.tls_server,
+                    insecure: self.insecure,
+                    tls_fp: self.tls_fp,
+                    fragment: self.fragment.as_ref(),
+                    ech: ech.clone(),
+                    path,
+                    headers,
+                };
+                build_ws_async(tcp, params)
+                    .await
+                    .map(VlessStream::Ws)
+            },
             TransportBuilder::Reality { params } => {
                 // The session_id timestamp is derived at build time; pooled
                 // connections may age, but servers only check it when an
@@ -1020,22 +1022,38 @@ fn split_vless_response(resp: Vec<u8>) -> io::Result<Vec<u8>> {
     Ok(data)
 }
 
-#[allow(clippy::too_many_arguments)] // relay plumbing; grouping would obscure the call sites
+/// The VLESS request relayed over an established transport stream: the
+/// header fields plus the bundled first payload (first-write optimization —
+/// header and payload go out in a single frame).
+struct VlessRelayRequest {
+    uuid: [u8; 16],
+    dest: Destination,
+    command: VlessCommand,
+    /// Vision flow (§S2.8): only sent on TCP requests; UDP keeps it empty
+    /// so servers that accept UDP without flow don't reject the request.
+    flow: Option<String>,
+    /// First payload bytes bundled into the handshake frame.
+    first_payload: Vec<u8>,
+}
+
 /// Spawn an async relay for an established VLESS connection.
 ///
 /// Performs the VLESS handshake (header + bundled first payload), then splits
 /// the transport into reader/writer halves and runs async read/write loops —
 /// fully async, no `spawn_blocking`, so a stuck connection can't wedge the
 /// tokio blocking pool (and thus Ctrl+C shutdown).
-///
-/// `flow` is only sent on TCP requests (§S2.8); `VlessCommand::Udp` keeps it
-/// empty so servers that accept UDP without flow don't reject the request.
 fn spawn_vless_relay(
-    stream: VlessStream, uuid: [u8; 16], dest: Destination,
-    command: VlessCommand, flow: Option<String>, first_payload: Vec<u8>,
+    stream: VlessStream, request: VlessRelayRequest,
     data_tx: mpsc::UnboundedSender<Vec<u8>>,
     mut outbound_rx: mpsc::UnboundedReceiver<Vec<u8>>,
 ) {
+    let VlessRelayRequest {
+        uuid,
+        dest,
+        command,
+        flow,
+        first_payload,
+    } = request;
     tokio::spawn(async move {
         // 1. VLESS handshake: send header + first payload, read response.
         let flow_for_request = match command {
@@ -1605,16 +1623,37 @@ impl WsStreamAsync {
     }
 }
 
-#[allow(clippy::too_many_arguments)] // relay plumbing; grouping would obscure the call sites
+/// WebSocket dial parameters: TLS options plus the WS upgrade target.
+///
+/// Grouped because every caller assembles them from a context/pool struct
+/// rather than threading five loose scalars through the call.
+pub(crate) struct WsDialParams<'a> {
+    /// SNI / TLS server name; empty means plain (no TLS) WebSocket.
+    pub(crate) tls_server: &'a str,
+    pub(crate) insecure: bool,
+    pub(crate) tls_fp: bool,
+    pub(crate) fragment: Option<&'a FragmentConfig>,
+    pub(crate) ech: crate::ech::EchOffer<'a>,
+    pub(crate) path: &'a str,
+    pub(crate) headers: &'a HashMap<String, String>,
+}
+
 /// Build an async WebSocket connection over TCP (optional TLS).
 ///
 /// Uses `tokio_boring` for async TLS and `WsConnAsync` for async WebSocket
 /// framing. The entire handshake is fully async — no `spawn_blocking`.
 pub(crate) async fn build_ws_async(
-    tcp: tokio::net::TcpStream, tls_server: &str, insecure: bool, tls_fp: bool,
-    fragment: Option<&FragmentConfig>, ech: &crate::ech::EchOffer<'_>,
-    path: &str, headers: &HashMap<String, String>,
+    tcp: tokio::net::TcpStream, params: WsDialParams<'_>,
 ) -> io::Result<WsStreamAsync> {
+    let WsDialParams {
+        tls_server,
+        insecure,
+        tls_fp,
+        fragment,
+        ech,
+        path,
+        headers,
+    } = params;
     let host = tls_server;
     let hdrs: Vec<(&str, &str)> = headers
         .iter()
@@ -1627,10 +1666,20 @@ pub(crate) async fn build_ws_async(
     }
     // TLS fragment is now supported via AsyncFragmentStream in create_tls_stream_async.
     let ssl_stream = crate::outbound::common::create_tls_stream_async(
-        tcp, host, tls_fp, insecure, fragment, ech,
+        tcp, host, tls_fp, insecure, fragment, &ech,
     )
     .await?;
     let ws = WsConnAsync::upgrade(ssl_stream, path, host, &hdrs).await?;
+    // TLS 1.3 session tickets arrive as post-handshake messages and are
+    // only processed while reading; reading the 101 response is the first
+    // read, so the server's tickets (Cloudflare sends them immediately
+    // after the handshake) are in by now. This re-capture — not the
+    // post-handshake one inside create_tls_stream_async — is what makes
+    // the NEXT dial resume instead of paying a full handshake again.
+    let resume_key = crate::tlsresume::cache_key(host, tls_fp, insecure);
+    if let Some(session) = ws.inner.ssl().session() {
+        crate::tlsresume::store(&resume_key, session);
+    }
     Ok(WsStreamAsync::Tls(ws))
 }
 
@@ -1741,11 +1790,13 @@ impl StreamRelay for VlessDeferredStreamRelay {
             let (outbound_tx, outbound_rx) = mpsc::unbounded_channel();
             spawn_vless_relay(
                 stream,
-                uuid,
-                dest,
-                VlessCommand::Tcp,
-                flow,
-                first,
+                VlessRelayRequest {
+                    uuid,
+                    dest,
+                    command: VlessCommand::Tcp,
+                    flow,
+                    first_payload: first,
+                },
                 data_tx,
                 outbound_rx,
             );
@@ -1885,11 +1936,13 @@ impl PacketRelay for VlessDeferredPacketRelay {
             let (outbound_tx, outbound_rx) = mpsc::unbounded_channel();
             spawn_vless_relay(
                 stream,
-                uuid,
-                dest,
-                VlessCommand::Udp,
-                flow,
-                first,
+                VlessRelayRequest {
+                    uuid,
+                    dest,
+                    command: VlessCommand::Udp,
+                    flow,
+                    first_payload: first,
+                },
                 data_tx,
                 outbound_rx,
             );

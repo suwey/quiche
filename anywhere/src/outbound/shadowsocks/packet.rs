@@ -614,12 +614,31 @@ mod tests {
 
     // ── Test helpers: build server response packets ─────────────────────────
 
+    /// Parameters of a server→client response packet, shared by the AES and
+    /// ChaCha20 test-packet builders.
+    struct ServerPacketSpec<'a> {
+        method: &'a CipherMethod,
+        server_session_id: u64,
+        server_packet_id: u64,
+        client_session_id: u64,
+        dest: &'a Destination,
+        payload: &'a [u8],
+        timestamp: Option<u64>,
+        padding_len: u16,
+    }
+
     /// Build an AES server→client response packet.
-    fn build_server_aes(
-        method: &CipherMethod, server_session_id: u64, server_packet_id: u64,
-        client_session_id: u64, dest: &Destination, payload: &[u8],
-        timestamp: Option<u64>, padding_len: u16,
-    ) -> Vec<u8> {
+    fn build_server_aes(spec: &ServerPacketSpec<'_>) -> Vec<u8> {
+        let ServerPacketSpec {
+            method,
+            server_session_id,
+            server_packet_id,
+            client_session_id,
+            dest,
+            payload,
+            timestamp,
+            padding_len,
+        } = *spec;
         let mut hdr = [0u8; 16];
         hdr[0..8].copy_from_slice(&server_session_id.to_be_bytes());
         hdr[8..16].copy_from_slice(&server_packet_id.to_be_bytes());
@@ -651,11 +670,17 @@ mod tests {
     }
 
     /// Build a ChaCha20 server→client response packet.
-    fn build_server_chacha(
-        method: &CipherMethod, server_session_id: u64, server_packet_id: u64,
-        client_session_id: u64, dest: &Destination, payload: &[u8],
-        timestamp: Option<u64>, padding_len: u16,
-    ) -> Vec<u8> {
+    fn build_server_chacha(spec: &ServerPacketSpec<'_>) -> Vec<u8> {
+        let ServerPacketSpec {
+            method,
+            server_session_id,
+            server_packet_id,
+            client_session_id,
+            dest,
+            payload,
+            timestamp,
+            padding_len,
+        } = *spec;
         let cipher =
             XChaCha20Poly1305::new_from_slice(method.last_psk()).unwrap();
 
@@ -699,14 +724,16 @@ mod tests {
         let payload = b"hello aes-256 udp";
 
         let packet = build_server_aes(
-            &method,
-            99_999,
-            0,
-            client_session_id,
-            &dest,
-            payload,
-            None,
-            0,
+            &ServerPacketSpec {
+                method: &method,
+                server_session_id: 99_999,
+                server_packet_id: 0,
+                client_session_id: client_session_id,
+                dest: &dest,
+                payload: payload,
+                timestamp: None,
+                padding_len: 0,
+            },
         );
 
         let (decrypted, parsed_dest) = relay.decrypt_packet_aes(&packet).unwrap();
@@ -726,14 +753,16 @@ mod tests {
         let payload = b"hello aes-128 udp";
 
         let packet = build_server_aes(
-            &method,
-            55_555,
-            0,
-            client_session_id,
-            &dest,
-            payload,
-            None,
-            0,
+            &ServerPacketSpec {
+                method: &method,
+                server_session_id: 55_555,
+                server_packet_id: 0,
+                client_session_id: client_session_id,
+                dest: &dest,
+                payload: payload,
+                timestamp: None,
+                padding_len: 0,
+            },
         );
 
         let (decrypted, parsed_dest) = relay.decrypt_packet_aes(&packet).unwrap();
@@ -858,14 +887,16 @@ mod tests {
         let payload = b"pad";
 
         let packet = build_server_aes(
-            &method,
-            7777,
-            0,
-            client_session_id,
-            &dest,
-            payload,
-            None,
-            200,
+            &ServerPacketSpec {
+                method: &method,
+                server_session_id: 7777,
+                server_packet_id: 0,
+                client_session_id: client_session_id,
+                dest: &dest,
+                payload: payload,
+                timestamp: None,
+                padding_len: 200,
+            },
         );
 
         let (decrypted, parsed_dest) = relay.decrypt_packet_aes(&packet).unwrap();
@@ -889,14 +920,16 @@ mod tests {
         let payload = b"hello chacha udp";
 
         let packet = build_server_chacha(
-            &method,
-            88_888,
-            0,
-            client_session_id,
-            &dest,
-            payload,
-            None,
-            0,
+            &ServerPacketSpec {
+                method: &method,
+                server_session_id: 88_888,
+                server_packet_id: 0,
+                client_session_id: client_session_id,
+                dest: &dest,
+                payload: payload,
+                timestamp: None,
+                padding_len: 0,
+            },
         );
 
         let (decrypted, parsed_dest) =
@@ -960,14 +993,16 @@ mod tests {
         // 120s in the past — exceeds 30s tolerance
         let old_ts = now_secs().saturating_sub(120);
         let packet = build_server_aes(
-            &method,
-            42,
-            0,
-            client_session_id,
-            &dest,
-            payload,
-            Some(old_ts),
-            0,
+            &ServerPacketSpec {
+                method: &method,
+                server_session_id: 42,
+                server_packet_id: 0,
+                client_session_id: client_session_id,
+                dest: &dest,
+                payload: payload,
+                timestamp: Some(old_ts),
+                padding_len: 0,
+            },
         );
 
         let err = relay.decrypt_packet_aes(&packet).unwrap_err();
@@ -991,14 +1026,16 @@ mod tests {
 
         let old_ts = now_secs().saturating_sub(120);
         let packet = build_server_chacha(
-            &method,
-            42,
-            0,
-            client_session_id,
-            &dest,
-            payload,
-            Some(old_ts),
-            0,
+            &ServerPacketSpec {
+                method: &method,
+                server_session_id: 42,
+                server_packet_id: 0,
+                client_session_id: client_session_id,
+                dest: &dest,
+                payload: payload,
+                timestamp: Some(old_ts),
+                padding_len: 0,
+            },
         );
 
         let err = relay.decrypt_packet_chacha(&packet).unwrap_err();
@@ -1022,8 +1059,16 @@ mod tests {
 
         // Wrong clientSessionId
         let wrong_id = relay.session_id.wrapping_add(1);
-        let packet =
-            build_server_aes(&method, 66, 0, wrong_id, &dest, payload, None, 0);
+        let packet = build_server_aes(&ServerPacketSpec {
+            method: &method,
+            server_session_id: 66,
+            server_packet_id: 0,
+            client_session_id: wrong_id,
+            dest: &dest,
+            payload,
+            timestamp: None,
+            padding_len: 0,
+        });
 
         let err = relay.decrypt_packet_aes(&packet).unwrap_err();
         assert!(
@@ -1045,7 +1090,16 @@ mod tests {
 
         let wrong_id = relay.session_id.wrapping_add(1);
         let packet = build_server_chacha(
-            &method, 66, 0, wrong_id, &dest, payload, None, 0,
+            &ServerPacketSpec {
+                method: &method,
+                server_session_id: 66,
+                server_packet_id: 0,
+                client_session_id: wrong_id,
+                dest: &dest,
+                payload: payload,
+                timestamp: None,
+                padding_len: 0,
+            },
         );
 
         let err = relay.decrypt_packet_chacha(&packet).unwrap_err();
@@ -1069,14 +1123,16 @@ mod tests {
         let payload = b"replay me";
 
         let packet = build_server_aes(
-            &method,
-            44,
-            0,
-            client_session_id,
-            &dest,
-            payload,
-            None,
-            0,
+            &ServerPacketSpec {
+                method: &method,
+                server_session_id: 44,
+                server_packet_id: 0,
+                client_session_id: client_session_id,
+                dest: &dest,
+                payload: payload,
+                timestamp: None,
+                padding_len: 0,
+            },
         );
 
         // First reception: OK
@@ -1103,14 +1159,16 @@ mod tests {
         let payload = b"replay me";
 
         let packet = build_server_chacha(
-            &method,
-            44,
-            0,
-            client_session_id,
-            &dest,
-            payload,
-            None,
-            0,
+            &ServerPacketSpec {
+                method: &method,
+                server_session_id: 44,
+                server_packet_id: 0,
+                client_session_id: client_session_id,
+                dest: &dest,
+                payload: payload,
+                timestamp: None,
+                padding_len: 0,
+            },
         );
 
         // First reception: OK
@@ -1179,14 +1237,16 @@ mod tests {
         let payload = b"domain test";
 
         let packet = build_server_aes(
-            &method,
-            222,
-            0,
-            client_session_id,
-            &dest,
-            payload,
-            None,
-            0,
+            &ServerPacketSpec {
+                method: &method,
+                server_session_id: 222,
+                server_packet_id: 0,
+                client_session_id: client_session_id,
+                dest: &dest,
+                payload: payload,
+                timestamp: None,
+                padding_len: 0,
+            },
         );
 
         let (decrypted, parsed_dest) = relay.decrypt_packet_aes(&packet).unwrap();

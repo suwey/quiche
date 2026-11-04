@@ -124,7 +124,16 @@ impl TunWriter {
     }
 }
 
-#[allow(clippy::too_many_arguments)] // relay plumbing; grouping would obscure the call sites
+/// Relay plumbing shared by the TUN I/O loop and the NAT accept loop:
+/// where new inbound connections are offered, plus the reverse-DNS /
+/// fake-ip state used to restore destination domain names.
+#[derive(Clone)]
+pub(crate) struct TunRelayCtx {
+    pub(crate) conn_tx: mpsc::Sender<InboundConn>,
+    pub(crate) reverse_dns: Option<Arc<ReverseDnsCache>>,
+    pub(crate) dns_hijack: Option<Arc<DnsHijack>>,
+}
+
 /// Run the TUN I/O handler loop.
 ///
 /// Reads packets from the TUN device, applies NAT/un-NAT for TCP,
@@ -133,9 +142,7 @@ impl TunWriter {
 /// reader never blocks.
 pub async fn run_tun_handler(
     tun: Arc<AsyncDevice>, tun_addr: IpAddr, nat: Arc<Mutex<TCPNat>>,
-    listener_port: u16, conn_tx: mpsc::Sender<InboundConn>,
-    dns_hijack: Option<Arc<DnsHijack>>,
-    reverse_dns: Option<Arc<ReverseDnsCache>>, shutdown: CancellationToken,
+    listener_port: u16, ctx: TunRelayCtx, shutdown: CancellationToken,
 ) {
     let writer = TunWriter::new(tun.clone());
 
@@ -205,7 +212,7 @@ pub async fn run_tun_handler(
                         dst = meta.dst_ip,
                         dp = meta.dst_port,
                     );
-                    if let Some(ref dns) = dns_hijack {
+                    if let Some(ref dns) = ctx.dns_hijack {
                         let l4_off = meta.l4_offset;
                         let udp_hdr_end = l4_off + 8;
                         if udp_hdr_end < meta.total_len {
@@ -237,11 +244,9 @@ pub async fn run_tun_handler(
                     &buf[..n],
                     &meta,
                     &tun_addr,
-                    &conn_tx,
+                    &ctx,
                     &writer,
                     &mut udp_sessions,
-                    &reverse_dns,
-                    &dns_hijack,
                 )
                 .await;
 
@@ -508,17 +513,14 @@ fn is_non_routable(ip: IpAddr) -> bool {
     }
 }
 
-#[allow(clippy::too_many_arguments)] // relay plumbing; grouping would obscure the call sites
 /// Handle a UDP packet: dispatch via session table, or create a new
 /// relay session.
 ///
 /// Returns `true` if the packet was dropped (channel full / system under
 /// load), `false` if it was successfully dispatched.
 async fn handle_udp_packet(
-    buf: &[u8], meta: &IpPacketMeta, tun_addr: &IpAddr,
-    conn_tx: &mpsc::Sender<InboundConn>, writer: &TunWriter,
-    sessions: &mut UdpSessionTable, reverse_dns: &Option<Arc<ReverseDnsCache>>,
-    dns_hijack: &Option<Arc<DnsHijack>>,
+    buf: &[u8], meta: &IpPacketMeta, tun_addr: &IpAddr, ctx: &TunRelayCtx,
+    writer: &TunWriter, sessions: &mut UdpSessionTable,
 ) -> bool {
     // Drop broadcast / multicast / link-local packets early — these are
     // local discovery protocols (mDNS, SSDP, NetBIOS, etc.) that must not
@@ -578,7 +580,7 @@ async fn handle_udp_packet(
         packet_rx, // subsequent datagrams arrive here
     );
 
-    let initial_destination = if let Some(ref rev) = *reverse_dns {
+    let initial_destination = if let Some(ref rev) = ctx.reverse_dns {
         match meta.dst_ip {
             IpAddr::V4(v4) => {
                 if let Some(domain) = rev.lookup_ipv4(v4).await {
@@ -588,7 +590,7 @@ async fn handle_udp_packet(
                         meta.dst_ip,
                     )
                 } else {
-                    if let Some(hj) = dns_hijack
+                    if let Some(hj) = &ctx.dns_hijack
                         && hj.fakeip_contains(v4) {
                             log::warn!(
                                 "TUN fake-ip missing reverse mapping: {}:{}",
@@ -623,7 +625,7 @@ async fn handle_udp_packet(
         type_: "tun".into(),
     };
 
-    if conn_tx.try_send(conn).is_ok() {
+    if ctx.conn_tx.try_send(conn).is_ok() {
         // Insert session entry only after conn_tx accepted it.
         sessions.sessions.insert(
             key,

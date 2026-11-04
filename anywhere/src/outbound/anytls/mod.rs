@@ -920,7 +920,10 @@ fn run_io_loop(
 
 // ========== Client ==========
 
-pub struct AnyTlsOutboundClient {
+/// Everything needed to establish an anytls TLS session — built once at
+/// config time and shared by the eager pre-connect, the lazy reconnects
+/// and the pool cleanup tasks.
+struct SessionParams {
     addr: std::net::SocketAddr,
     sni: String,
     password: String,
@@ -930,10 +933,14 @@ pub struct AnyTlsOutboundClient {
     /// ECH offer for TLS handshakes (config / grease / none, derived from
     /// `ech` + registry-resolved `ech_config`).
     ech: crate::ech::EchOffer<'static>,
-    tcp_pool: Arc<SessionPool>,
-    udp_pool: Arc<SessionPool>,
     /// Cached padding scheme shared across TCP and UDP sessions.
     padding_cache: Arc<StdMutex<PaddingCache>>,
+}
+
+pub struct AnyTlsOutboundClient {
+    params: Arc<SessionParams>,
+    tcp_pool: Arc<SessionPool>,
+    udp_pool: Arc<SessionPool>,
 }
 
 impl AnyTlsOutboundClient {
@@ -961,20 +968,21 @@ impl AnyTlsOutboundClient {
             config.ech,
             config.ech_config.as_deref(),
         );
+        let params = Arc::new(SessionParams {
+            addr,
+            sni,
+            password,
+            fp: config.fp,
+            insecure: config.insecure,
+            fragment,
+            ech,
+            padding_cache: padding_cache.clone(),
+        });
 
         // Eagerly create one TLS session before TUN comes up, so the
         // initial TCP connection uses normal routing (not TUN). If this
         // fails the session will be lazily re-created on first dial().
-        if let Ok(handle) = Self::create_session_inner(
-            addr,
-            &sni,
-            &password,
-            config.fp,
-            config.insecure,
-            fragment.as_ref(),
-            &ech,
-            padding_cache.clone(),
-        ) {
+        if let Ok(handle) = Self::create_session_inner(&params) {
             tcp_pool.entries.lock().unwrap().push(SessionPoolEntry {
                 handle,
                 idle_since: Some(std::time::Instant::now()),
@@ -983,16 +991,9 @@ impl AnyTlsOutboundClient {
         }
 
         let client = Self {
-            addr,
-            sni,
-            password,
-            fp: config.fp,
-            insecure: config.insecure,
-            fragment,
-            ech,
+            params,
             tcp_pool,
             udp_pool,
-            padding_cache,
         };
 
         // Spawn periodic cleanup for both pools.
@@ -1003,79 +1004,32 @@ impl AnyTlsOutboundClient {
 
     /// Spawn background cleanup tasks for TCP and UDP session pools.
     fn spawn_pool_cleanup_tasks(&self) {
-        let addr = self.addr;
-        let sni = self.sni.clone();
-        let password = self.password.clone();
-        let fp = self.fp;
-        let insecure = self.insecure;
-        let frag = self.fragment.clone();
-        let ech = self.ech.clone();
-        let pc = self.padding_cache.clone();
-        self.tcp_pool.spawn_cleanup(move || {
-            Self::create_session_inner(
-                addr,
-                &sni,
-                &password,
-                fp,
-                insecure,
-                frag.as_ref(),
-                &ech,
-                pc.clone(),
-            )
-        });
+        let params = self.params.clone();
+        self.tcp_pool
+            .spawn_cleanup(move || Self::create_session_inner(&params));
 
-        let addr = self.addr;
-        let sni = self.sni.clone();
-        let password = self.password.clone();
-        let fp = self.fp;
-        let insecure = self.insecure;
-        let frag = self.fragment.clone();
-        let ech = self.ech.clone();
-        let pc = self.padding_cache.clone();
-        self.udp_pool.spawn_cleanup(move || {
-            Self::create_session_inner(
-                addr,
-                &sni,
-                &password,
-                fp,
-                insecure,
-                frag.as_ref(),
-                &ech,
-                pc.clone(),
-            )
-        });
+        let params = self.params.clone();
+        self.udp_pool
+            .spawn_cleanup(move || Self::create_session_inner(&params));
     }
 
     /// Create a new TLS session and spawn its IO thread.
     /// Does NOT open the first stream — call `session.open_stream(target)`
     fn create_session(&self) -> std::io::Result<SessionHandle> {
-        Self::create_session_inner(
-            self.addr,
-            &self.sni,
-            &self.password,
-            self.fp,
-            self.insecure,
-            self.fragment.as_ref(),
-            &self.ech,
-            self.padding_cache.clone(),
-        )
+        Self::create_session_inner(&self.params)
     }
 
-    #[allow(clippy::too_many_arguments)] // relay plumbing; grouping would obscure the call sites
     /// Static version of create_session — used both by from_config (eager
     /// pre-connect) and by ensure_session (lazy reconnect).
     fn create_session_inner(
-        addr: std::net::SocketAddr, sni: &str, password: &str, fp: bool,
-        insecure: bool, fragment: Option<&FragmentConfig>,
-        ech: &crate::ech::EchOffer<'static>,
-        padding_cache: Arc<StdMutex<PaddingCache>>,
+        params: &SessionParams,
     ) -> std::io::Result<SessionHandle> {
         let (control_tx, control_rx) = mpsc::unbounded_channel();
         let (outbound_tx, outbound_rx) = mpsc::unbounded_channel::<OutboundMsg>();
 
         // Initialize padding from the client-wide cache (avoids update
         // round-trip when reconnecting).
-        let cached_raw = padding_cache.lock().unwrap().raw.clone();
+        let cached_raw = params.padding_cache.lock().unwrap().raw.clone();
         let initial_padding = PaddingFactory::new(&cached_raw)
             .unwrap_or_else(|_| PaddingFactory::default_factory());
 
@@ -1094,10 +1048,16 @@ impl AnyTlsOutboundClient {
         });
 
         let inner_clone = inner.clone();
-        let sni = sni.to_string();
-        let password = password.to_string();
-        let frag = fragment.cloned();
-        let ech = ech.clone();
+        // Owned copies for the 'static blocking task: `params` does not
+        // outlive this function.
+        let addr = params.addr;
+        let sni = params.sni.clone();
+        let password = params.password.clone();
+        let fp = params.fp;
+        let insecure = params.insecure;
+        let frag = params.fragment.clone();
+        let ech = params.ech.clone();
+        let padding_cache = params.padding_cache.clone();
 
         tokio::task::spawn_blocking(move || {
             let tcp = match connect_tcp_bypass_sync(addr) {
@@ -1184,7 +1144,7 @@ impl AnyTlsOutboundClient {
     /// (diagnostic/test observability only; not part of the wire protocol).
     #[doc(hidden)]
     pub fn cached_padding_md5(&self) -> String {
-        self.padding_cache.lock().unwrap().md5().to_string()
+        self.params.padding_cache.lock().unwrap().md5().to_string()
     }
 }
 

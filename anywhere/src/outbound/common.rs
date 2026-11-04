@@ -1065,6 +1065,8 @@ pub fn create_tls_stream(
         ssl.set_hostname(sni)
             .map_err(io::Error::other)?;
     }
+    let resume_key = crate::tlsresume::cache_key(sni, fp, insecure);
+    crate::tlsresume::try_resume(&mut ssl, &resume_key);
     crate::ech::apply_ech_offer(&mut ssl, ech)
         .map_err(io::Error::other)?;
     // Always wrap with FragmentTcpStream.  When fragment is None,
@@ -1080,6 +1082,15 @@ pub fn create_tls_stream(
         .map_err(io::Error::other)?;
     crate::ech::verify_ech_outcome(stream.ssl(), ech)
         .map_err(io::Error::other)?;
+    if stream.ssl().session_reused() {
+        log::info!("TLS: session resumed for {sni} (PSK, no cert flight)");
+    } else if let Some(session) = stream.ssl().session() {
+        // TLS 1.2 tickets ride the handshake flight, so the session is
+        // already resumable here; TLS 1.3 tickets only land once the
+        // caller reads post-handshake records (see build_ws_async), and
+        // `store` gates on resumability so this is a no-op until then.
+        crate::tlsresume::store(&resume_key, session);
+    }
     Ok(stream)
 }
 
@@ -1122,6 +1133,8 @@ pub async fn create_tls_stream_async(
     let mut config = connector
         .configure()
         .map_err(io::Error::other)?;
+    let resume_key = crate::tlsresume::cache_key(sni, fp, insecure);
+    crate::tlsresume::try_resume(&mut config, &resume_key);
     crate::ech::apply_ech_offer(&mut config, ech)
         .map_err(io::Error::other)?;
     let frag_stream = AsyncFragmentStream::new(tcp, fragment);
@@ -1130,6 +1143,14 @@ pub async fn create_tls_stream_async(
         .map_err(io::Error::other)?;
     crate::ech::verify_ech_outcome(tls.ssl(), ech)
         .map_err(io::Error::other)?;
+    if tls.ssl().session_reused() {
+        log::info!("TLS: session resumed for {sni} (PSK, no cert flight)");
+    } else if let Some(session) = tls.ssl().session() {
+        // See create_tls_stream: TLS 1.2 sessions are resumable right here;
+        // TLS 1.3 tickets land on the caller's first post-handshake read,
+        // where build_ws_async re-captures them.
+        crate::tlsresume::store(&resume_key, session);
+    }
     Ok(tls)
 }
 

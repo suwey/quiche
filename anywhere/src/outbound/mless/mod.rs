@@ -25,6 +25,7 @@ use crate::relay::StreamRelay;
 use self::frame::FLAG_FIRST;
 use self::multiplexer::MlessMessage;
 use self::multiplexer::MlessMultiplexer;
+use self::multiplexer::MuxPoolWiring;
 use self::multiplexer::PoolRetireGate;
 use self::multiplexer::MlessStreamHandle;
 use self::vless::build_vless_header;
@@ -51,19 +52,11 @@ pub struct MlessOutboundClient {
     next: AtomicUsize,
     /// Pool size (cached for reconnection logic).
     pool_size: usize,
-    /// Maximum MLESS streams per physical connection (0 = unlimited).
-    max_streams: usize,
-    /// Notified when a stream permit is released.
-    capacity_notify: Arc<Notify>,
-    /// Shared across the pool: bounds how often a streak of unanswered dials
-    /// may retire a tunnel, so a globally degraded path cannot keep recycling
-    /// the pool and cutting streams that are still downloading fine.
-    pool_gate: Arc<PoolRetireGate>,
+    /// Pool-side wiring shared by every slot: stream capacity, retire gate,
+    /// and the pool-wide death signal.
+    wiring: MuxPoolWiring,
     uuid: [u8; 16],
     uuid_str: String,
-    /// Pool-wide wake-up signal fired on any tunnel death so the keepalive
-    /// task reconnects immediately instead of waiting out its poll interval.
-    disconnect_signal: Arc<tokio::sync::Notify>,
     /// Pluggable crypto factory (shared; each slot creates its own instance).
     crypto_factory: Arc<dyn CryptoFactory>,
     /// Direct outbound used for UDP ports that mless can't tunnel (e.g. NTP).
@@ -119,8 +112,6 @@ impl MlessOutboundClient {
             .and_then(|x| x.max_concurrency.as_ref())
             .map(|range| range.rand_usize())
             .unwrap_or(0);
-        let capacity_notify = Arc::new(Notify::new());
-        let pool_gate = PoolRetireGate::new();
 
         // Build connection manager(s) from the nested [transport] config.
         //
@@ -251,7 +242,12 @@ impl MlessOutboundClient {
 
         // One pool-wide wake-up channel: any tunnel death (transport EOF,
         // involuntary retirement) notifies the keepalive task immediately.
-        let disconnect_signal = Arc::new(tokio::sync::Notify::new());
+        let wiring = MuxPoolWiring {
+            max_streams,
+            capacity_notify: Arc::new(Notify::new()),
+            pool_gate: PoolRetireGate::new(),
+            disconnect_signal: Arc::new(Notify::new()),
+        };
 
         // Connect all multiplexer instances in the pool concurrently.
         // Each slot does its own TCP+TLS+WS (or XHTTP stream) handshake with
@@ -265,21 +261,16 @@ impl MlessOutboundClient {
             (0..pool_size).map(|i| {
                 let conn_mgr = build_conn_mgr(i + 1);
                 let crypto_factory = crypto_factory.clone();
-                let capacity_notify = capacity_notify.clone();
+                let wiring = wiring.clone();
                 let uuid_str = uuid_str.clone();
-                let pool_gate = pool_gate.clone();
-                let disconnect_signal = disconnect_signal.clone();
                 let slot = i + 1;
                 async move {
                     let mux = MlessMultiplexer::connect_pluggable(
                         conn_mgr,
                         crypto_factory,
                         &uuid_str,
-                        max_streams,
-                        capacity_notify,
+                        wiring,
                         slot,
-                        pool_gate,
-                        disconnect_signal,
                     )
                     .await?;
                     // Completion lines may interleave now that the slots
@@ -306,15 +297,12 @@ impl MlessOutboundClient {
             .collect();
 
         Ok(Self {
-            pool_gate,
+            wiring,
             pool: tokio::sync::Mutex::new(slots),
             next: AtomicUsize::new(0),
             pool_size,
-            max_streams,
-            capacity_notify,
             uuid,
             uuid_str,
-            disconnect_signal,
             crypto_factory,
             direct_fallback: DirectOutboundClient::default(),
         })
@@ -378,11 +366,8 @@ impl MlessOutboundClient {
             conn_mgr,
             self.crypto_factory.clone(),
             &self.uuid_str,
-            self.max_streams,
-            self.capacity_notify.clone(),
+            self.wiring.clone(),
             slot,
-            self.pool_gate.clone(),
-            self.disconnect_signal.clone(),
         )
         .await;
 
@@ -434,7 +419,7 @@ impl MlessOutboundClient {
                     _ = tokio::time::sleep(
                         std::time::Duration::from_secs(10),
                     ) => {},
-                    _ = client.disconnect_signal.notified() => {},
+                    _ = client.wiring.disconnect_signal.notified() => {},
                 }
                 let mut dead: Vec<usize> = Vec::new();
                 while dead.len() < client.pool_size {
@@ -492,7 +477,7 @@ impl MlessOutboundClient {
                 continue;
             }
 
-            let notified = self.capacity_notify.notified();
+            let notified = self.wiring.capacity_notify.notified();
             tokio::pin!(notified);
             if let Some(stream) = self.try_register_stream().await {
                 return Ok(stream);

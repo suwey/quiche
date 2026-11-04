@@ -113,10 +113,21 @@ function isWSHandoff(result: Response | WSHandoff): result is WSHandoff {
 // - DO 被 CF 强杀/逐出时一死全死（现场：5 条隧道 30 秒内 1005/1006 全灭）。
 //
 // 客户端（anywhere mless WS 池）在隧道路径上带 `_hslot=<slot>` 标记；
-// 带 `_hslot` 的隧道请求按值取模分片，其余请求（admin/订阅/配置页）
+// 带 `_hslot` 的隧道请求按值取模分片。其余请求（admin/订阅/配置页）
 // 一律落 shard 0 —— KV（config.json 等）只在 shard 0 上有完整状态，
-// 隧道数据面不读 KV，因此各分片 DO 独立持有自己的 WS session 是安全的。
+// 隧道数据面不读 KV（反代参数也只从 URL 解析），因此各分片 DO 独立持有
+// 自己的隧道会话是安全的。
 const DO_SHARD_COUNT = 8;
+
+/** FNV-1a 32bit：分片哈希只需确定性 + 均匀，不需要密码学强度（保持同步）。 */
+function 隧道哈希分片(文本: string): number {
+	let hash = 0x811c9dc5;
+	for (let i = 0; i < 文本.length; i++) {
+		hash ^= 文本.charCodeAt(i);
+		hash = Math.imul(hash, 0x01000193);
+	}
+	return (hash >>> 0) % DO_SHARD_COUNT;
+}
 
 function 解析隧道分片(request: Request, url: URL): number | null {
 	const upgradeHeader = (request.headers.get('Upgrade') || '').toLowerCase();
@@ -124,10 +135,20 @@ function 解析隧道分片(request: Request, url: URL): number | null {
 		return null;
 	}
 	const raw = url.searchParams.get('_hslot');
-	if (raw === null) return null;
-	const slot = Number(raw);
-	if (!Number.isInteger(slot) || slot < 0) return null;
-	return slot % DO_SHARD_COUNT;
+	if (raw !== null) {
+		const slot = Number(raw);
+		if (!Number.isInteger(slot) || slot < 0) return null;
+		return slot % DO_SHARD_COUNT;
+	}
+	// 无标记的隧道 POST（xhttp / gRPC 协议，外部订阅客户端如 sing-box）
+	// 与 router 的判定对齐（router.ts：非 admin/login 的 POST 即隧道请求，
+	// 每个 POST 独立成一条 stream-one 隧道、无跨请求会话状态），按完整
+	// URL 确定性哈希分片 —— 同一会话的所有请求 URL 相同，落同一 shard；
+	// 不同隧道的并发流摊到各 shard DO 上，避免全部挤在 shard 0。
+	if (request.method !== 'POST') return null;
+	const pathname = url.pathname.toLowerCase();
+	if (pathname.startsWith('/admin') || pathname === '/login') return null;
+	return 隧道哈希分片(url.pathname + url.search);
 }
 
 export default {

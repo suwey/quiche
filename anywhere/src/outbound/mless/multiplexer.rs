@@ -18,7 +18,6 @@
 
 use std::collections::HashMap;
 use std::collections::VecDeque;
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::Weak;
 use std::sync::atomic::AtomicBool;
@@ -37,7 +36,6 @@ use crate::connection::ConnectionManager;
 use crate::crypto::{CryptoFactory, CryptoLayer};
 use crate::transport::TransportSession;
 
-use super::crypto::AheadXorFactory;
 use super::frame::*;
 
 // ---------------------------------------------------------------------------
@@ -114,6 +112,22 @@ impl Drop for MlessStreamPermit {
 pub(crate) struct MlessMultiplexerInner {
     pub(crate) streams: HashMap<u64, MlessStreamEntry>,
     pub(crate) active_streams: std::collections::HashSet<u64>,
+}
+
+/// Pool-side wiring shared by every multiplexer in a mless pool, built once
+/// at client construction and cloned per slot dial: stream capacity, the
+/// retire gate, and the pool-wide death signal.
+#[derive(Clone)]
+pub(crate) struct MuxPoolWiring {
+    /// Maximum MLESS streams per physical connection (0 = unlimited).
+    pub(crate) max_streams: usize,
+    /// Notified when a stream permit is released.
+    pub(crate) capacity_notify: Arc<Notify>,
+    /// Bounds how often a streak of unanswered dials may retire a tunnel.
+    pub(crate) pool_gate: Arc<PoolRetireGate>,
+    /// Pool-wide wake-up fired on any tunnel death so the keepalive task
+    /// reconnects immediately instead of waiting out its poll interval.
+    pub(crate) disconnect_signal: Arc<Notify>,
 }
 
 /// Shared by every tunnel in the pool to throttle streak-driven retirements.
@@ -234,13 +248,10 @@ impl MlessMultiplexer {
     /// Acquires a `TransportSession` from the `ConnectionManager`, creates
     /// a `CryptoLayer` from the `CryptoFactory`, and spawns an async io_loop
     /// that handles encryption/decryption and frame I/O.
-    #[allow(clippy::too_many_arguments)] // pool wiring; grouping would obscure the call sites
     pub(crate) async fn connect_pluggable(
         conn_mgr: Arc<dyn ConnectionManager>,
         crypto_factory: Arc<dyn CryptoFactory>, uuid_str: &str,
-        max_streams: usize, capacity_notify: Arc<Notify>, slot: usize,
-        pool_gate: Arc<PoolRetireGate>,
-        disconnect_signal: Arc<Notify>,
+        wiring: MuxPoolWiring, slot: usize,
     ) -> Result<Arc<Self>, Box<dyn std::error::Error>> {
         log::debug!("mless: [slot {slot}] acquiring transport session...");
         let session = conn_mgr
@@ -253,6 +264,13 @@ impl MlessMultiplexer {
 
         let (ws_tx, ws_rx): (mpsc::UnboundedSender<MlessMessage>, _) =
             mpsc::unbounded_channel();
+
+        let MuxPoolWiring {
+            max_streams,
+            capacity_notify,
+            pool_gate,
+            disconnect_signal,
+        } = wiring;
 
         let mux = Arc::new(Self {
             slot,
@@ -283,47 +301,6 @@ impl MlessMultiplexer {
         });
 
         Ok(mux)
-    }
-
-    /// Backward-compatible connect using WS transport.
-    ///
-    /// Builds a `SingleConnectionManager` + `WsTransportFactory` and
-    /// delegates to `connect_pluggable()`.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn connect(
-        addr: SocketAddr, uuid_str: &str, tls_server: &str, insecure: bool,
-        tls_fp: bool, fragment: Option<&crate::tlsfragment::FragmentConfig>,
-        path: &str, headers: &HashMap<String, String>,
-    ) -> Result<Arc<Self>, Box<dyn std::error::Error>> {
-        use crate::connection::SingleConnectionManager;
-        use crate::transport::{TransportContext, ws::WsTransportFactory};
-
-        let ctx = TransportContext {
-            server: format!("{}:{}", addr.ip(), addr.port()),
-            port: addr.port(),
-            tls_server: tls_server.to_string(),
-            insecure,
-            tls_fp,
-            path: path.to_string(),
-            headers: headers.clone(),
-            fragment: fragment.cloned(),
-        };
-        let conn_mgr: Arc<dyn ConnectionManager> = Arc::new(
-            SingleConnectionManager::new(Box::new(WsTransportFactory), ctx),
-        );
-        let crypto_factory: Arc<dyn CryptoFactory> = Arc::new(AheadXorFactory);
-
-        Self::connect_pluggable(
-            conn_mgr,
-            crypto_factory,
-            uuid_str,
-            0,
-            Arc::new(Notify::new()),
-            1,
-            PoolRetireGate::new(),
-            Arc::new(Notify::new()),
-        )
-        .await
     }
 
     /// Register a new stream without sending any frame.

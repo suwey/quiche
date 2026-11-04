@@ -34,12 +34,30 @@ use crate::inbound::tun::TunRouteManager;
 #[cfg(target_os = "windows")]
 use crate::inbound::tun::WindowsTunManager;
 
+/// Construction-time dependencies for [`AppContext::new`].
+///
+/// Groups the wiring built by the runner so the constructor stays readable;
+/// the runtime-managed fields (`shutdown_signal`, `conn_handles`,
+/// `config_path`, TUN manager) are initialized inside `new` instead.
+pub struct AppContextDeps {
+    pub registry: Arc<OutboundRegistry>,
+    pub rules: Arc<Rules>,
+    pub stats: Arc<AppStats>,
+    pub logs_tx: broadcast::Sender<LogMsg>,
+    pub start_cmd: Option<String>,
+    pub outbound_tags: Vec<(String, String)>,
+    pub urltest_states: HashMap<String, Arc<UrlTestState>>,
+    /// Persistent cache store (redb) for group selections, mode, etc.
+    pub cache: Arc<crate::cache::CacheStore>,
+    pub cmd_tx: mpsc::Sender<UiCommand>,
+    pub event_tx: broadcast::Sender<StateEvent>,
+}
+
 /// Global application context.
 ///
 /// Every field is cheaply cloneable so the context can be shared across tasks
 /// without additional `Arc` nesting.
-pub struct AppContext {
-    pub registry: Arc<OutboundRegistry>,
+pub struct AppContext {    pub registry: Arc<OutboundRegistry>,
     pub rules: Arc<Rules>,
     pub stats: Arc<AppStats>,
     pub logs_tx: broadcast::Sender<LogMsg>,
@@ -95,27 +113,19 @@ impl Clone for AppContext {
 }
 
 impl AppContext {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        registry: Arc<OutboundRegistry>, rules: Arc<Rules>, stats: Arc<AppStats>,
-        logs_tx: broadcast::Sender<LogMsg>, start_cmd: Option<String>,
-        outbound_tags: Vec<(String, String)>,
-        urltest_states: HashMap<String, Arc<UrlTestState>>,
-        cache: Arc<crate::cache::CacheStore>, cmd_tx: mpsc::Sender<UiCommand>,
-        event_tx: broadcast::Sender<StateEvent>,
-    ) -> Self {
+    pub fn new(deps: AppContextDeps) -> Self {
         Self {
-            registry,
-            rules,
-            stats,
-            logs_tx,
-            start_cmd,
+            registry: deps.registry,
+            rules: deps.rules,
+            stats: deps.stats,
+            logs_tx: deps.logs_tx,
+            start_cmd: deps.start_cmd,
             shutdown_signal: Arc::new(Notify::new()),
-            outbound_tags,
-            urltest_states,
-            cache,
-            cmd_tx,
-            event_tx,
+            outbound_tags: deps.outbound_tags,
+            urltest_states: deps.urltest_states,
+            cache: deps.cache,
+            cmd_tx: deps.cmd_tx,
+            event_tx: deps.event_tx,
             conn_handles: Arc::new(std::sync::Mutex::new(Vec::new())),
             config_path: None,
             #[cfg(target_os = "linux")]
