@@ -70,11 +70,10 @@ fn load_macos_physical_iface() -> Option<MacosPhysicalIface> {
     for line in stdout.lines() {
         let trimmed = line.trim();
         if let Some(rest) = trimmed.strip_prefix("inet ") {
-            if let Some(ip_str) = rest.split_whitespace().next() {
-                if let Ok(ip) = ip_str.parse::<std::net::Ipv4Addr>() {
+            if let Some(ip_str) = rest.split_whitespace().next()
+                && let Ok(ip) = ip_str.parse::<std::net::Ipv4Addr>() {
                     ipv4 = Some(ip);
                 }
-            }
             break;
         }
     }
@@ -96,11 +95,10 @@ pub fn refresh_macos_physical_iface_cache() {
 fn cached_macos_physical_iface() -> Option<MacosPhysicalIface> {
     let cache = MACOS_PHYSICAL_IFACE_CACHE
         .get_or_init(|| std::sync::RwLock::new(load_macos_physical_iface()));
-    if let Ok(cached) = cache.read() {
-        if cached.as_ref().is_some_and(|iface| iface.ipv4.is_some()) {
+    if let Ok(cached) = cache.read()
+        && cached.as_ref().is_some_and(|iface| iface.ipv4.is_some()) {
             return cached.clone();
         }
-    }
 
     refresh_macos_physical_iface_cache();
     cache.read().ok().and_then(|cached| cached.clone())
@@ -211,7 +209,7 @@ fn set_unicast_if_raw(raw: libc::SOCKET, ipv4: bool) {
 #[allow(dead_code)]
 fn bind_to_physical_iface(fd: std::os::fd::RawFd) -> io::Result<()> {
     let iface = cached_macos_physical_iface().ok_or_else(|| {
-        io::Error::new(io::ErrorKind::Other, "no physical interface")
+        io::Error::other("no physical interface")
     })?;
     let idx = iface.index;
     // IP_BOUND_IF = 25 (IP level) on macOS. See <netinet/in.h>.
@@ -242,7 +240,6 @@ const TCP_CONNECT_TIMEOUT: std::time::Duration =
 
 /// Connect a TCP socket, applying SO_MARK on Linux so it bypasses TUN routing.
 /// The address MUST be a resolved `SocketAddr` (IP:port), not a domain.
-
 pub async fn connect_tcp_bypass(
     addr: std::net::SocketAddr,
 ) -> io::Result<TcpStream> {
@@ -518,11 +515,10 @@ async fn connect_tcp_bypass_macos(
             .with_retries(3),
     )?;
 
-    if addr.is_ipv4() {
-        if let Some(src_ip) = physical_iface_ipv4() {
+    if addr.is_ipv4()
+        && let Some(src_ip) = physical_iface_ipv4() {
             socket.bind(&std::net::SocketAddr::from((src_ip, 0)).into())?;
         }
-    }
 
     if bind_interface {
         let fd = socket.as_raw_fd();
@@ -637,7 +633,7 @@ async fn connect_tcp_bypass_macos(
             }
             Err(e)
         },
-        Err(e) => Err(io::Error::new(io::ErrorKind::Other, e)),
+        Err(e) => Err(io::Error::other(e)),
     }
 }
 
@@ -1055,7 +1051,7 @@ pub fn create_tls_stream(
     fragment: Option<&FragmentConfig>, ech: &crate::ech::EchOffer<'_>,
 ) -> io::Result<TlsStream> {
     let mut builder = SslContextBuilder::new(SslMethod::tls())
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        .map_err(io::Error::other)?;
     if fp {
         apply_fingerprint_to_ctx(&mut builder);
     }
@@ -1064,13 +1060,13 @@ pub fn create_tls_stream(
     }
     let ctx = builder.build();
     let mut ssl =
-        Ssl::new(&ctx).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        Ssl::new(&ctx).map_err(io::Error::other)?;
     if !sni.is_empty() {
         ssl.set_hostname(sni)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            .map_err(io::Error::other)?;
     }
     crate::ech::apply_ech_offer(&mut ssl, ech)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        .map_err(io::Error::other)?;
     // Always wrap with FragmentTcpStream.  When fragment is None,
     // fragment_enabled is false and all writes pass through unchanged.
     #[cfg(unix)]
@@ -1078,12 +1074,12 @@ pub fn create_tls_stream(
     #[cfg(not(unix))]
     let frag_stream = FragmentTcpStream::new_no_ack(tcp, fragment.cloned());
     let mut stream = SslStream::new(ssl, frag_stream)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        .map_err(io::Error::other)?;
     stream
         .connect()
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        .map_err(io::Error::other)?;
     crate::ech::verify_ech_outcome(stream.ssl(), ech)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        .map_err(io::Error::other)?;
     Ok(stream)
 }
 
@@ -1107,7 +1103,7 @@ pub async fn create_tls_stream_async(
     use crate::obfuscation::fragment::AsyncFragmentStream;
     use boring::ssl::SslConnector;
     let mut builder = SslConnector::builder(SslMethod::tls())
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        .map_err(io::Error::other)?;
     if fp {
         apply_fingerprint_to_ctx(&mut builder);
     }
@@ -1125,15 +1121,15 @@ pub async fn create_tls_stream_async(
     let connector = builder.build();
     let mut config = connector
         .configure()
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        .map_err(io::Error::other)?;
     crate::ech::apply_ech_offer(&mut config, ech)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        .map_err(io::Error::other)?;
     let frag_stream = AsyncFragmentStream::new(tcp, fragment);
     let tls = tokio_boring::connect(config, sni, frag_stream)
         .await
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        .map_err(io::Error::other)?;
     crate::ech::verify_ech_outcome(tls.ssl(), ech)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        .map_err(io::Error::other)?;
     Ok(tls)
 }
 
@@ -1413,7 +1409,7 @@ async fn resolve_bypass_via(
             })
         })
         .await
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
+        .map_err(io::Error::other)?
     };
     match last_err {
         Ok(addrs) => addrs
@@ -1425,8 +1421,7 @@ async fn resolve_bypass_via(
                     format!("no non-fake-ip addresses for {host}"),
                 )
             }),
-        Err(e) => Err(io::Error::new(
-            io::ErrorKind::Other,
+        Err(e) => Err(io::Error::other(
             format!("system resolve {host}: {e}"),
         )),
     }

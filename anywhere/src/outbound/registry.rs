@@ -157,12 +157,12 @@ impl OutboundRegistry {
         for cfg in config.outbounds.iter().filter(|o| o.type_ == "ssh") {
             match SshOutboundClient::from_config(cfg).await {
                 Ok(client) => {
-                    clients.insert(Self::tag(&cfg)?.to_string(), Arc::new(client));
+                    clients.insert(Self::tag(cfg)?.to_string(), Arc::new(client));
                 },
                 Err(e) => {
                     log::error!(
                         "failed to init ssh outbound '{}': {e}",
-                        Self::tag(&cfg).unwrap_or("?"),
+                        Self::tag(cfg).unwrap_or("?"),
                     );
                 },
             }
@@ -175,7 +175,7 @@ impl OutboundRegistry {
         for cfg in config.outbounds.iter().filter(|o| o.type_ == "mless") {
             match MlessOutboundClient::from_config(vec![cfg]).await {
                 Ok(client) => {
-                    let tag = Self::tag(&cfg)?.to_string();
+                    let tag = Self::tag(cfg)?.to_string();
                     let client = Arc::new(client);
                     test_loop_handles.push(MlessOutboundClient::spawn_pool_keepalive(
                         Arc::clone(&client),
@@ -185,7 +185,7 @@ impl OutboundRegistry {
                 Err(e) => {
                     log::error!(
                         "failed to init mless outbound '{}': {e}",
-                        Self::tag(&cfg).unwrap_or("?"),
+                        Self::tag(cfg).unwrap_or("?"),
                     );
                 },
             }
@@ -194,12 +194,12 @@ impl OutboundRegistry {
         for cfg in config.outbounds.iter().filter(|o| o.type_ == "shadowsocks") {
             match ShadowsocksOutboundClient::from_config(cfg).await {
                 Ok(client) => {
-                    clients.insert(Self::tag(&cfg)?.to_string(), Arc::new(client));
+                    clients.insert(Self::tag(cfg)?.to_string(), Arc::new(client));
                 },
                 Err(e) => {
                     log::error!(
                         "failed to init shadowsocks outbound '{}': {e}",
-                        Self::tag(&cfg).unwrap_or("?"),
+                        Self::tag(cfg).unwrap_or("?"),
                     );
                 },
             }
@@ -251,9 +251,10 @@ impl OutboundRegistry {
             let mode = if cfg.type_ == "select" {
                 urltest::SelectMode::Select
             } else {
+                use std::str::FromStr;
                 cfg.mode
                     .as_deref()
-                    .map(urltest::SelectMode::from_str)
+                    .map(|s| urltest::SelectMode::from_str(s).unwrap_or_default())
                     .unwrap_or_default()
             };
 

@@ -34,12 +34,11 @@ pub const ECH_BOOTSTRAP_DOH_UPSTREAMS: &[&str] = &[
 /// list carries no plain IP resolver, append the default bootstrap so DoH
 /// hostnames can be resolved and DoH failures have a UDP fallback.
 pub fn with_plain_bootstrap(mut upstreams: Vec<Upstream>) -> Vec<Upstream> {
-    if !upstreams.iter().any(|u| matches!(u, Upstream::Plain(_))) {
-        if let Ok(u) = crate::dns::upstream::parse_upstream(BOOTSTRAP_PLAIN_UPSTREAM)
+    if !upstreams.iter().any(|u| matches!(u, Upstream::Plain(_)))
+        && let Ok(u) = crate::dns::upstream::parse_upstream(BOOTSTRAP_PLAIN_UPSTREAM)
         {
             upstreams.push(u);
         }
-    }
     upstreams
 }
 
@@ -83,21 +82,19 @@ pub async fn resolve_echconfig(host: &str, dns_direct: &[String]) -> Option<Vec<
     for up in &candidates {
         match up {
             Upstream::Doh { .. } => {
-                if let Some(resp) = client.resolve(&query, up).await {
-                    if let Some(config) = parse_https_echconfig(&resp) {
+                if let Some(resp) = client.resolve(&query, up).await
+                    && let Some(config) = parse_https_echconfig(&resp) {
                         return Some(config);
                     }
-                }
             },
             Upstream::Plain(_) => {
                 // Plaintext fallback: the type-65 query is visible to the
                 // resolver path, but it reveals only that `host` was resolved
                 // — which the A query for the same connection reveals anyway.
-                if let Some(resp) = udp_dns_query(&query, up).await {
-                    if let Some(config) = parse_https_echconfig(&resp) {
+                if let Some(resp) = udp_dns_query(&query, up).await
+                    && let Some(config) = parse_https_echconfig(&resp) {
                         return Some(config);
                     }
-                }
             },
         }
     }
@@ -111,7 +108,7 @@ fn destination_socket_addr(dest: &crate::inbound::Destination) -> Option<std::ne
         Address::Ipv6(o) => std::net::IpAddr::V6(std::net::Ipv6Addr::from(*o)),
         Address::Domain(_) => return None,
     };
-    Some(std::net::SocketAddr::new(ip, dest.port as u16))
+    Some(std::net::SocketAddr::new(ip, dest.port))
 }
 
 /// One plain-UDP DNS exchange with a short timeout.
@@ -127,7 +124,7 @@ async fn udp_dns_query(query: &[u8], up: &Upstream) -> Option<Vec<u8>> {
                 crate::inbound::Address::Domain(d) => d.clone(),
                 _ => return None,
             };
-            tokio::net::lookup_host((host.as_str(), dest.port as u16))
+            tokio::net::lookup_host((host.as_str(), dest.port))
                 .await
                 .ok()?
                 .next()?
@@ -182,11 +179,10 @@ pub fn parse_https_echconfig(resp: &[u8]) -> Option<Vec<u8>> {
         if rdata_end > resp.len() {
             return None;
         }
-        if rtype == 65 {
-            if let Some(config) = https_rdata_ech_config(&resp[rdata_start..rdata_end]) {
+        if rtype == 65
+            && let Some(config) = https_rdata_ech_config(&resp[rdata_start..rdata_end]) {
                 return Some(config);
             }
-        }
         pos = rdata_end;
     }
     None
@@ -235,7 +231,7 @@ fn skip_dns_name(buf: &[u8], mut pos: usize) -> Option<usize> {
                     return None; // pointer loop guard
                 }
                 let target =
-                    (((len & 0x3F) as usize) << 8) | buf[cursor + 1] as usize;
+                    ((len & 0x3F) << 8) | buf[cursor + 1] as usize;
                 if target >= cursor {
                     return None; // pointers must point strictly backward
                 }

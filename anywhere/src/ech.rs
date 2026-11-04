@@ -83,15 +83,14 @@ pub fn promote_cloudflare_config(fresh: &[u8]) {
     if fresh.is_empty() {
         return;
     }
-    if let Ok(mut guard) = PROMOTED_CLOUDFLARE_ECH_CONFIG.write() {
-        if guard.as_deref() != Some(fresh) {
+    if let Ok(mut guard) = PROMOTED_CLOUDFLARE_ECH_CONFIG.write()
+        && guard.as_deref() != Some(fresh) {
             log::info!(
                 "ECH: promoted fresh Cloudflare config ({} bytes)",
                 fresh.len()
             );
             *guard = Some(fresh.to_vec());
         }
-    }
 }
 
 // ---------------------------------------------------------------------------

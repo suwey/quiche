@@ -469,7 +469,7 @@ where
     };
 
     let key_bytes: [u8; 16] = rand_bytes();
-    let key = base64::engine::general_purpose::STANDARD.encode(&key_bytes);
+    let key = base64::engine::general_purpose::STANDARD.encode(key_bytes);
 
     let request = format!(
         "GET {path} HTTP/1.1\r\n\
@@ -503,18 +503,15 @@ where
         if line.is_empty() {
             break;
         }
-        if let Some(val) = crate::transport::ws::header_value(&line, "upgrade") {
-            if val.eq_ignore_ascii_case("websocket") {
+        if let Some(val) = crate::transport::ws::header_value(&line, "upgrade")
+            && val.eq_ignore_ascii_case("websocket") {
                 got_upgrade = true;
             }
-        }
         if let Some(val) =
             crate::transport::ws::header_value(&line, "sec-websocket-accept")
-        {
-            if val == crate::transport::ws::compute_accept(&key) {
+            && val == crate::transport::ws::compute_accept(&key) {
                 got_accept = true;
             }
-        }
         if crate::transport::ws::header_value(&line, "sec-websocket-extensions")
             .is_some()
         {
@@ -633,7 +630,7 @@ fn poll_fill_raw<T: tokio::io::AsyncRead + Unpin>(
             raw.extend_from_slice(rb.filled());
             Poll::Ready(Ok(n))
         },
-        Poll::Ready(Err(e)) => Poll::Ready(Err(e.into())),
+        Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
         Poll::Pending => Poll::Pending,
     }
 }
@@ -874,22 +871,22 @@ impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send>
             Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
             Poll::Pending => return Poll::Pending,
         }
-        loop {
-            if this.pending.is_empty() {
-                match this.poll_decode(cx) {
-                    Poll::Ready(Ok(())) => {},
-                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                    Poll::Pending => return Poll::Pending,
-                }
-                if this.pending.is_empty() {
-                    return Poll::Pending;
-                }
+        // The loop below never iterates: every branch of the body returns.
+        // Kept as a plain block (clippy::never_loop).
+        if this.pending.is_empty() {
+            match this.poll_decode(cx) {
+                Poll::Ready(Ok(())) => {},
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
             }
-            let n = buf.len().min(this.pending.len());
-            buf[..n].copy_from_slice(&this.pending[..n]);
-            this.pending.drain(..n);
-            return Poll::Ready(Ok(n));
+            if this.pending.is_empty() {
+                return Poll::Pending;
+            }
         }
+        let n = buf.len().min(this.pending.len());
+        buf[..n].copy_from_slice(&this.pending[..n]);
+        this.pending.drain(..n);
+        Poll::Ready(Ok(n))
     }
 }
 
@@ -911,22 +908,22 @@ impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send>
             // Empty binary messages carry no yamux data; never frame them.
             return Poll::Ready(Ok(0));
         }
-        loop {
-            if this.out.is_none() {
-                this.out =
-                    Some(crate::transport::ws::encode_frame(WS_OP_BINARY, buf));
+        // The loop below never iterates: both write outcomes return.
+        // Kept as a plain block (clippy::never_loop).
+        if this.out.is_none() {
+            this.out =
+                Some(crate::transport::ws::encode_frame(WS_OP_BINARY, buf));
+            this.out_pos = 0;
+        }
+        let out = this.out.as_ref().expect("frame buffered");
+        match poll_write_all_from(&mut this.inner, cx, out, &mut this.out_pos)? {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(()) => {
+                let n = buf.len();
+                this.out = None;
                 this.out_pos = 0;
-            }
-            let out = this.out.as_ref().expect("frame buffered");
-            match poll_write_all_from(&mut this.inner, cx, out, &mut this.out_pos)? {
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(()) => {
-                    let n = buf.len();
-                    this.out = None;
-                    this.out_pos = 0;
-                    return Poll::Ready(Ok(n));
-                },
-            }
+                Poll::Ready(Ok(n))
+            },
         }
     }
 
@@ -951,7 +948,7 @@ impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send>
                 },
                 Poll::Ready(Err(e)) => {
                     this.closed = true;
-                    return Poll::Ready(Err(e.into()));
+                    return Poll::Ready(Err(e));
                 },
                 Poll::Pending => return Poll::Pending,
             }
@@ -975,7 +972,7 @@ fn poll_write_all_from<T: tokio::io::AsyncWrite + Unpin>(
                 )));
             },
             Poll::Ready(Ok(n)) => *pos += n,
-            Poll::Ready(Err(e)) => return Poll::Ready(Err(e.into())),
+            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
             Poll::Pending => return Poll::Pending,
         }
     }
@@ -1352,26 +1349,25 @@ async fn tls_no_sni(
     use boring::x509::verify::X509CheckFlags;
     let mut builder =
         boring::ssl::SslContextBuilder::new(boring::ssl::SslMethod::tls())
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            .map_err(std::io::Error::other)?;
     builder
         .set_default_verify_paths()
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        .map_err(std::io::Error::other)?;
     let ctx = builder.build();
     let mut ssl = boring::ssl::Ssl::new(&ctx)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        .map_err(std::io::Error::other)?;
     {
         let param = ssl.param_mut();
         param.set_hostflags(X509CheckFlags::NO_PARTIAL_WILDCARDS);
         param
             .set_host(verify_host)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            .map_err(std::io::Error::other)?;
     }
     tokio_boring::SslStreamBuilder::new(ssl, tcp)
         .connect()
         .await
         .map_err(|e| {
-            std::io::Error::new(
-                std::io::ErrorKind::Other,
+            std::io::Error::other(
                 format!("no-SNI handshake failed: {e}"),
             )
         })
@@ -1784,12 +1780,12 @@ async fn tls_connector_connect(
         std::sync::Arc::new(provider),
     )
     .with_safe_default_protocol_versions()
-    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("TLS config: {e}")))?
+    .map_err(|e| std::io::Error::other(format!("TLS config: {e}")))?
     .with_root_certificates(roots)
     .with_no_client_auth();
     let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(config));
     let server_name = ServerName::try_from(host.to_string())
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("invalid server name '{host}': {e}")))?;
+        .map_err(|e| std::io::Error::other(format!("invalid server name '{host}': {e}")))?;
     connector.connect(server_name, tcp).await
 }
 

@@ -15,6 +15,7 @@ pub mod urltest;
 pub mod mless;
 pub mod shadowsocks;
 pub mod vless;
+#[allow(clippy::double_must_use)] // async_trait expands to a must_use impl over an already-must_use Result
 #[async_trait]
 pub trait OutboundClient: Send + Sync {
     /// TCP-style dial. Returns a byte-stream relay.

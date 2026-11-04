@@ -105,6 +105,7 @@ pub enum UplinkDataPlacement {
 
 /// Uplink data control: method, placement, chunk size.
 #[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Default)]
 pub struct UplinkDataConfig {
     /// HTTP method for uplink (default: POST).
     #[serde(default)]
@@ -120,16 +121,6 @@ pub struct UplinkDataConfig {
     pub chunk_size: Option<Range>,
 }
 
-impl Default for UplinkDataConfig {
-    fn default() -> Self {
-        Self {
-            method: HttpMethod::default(),
-            data_placement: UplinkDataPlacement::default(),
-            data_key: String::new(),
-            chunk_size: None,
-        }
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Throttle config (stream-up / packet-up)

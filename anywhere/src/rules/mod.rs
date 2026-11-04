@@ -550,27 +550,26 @@ impl Rules {
 
         match mode {
             MODE_DIRECT => {
-                return Some(RuleMatch {
+                Some(RuleMatch {
                     outbound_tag: "direct".into(),
                     description: "direct mode => route(direct)".into(),
-                });
+                })
             },
             MODE_GLOBAL => {
                 // Only match builtin rules (e.g. private CIDRs).
                 for rule in &self.rules {
-                    if rule.type_ == TYPE_BUILTIN {
-                        if Self::matches(dest, network, rule, sniff_info) {
+                    if rule.type_ == TYPE_BUILTIN
+                        && Self::matches(dest, network, rule, sniff_info) {
                             return Some(Self::rule_match(
                                 rule.outbound_tag.clone(),
                                 rule,
                             ));
                         }
-                    }
                 }
-                return Some(RuleMatch {
+                Some(RuleMatch {
                     outbound_tag: "GLOBAL".into(),
                     description: "global mode => route(GLOBAL)".into(),
-                });
+                })
             },
             _ => {
                 // MODE_RULE: match all rules
@@ -604,30 +603,26 @@ impl Rules {
         dest: &Destination, network: Network, rule: &Rule,
         sniff_info: Option<&SniffInfo>,
     ) -> bool {
-        if let Some(rule_net) = rule.network {
-            if rule_net != network {
+        if let Some(rule_net) = rule.network
+            && rule_net != network {
                 return false;
             }
-        }
 
-        if let Some(rule_port) = rule.port {
-            if rule_port != dest.port {
+        if let Some(rule_port) = rule.port
+            && rule_port != dest.port {
                 return false;
             }
-        }
 
-        if let Some((min, max)) = rule.port_range {
-            if dest.port < min || dest.port > max {
+        if let Some((min, max)) = rule.port_range
+            && (dest.port < min || dest.port > max) {
                 return false;
             }
-        }
 
         // Protocol matching (port-based OR sniff-based)
-        if let Some(ref proto_matches) = rule.protocol {
-            if !protocol_matches(proto_matches, network, dest.port, sniff_info) {
+        if let Some(ref proto_matches) = rule.protocol
+            && !protocol_matches(proto_matches, network, dest.port, sniff_info) {
                 return false;
             }
-        }
 
         // If this is a geo rule, delegate to GeoMatcher
         if let Some(ref geo) = rule.geo_matcher {
@@ -649,36 +644,31 @@ impl Rules {
     fn host_matches(address: &Address, rule: &Rule) -> bool {
         match address {
             Address::Domain(host) => {
-                if let Some(ref domains) = rule.domain {
-                    if domains.iter().any(|d| host == d) {
+                if let Some(ref domains) = rule.domain
+                    && domains.iter().any(|d| host == d) {
                         return true;
                     }
-                }
-                if let Some(ref suffixes) = rule.domain_suffix {
-                    if suffixes.iter().any(|s| {
+                if let Some(ref suffixes) = rule.domain_suffix
+                    && suffixes.iter().any(|s| {
                         let sfx = s.strip_prefix('.').unwrap_or(s);
                         host == sfx || host.ends_with(&format!(".{sfx}"))
                     }) {
                         return true;
                     }
-                }
-                if let Some(ref keywords) = rule.domain_keyword {
-                    if keywords.iter().any(|k| host.contains(k.as_str())) {
+                if let Some(ref keywords) = rule.domain_keyword
+                    && keywords.iter().any(|k| host.contains(k.as_str())) {
                         return true;
                     }
-                }
                 // If the domain string looks like an IP address, also check
                 // ip_cidr rules (handles SOCKS5 clients that send IP literals
                 // as ATYP 0x03 domain).
-                if let Some(ref cidrs) = rule.ip_cidr {
-                    if let Ok(ip) = host.parse::<IpAddr>() {
-                        if cidrs.iter().any(|cidr| {
+                if let Some(ref cidrs) = rule.ip_cidr
+                    && let Ok(ip) = host.parse::<IpAddr>()
+                        && cidrs.iter().any(|cidr| {
                             Self::cidr_matches(ip, cidr).unwrap_or(false)
                         }) {
                             return true;
                         }
-                    }
-                }
                 false
             },
             Address::Ipv4(o) => {

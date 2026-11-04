@@ -124,6 +124,7 @@ impl TunWriter {
     }
 }
 
+#[allow(clippy::too_many_arguments)] // relay plumbing; grouping would obscure the call sites
 /// Run the TUN I/O handler loop.
 ///
 /// Reads packets from the TUN device, applies NAT/un-NAT for TCP,
@@ -284,22 +285,22 @@ async fn handle_tcp_packet(
         let f = buf[meta.l4_offset + 13];
         let mut s = String::new();
         if f & 0x01 != 0 {
-            s.push_str("F");
+            s.push('F');
         }
         if f & 0x02 != 0 {
-            s.push_str("S");
+            s.push('S');
         }
         if f & 0x04 != 0 {
-            s.push_str("R");
+            s.push('R');
         }
         if f & 0x08 != 0 {
-            s.push_str("P");
+            s.push('P');
         }
         if f & 0x10 != 0 {
-            s.push_str("A");
+            s.push('A');
         }
         if s.is_empty() {
-            s.push_str("-");
+            s.push('-');
         }
         s
     } else {
@@ -507,6 +508,7 @@ fn is_non_routable(ip: IpAddr) -> bool {
     }
 }
 
+#[allow(clippy::too_many_arguments)] // relay plumbing; grouping would obscure the call sites
 /// Handle a UDP packet: dispatch via session table, or create a new
 /// relay session.
 ///
@@ -586,15 +588,14 @@ async fn handle_udp_packet(
                         meta.dst_ip,
                     )
                 } else {
-                    if let Some(hj) = dns_hijack {
-                        if hj.fakeip_contains(v4) {
+                    if let Some(hj) = dns_hijack
+                        && hj.fakeip_contains(v4) {
                             log::warn!(
                                 "TUN fake-ip missing reverse mapping: {}:{}",
                                 v4,
                                 meta.dst_port,
                             );
                         }
-                    }
                     Destination::new(ip_to_address(meta.dst_ip), meta.dst_port)
                 }
             },

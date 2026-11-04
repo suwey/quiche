@@ -319,7 +319,7 @@ export async function 处理叉HTTP请求(request: Request, yourUUID: string): P
 
 	try { reader.releaseLock(); } catch { /* ignore */ }
 
-	const remoteConnWrapper: RemoteConnWrapper = { socket: null, connectingPromise: null, retryConnect: null, socketWritePromise: null };
+	const remoteConnWrapper: RemoteConnWrapper = { socket: null, connectingPromise: null, retryConnect: null, socketWritePromise: null, writer: null };
 	const abortController = new AbortController();
 	let 已清理 = false;
 	const 清理 = (reason?: unknown): void => {

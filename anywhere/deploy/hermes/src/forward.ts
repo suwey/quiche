@@ -24,6 +24,10 @@ export interface RemoteConnWrapper {
 	connectingPromise: Promise<void> | null;
 	retryConnect: (() => Promise<void>) | null;
 	socketWritePromise: Promise<void> | null;
+	// 远端 socket 的共享 writer：socket 就绪时获取一次，流生命周期内复用。
+	// WritableStream 会按调用顺序排队并发 write，无需每帧 getWriter/releaseLock
+	// （独占锁获取是 DO 热路径上最贵的操作之一）。
+	writer: WritableStreamDefaultWriter | null;
 }
 
 export function 创建请求TCP连接器(request?: Request): TCPConnector {

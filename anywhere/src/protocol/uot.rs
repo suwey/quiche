@@ -268,8 +268,7 @@ impl<S: StreamRelay> PacketRelay for UotPacketRelay<S> {
             {
                 let data = &self.read_buf[data_range];
                 if buf.len() < data.len() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::Other,
+                    return Err(io::Error::other(
                         "uot read buffer too small",
                     ));
                 }

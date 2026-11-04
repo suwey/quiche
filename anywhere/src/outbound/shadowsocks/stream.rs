@@ -120,7 +120,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> SsTcpStream<S> {
         // 2. Timestamp + padding length + early-data bounds.
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
+            .map_err(io::Error::other)?
             .as_secs();
         let padding_len: usize = if payload.len() < MAX_PADDING_LENGTH {
             let mut rb = [0u8; 2];
@@ -249,7 +249,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> SsTcpStream<S> {
         let epoch = u64::from_be_bytes(hdr[1..9].try_into().unwrap());
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
+            .map_err(io::Error::other)?
             .as_secs() as i64;
         let diff = (now - epoch as i64).abs();
         if diff > TIMESTAMP_TOLERANCE_SECS {
@@ -346,12 +346,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> StreamRelay for SsTcpStream<S> {
             buf.len(),
             self.read_handshaked
         );
-        if !self.read_handshaked {
-            if let Err(e) = self.do_handshake_read().await {
+        if !self.read_handshaked
+            && let Err(e) = self.do_handshake_read().await {
                 log::error!("ss: handshake read failed: {e}");
                 return Err(e);
             }
-        }
 
         // Serve any leftover payload from the previous chunk first.
         if self.read_buf_pos < self.read_buf.len() {

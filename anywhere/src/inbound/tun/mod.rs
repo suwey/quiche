@@ -69,6 +69,14 @@ use crate::inbound::tun::nat::TCPNat;
 use crate::inbound::tun::reverse_dns::ReverseDnsCache;
 use crate::relay::StreamRelay;
 
+/// Builder handed to [`TunInbound::new`] that wires the DNS hijack loop once
+/// the TUN writer and reverse cache exist.
+type DnsHijackBuilder = Box<
+    dyn FnOnce(handler::TunWriter, Arc<ReverseDnsCache>, CancellationToken)
+        -> DnsHijack
+    + Send,
+>;
+
 #[cfg(target_os = "android")]
 use std::os::fd::RawFd;
 
@@ -383,16 +391,7 @@ impl TunInbound {
     #[allow(unused_variables)]
     pub async fn new(
         config: &TunConfig,
-        dns_hijack_builder: Option<
-            Box<
-                dyn FnOnce(
-                        handler::TunWriter,
-                        Arc<ReverseDnsCache>,
-                        CancellationToken,
-                    ) -> DnsHijack
-                    + Send,
-            >,
-        >,
+        dns_hijack_builder: Option<DnsHijackBuilder>,
         #[cfg(target_os = "android")] tun_fd: Option<RawFd>,
     ) -> Result<(Self, TunGuard, TunLifecycle), Box<dyn std::error::Error>> {
         let addr = config.addr;
@@ -600,20 +599,18 @@ impl TunInbound {
                 log::warn!("Failed to setup TUN interface: {e}");
             }
 
-            if config.auto_route {
-                if let Err(e) =
+            if config.auto_route
+                && let Err(e) =
                     mgr.setup_routing(config.auto_hijack, &config.bypass_ips)
                 {
                     log::warn!("Failed to set up routing: {e}");
                 }
-            }
 
             // Start DNS loopback listener when auto_hijack is enabled.
-            if config.auto_hijack {
-                if let Some(ref hijack) = dns_hijack {
+            if config.auto_hijack
+                && let Some(ref hijack) = dns_hijack {
                     tun_handles.extend(hijack.start_hijack_listener());
                 }
-            }
 
             let mgr = Arc::new(std::sync::Mutex::new(mgr));
             if config.auto_route {
@@ -756,6 +753,7 @@ impl TunInbound {
     }
 }
 
+#[allow(clippy::too_many_arguments)] // relay plumbing; grouping would obscure the call sites
 /// Accept TCP connections from the NAT listener and forward them as
 /// InboundConns.
 async fn accept_loop(
@@ -1083,13 +1081,12 @@ fn find_utun_by_addr(addr: std::net::IpAddr) -> Option<String> {
             if let Some(name) = trimmed.strip_suffix(':') {
                 current_iface = Some(name.to_string());
             }
-        } else if let Some(ref iface) = current_iface {
-            if (trimmed.starts_with("inet ") || trimmed.starts_with("inet6 "))
+        } else if let Some(ref iface) = current_iface
+            && (trimmed.starts_with("inet ") || trimmed.starts_with("inet6 "))
                 && trimmed.contains(&addr_str)
             {
                 return Some(iface.clone());
             }
-        }
     }
     None
 }

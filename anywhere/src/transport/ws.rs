@@ -188,7 +188,7 @@ impl<T: Read + Write> WsConn<T> {
         let mut rng = LcgGen::new();
         let mut key_bytes = [0u8; 16];
         rng.next_bytes(&mut key_bytes);
-        let key = base64::engine::general_purpose::STANDARD.encode(&key_bytes);
+        let key = base64::engine::general_purpose::STANDARD.encode(key_bytes);
 
         // Build request
         let mut request = String::new();
@@ -232,11 +232,10 @@ impl<T: Read + Write> WsConn<T> {
             }
             all_headers.push_str(&line);
             all_headers.push(';');
-            if let Some(val) = header_value(&line, "upgrade") {
-                if val.eq_ignore_ascii_case("websocket") {
+            if let Some(val) = header_value(&line, "upgrade")
+                && val.eq_ignore_ascii_case("websocket") {
                     got_upgrade = true;
                 }
-            }
             if let Some(val) = header_value(&line, "sec-websocket-accept") {
                 let expected = compute_accept(&key);
                 if val == expected {
@@ -457,7 +456,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> WsConnAsync<T> {
         let mut rng = LcgGen::new();
         let mut key_bytes = [0u8; 16];
         rng.next_bytes(&mut key_bytes);
-        let key = base64::engine::general_purpose::STANDARD.encode(&key_bytes);
+        let key = base64::engine::general_purpose::STANDARD.encode(key_bytes);
 
         // Build request
         let mut request = String::new();
@@ -501,11 +500,10 @@ impl<T: AsyncRead + AsyncWrite + Unpin> WsConnAsync<T> {
             }
             all_headers.push_str(&line);
             all_headers.push(';');
-            if let Some(val) = header_value(&line, "upgrade") {
-                if val.eq_ignore_ascii_case("websocket") {
+            if let Some(val) = header_value(&line, "upgrade")
+                && val.eq_ignore_ascii_case("websocket") {
                     got_upgrade = true;
                 }
-            }
             if let Some(val) = header_value(&line, "sec-websocket-accept") {
                 let expected = compute_accept(&key);
                 if val == expected {
@@ -1353,7 +1351,7 @@ impl TransportSession for WsTransportSession {
 
     async fn downlink(&mut self) -> io::Result<Box<dyn DownlinkReader>> {
         let rx = self.downlink_rx.take().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::Other, "downlink already taken")
+            io::Error::other("downlink already taken")
         })?;
         Ok(Box::new(WsDownlinkReader {
             rx,
@@ -1399,7 +1397,7 @@ impl TransportFactory for WsTransportFactory {
     > {
         let addr_str = format!("{}:{}", ctx.server, ctx.port);
         let addr = crate::outbound::common::resolve_addr(&addr_str)
-            .map_err(|e| TransportError::Connect(e))?;
+            .map_err(TransportError::Connect)?;
         let tcp = crate::outbound::common::connect_tcp_bypass(addr)
             .await
             .map_err(|e| TransportError::Connect(e.to_string()))?;

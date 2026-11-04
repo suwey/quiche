@@ -251,8 +251,7 @@ impl SsUser {
                 }
                 block == psk_identity_hash(&self.psks[i + 1])
             })
-        {
-            if let Ok(body) = aead.open(&hdr[4..16], &packet[16 + eih_len..]) {
+            && let Ok(body) = aead.open(&hdr[4..16], &packet[16 + eih_len..]) {
                 return Some((
                     session_psk.clone(),
                     u64::from_be_bytes(hdr[0..8].try_into().ok()?),
@@ -260,7 +259,6 @@ impl SsUser {
                     body,
                 ));
             }
-        }
         None
     }
 }

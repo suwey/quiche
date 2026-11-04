@@ -193,6 +193,7 @@ impl InboundConn {
     }
 }
 
+#[allow(clippy::double_must_use)] // async_trait expands to a must_use impl over an already-must_use Result
 #[async_trait]
 pub trait Inbound: Send {
     /// Accept a new connection. Returns None when shut down.

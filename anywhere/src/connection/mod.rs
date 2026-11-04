@@ -10,6 +10,7 @@ use async_trait::async_trait;
 use crate::transport::TransportSession;
 
 /// 连接管理器接口
+#[allow(clippy::double_must_use)] // async_trait expands to a must_use impl over an already-must_use Result
 #[async_trait]
 pub trait ConnectionManager: Send + Sync {
     /// 获取一条可用的传输会话（上行）

@@ -436,7 +436,7 @@ pub fn endpoint_is_loopback(endpoint: &str) -> bool {
         return false;
     };
     match parsed.host() {
-        Some(url::Host::Domain(domain)) => host_is_loopback(&domain),
+        Some(url::Host::Domain(domain)) => host_is_loopback(domain),
         Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
         Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
         None => false,

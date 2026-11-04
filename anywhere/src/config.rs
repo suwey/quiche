@@ -447,12 +447,12 @@ impl Config {
 
         // Resolve relative cert/key paths relative to the config file directory.
         for inbound in &mut config.inbounds {
-            resolve_path(&base_dir, &mut inbound.cert);
-            resolve_path(&base_dir, &mut inbound.key);
+            resolve_path(base_dir, &mut inbound.cert);
+            resolve_path(base_dir, &mut inbound.key);
         }
 
         // Resolve relative serve_path relative to the config file directory.
-        resolve_path(&base_dir, &mut config.ui.serve_path);
+        resolve_path(base_dir, &mut config.ui.serve_path);
 
         Ok(config)
     }

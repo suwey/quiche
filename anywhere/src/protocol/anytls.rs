@@ -223,7 +223,7 @@ impl LcgGen {
         )
     }
 
-    pub fn next(&mut self) -> u64 {
+    pub fn next_u64(&mut self) -> u64 {
         self.0 = self
             .0
             .wrapping_mul(6364136223846793005)
@@ -232,14 +232,20 @@ impl LcgGen {
     }
 
     pub fn range(&mut self, min: i64, max: i64) -> i64 {
-        min + (self.next() % (max - min + 1) as u64) as i64
+        min + (self.next_u64() % (max - min + 1) as u64) as i64
     }
 
     /// Fill `buf` with pseudo-random bytes.
     pub fn fill_bytes(&mut self, buf: &mut [u8]) {
         for b in buf.iter_mut() {
-            *b = self.next() as u8;
+            *b = self.next_u64() as u8;
         }
+    }
+}
+
+impl Default for LcgGen {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -402,7 +408,7 @@ pub fn build_server_settings_body() -> String {
 /// SHA-256 hash of `data`, returned as a 32-byte array.
 pub fn sha256(data: &[u8]) -> io::Result<[u8; 32]> {
     let digest = hash(MessageDigest::sha256(), data)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        .map_err(io::Error::other)?;
     let mut out = [0u8; 32];
     out.copy_from_slice(digest.as_ref());
     Ok(out)

@@ -222,8 +222,8 @@ async fn patch_configs_handler(
 ) -> impl IntoResponse {
     let mut handled = false;
 
-    if let Some(tun) = payload.tun {
-        if let Some(enable) = tun.enable {
+    if let Some(tun) = payload.tun
+        && let Some(enable) = tun.enable {
             handled = true;
             let result = if enable {
                 ::log::info!("Enabling TUN routing via API");
@@ -237,17 +237,15 @@ async fn patch_configs_handler(
                 return (StatusCode::INTERNAL_SERVER_ERROR, ());
             }
         }
-    }
 
-    if let Some(mode) = payload.mode {
-        if let Some(idx) = MODE_LIST.iter().position(|m| *m == mode) {
+    if let Some(mode) = payload.mode
+        && let Some(idx) = MODE_LIST.iter().position(|m| *m == mode) {
             let idx = idx as u8;
             if state.ctx.set_mode(idx) {
                 ::log::info!("Switched mode to {}", mode_str(idx));
                 handled = true;
             }
         }
-    }
 
     if handled {
         (StatusCode::NO_CONTENT, ())
@@ -262,8 +260,9 @@ async fn patch_configs_handler(
 ///   - If `start_cmd` is set: spawns `<start_cmd> restart <service_name>` then exits.
 ///   - If `start_cmd` is None: re-executes itself via `execve` after a short
 ///     delay (lets the HTTP response flush to the client).
+///
 /// On Android: exits with code 0; the JNI layer (Kotlin) handles re-calling
-///   `startEngine` to reload the native engine.
+/// `startEngine` to reload the native engine.
 fn trigger_restart(state: &AppContext) -> StatusCode {
     #[cfg(not(target_os = "android"))]
     {
@@ -399,8 +398,8 @@ async fn put_configs_handler(
     }
 
     // If payload is provided, write it to the config file.
-    if let Some(ref payload) = body.payload {
-        if !payload.is_empty() {
+    if let Some(ref payload) = body.payload
+        && !payload.is_empty() {
             let config_path = match &state.ctx.config_path {
                 Some(p) => p.clone(),
                 None => {
@@ -422,7 +421,6 @@ async fn put_configs_handler(
                 },
             }
         }
-    }
 
     // Trigger in-process reload with the (potentially updated) config file.
     let status = trigger_reload(&state.ctx);
@@ -512,13 +510,12 @@ async fn proxies_handler(
     for (tag, type_) in &state.ctx.outbound_tags {
         // `select` is an alias for `urltest mode=select`; both are in
         // urltest_states.
-        if type_ == "urltest" || type_ == "select" {
-            if let Some(ut_state) = state.ctx.urltest_states.get(tag.as_str()) {
+        if (type_ == "urltest" || type_ == "select")
+            && let Some(ut_state) = state.ctx.urltest_states.get(tag.as_str()) {
                 for child_tag in &ut_state.children {
                     urltest_child_tags.insert(child_tag.as_str());
                 }
             }
-        }
     }
 
     // Lookup map for outbound type by tag.
@@ -532,8 +529,8 @@ async fn proxies_handler(
     // Top-level entries: all group types (select, urltest, fallback)
     // are unified into urltest_states.
     for (tag, type_) in &state.ctx.outbound_tags {
-        if type_ == "urltest" || type_ == "select" {
-            if let Some(ut_state) = state.ctx.urltest_states.get(tag.as_str()) {
+        if (type_ == "urltest" || type_ == "select")
+            && let Some(ut_state) = state.ctx.urltest_states.get(tag.as_str()) {
                 let current_idx =
                     ut_state.current.load(std::sync::atomic::Ordering::Relaxed);
                 let now = ut_state
@@ -602,7 +599,6 @@ async fn proxies_handler(
 
                 proxies.insert(tag.clone(), obj);
             }
-        }
     }
 
     Json(serde_json::json!({ "proxies": proxies }))

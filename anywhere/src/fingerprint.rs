@@ -84,10 +84,9 @@ impl ConnectionHook for FingerprintHook {
             // not a client distinguisher (Chrome does the same).
             ssl.set_enable_ech_grease(true);
         }
-        if let Some(ref ech) = self.ech_config {
-            if let Err(e) = ssl.set_ech_config_list(ech) {
+        if let Some(ref ech) = self.ech_config
+            && let Err(e) = ssl.set_ech_config_list(ech) {
                 log::warn!("Failed to set ECH config list: {e:?}");
             }
-        }
     }
 }

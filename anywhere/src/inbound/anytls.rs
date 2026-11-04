@@ -215,8 +215,7 @@ impl PacketRelay for UotServerPacketRelay {
             {
                 let data = &self.read_buf[data_range];
                 if buf.len() < data.len() {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::Other,
+                    return Err(std::io::Error::other(
                         "uot read buffer too small",
                     ));
                 }
@@ -420,12 +419,11 @@ fn handle_connection_inner(
     // Verify password.
     let mut auth_ok = false;
     for pw in passwords.iter() {
-        if let Ok(pw_hash) = proto::sha256(pw.as_bytes()) {
-            if hash == pw_hash {
+        if let Ok(pw_hash) = proto::sha256(pw.as_bytes())
+            && hash == pw_hash {
                 auth_ok = true;
                 break;
             }
-        }
     }
     if !auth_ok {
         return Err(std::io::Error::new(
@@ -749,11 +747,10 @@ async fn handle_server_stream(
     };
 
     // Send SYNACK success if client v >= 2.
-    if client_version >= PROTOCOL_VERSION {
-        if let Ok(frame) = encode_frame(CMD_SYNACK, stream_id, &[]) {
+    if client_version >= PROTOCOL_VERSION
+        && let Ok(frame) = encode_frame(CMD_SYNACK, stream_id, &[]) {
             let _ = writer_tx.send(OutboundMsg::RawFrame(frame));
         }
-    }
 
     // Build a ServerStream relay that reads from data_rx and writes via
     // writer_tx. The guard keeps the map entry (data channel) alive until
@@ -826,26 +823,23 @@ pub(crate) fn build_ssl_context(
     cert_path: &str, key_path: &str,
 ) -> std::io::Result<boring::ssl::SslContext> {
     let mut builder = SslContextBuilder::new(SslMethod::tls())
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        .map_err(std::io::Error::other)?;
     builder
         .set_certificate_file(cert_path, SslFiletype::PEM)
         .map_err(|e| {
-            std::io::Error::new(
-                std::io::ErrorKind::Other,
+            std::io::Error::other(
                 format!("failed to load cert {cert_path}: {e}"),
             )
         })?;
     builder
         .set_private_key_file(key_path, SslFiletype::PEM)
         .map_err(|e| {
-            std::io::Error::new(
-                std::io::ErrorKind::Other,
+            std::io::Error::other(
                 format!("failed to load key {key_path}: {e}"),
             )
         })?;
     builder.check_private_key().map_err(|e| {
-        std::io::Error::new(
-            std::io::ErrorKind::Other,
+        std::io::Error::other(
             format!("private key check failed: {e}"),
         )
     })?;

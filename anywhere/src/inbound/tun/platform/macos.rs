@@ -116,7 +116,7 @@ impl MacosTunManager {
         run_route_cmd(&["-n", "add", "-net", "128.0.0.0/1", &tun_addr_str])?;
 
         // IPv6 split routes (if applicable).
-        if let IpAddr::V6(_) = self.tun_addr {
+        if self.tun_addr.is_ipv6() {
             run_route_cmd(&["-n", "add", "-net", "::/1", &tun_addr_str])?;
             run_route_cmd(&["-n", "add", "-net", "8000::/1", &tun_addr_str])?;
         }
@@ -371,8 +371,7 @@ impl MacosTunManager {
                     last_port = Some(rest.trim().to_string());
                 } else if line.strip_prefix("Device:").map(|s| s.trim())
                     == Some(iface)
-                {
-                    if let Some(port) = &last_port {
+                    && let Some(port) = &last_port {
                         // Verify this service has a real IPv4 address.
                         let info = run_networksetup_cmd(&["-getinfo", port]);
                         let has_ipv4 = info.lines().any(|l| {
@@ -383,7 +382,6 @@ impl MacosTunManager {
                             return Some(port.clone());
                         }
                     }
-                }
             }
         }
 
@@ -450,9 +448,7 @@ impl MacosTunManager {
         // scoped physical routes instead; route-to can black-hole after deep
         // idle when macOS reinitializes the physical interface.
         let nat_rule = "";
-        let filter_rules = format!(
-            "pass out quick on lo0 inet proto {{ tcp udp }} keep state\n",
-        );
+        let filter_rules = "pass out quick on lo0 inet proto { tcp udp } keep state\n".to_string();
 
         // Insert nat rule before filtering section, filter rules after load anchor.
         let mut combined = String::new();
@@ -461,21 +457,20 @@ impl MacosTunManager {
                 && !existing_pf.contains("anywhere_nat")
             {
                 combined.push_str("# anywhere nat rule (translation)\n");
-                combined.push_str(&nat_rule);
+                combined.push_str(nat_rule);
             }
             combined.push_str(line);
             combined.push('\n');
-            if line.starts_with("load anchor \"com.apple\"") {
-                if !existing_pf.contains("anywhere_bypass") {
+            if line.starts_with("load anchor \"com.apple\"")
+                && !existing_pf.contains("anywhere_bypass") {
                     combined.push_str("# anywhere bypass rules (filtering)\n");
                     combined.push_str(&filter_rules);
                 }
-            }
         }
 
         std::fs::write(
             "/tmp/anywhere_bypass.pf",
-            &format!("{nat_rule}{filter_rules}"),
+            format!("{nat_rule}{filter_rules}"),
         )
         .map_err(|e| format!("Failed to write bypass rules: {e}"))?;
 
@@ -614,7 +609,7 @@ impl MacosTunManager {
                 &tun_addr_str,
             ]);
 
-            if let IpAddr::V6(_) = self.tun_addr {
+            if self.tun_addr.is_ipv6() {
                 let _ = run_route_cmd(&[
                     "-n",
                     "delete",
@@ -742,7 +737,7 @@ impl MacosTunManager {
             return false;
         }
 
-        if let IpAddr::V6(_) = self.tun_addr {
+        if self.tun_addr.is_ipv6() {
             if replace_route(&["-net", "::/1", &tun_addr]).is_err() {
                 return false;
             }
@@ -1297,7 +1292,7 @@ fn run_route_cmd(args: &[&str]) -> Result<(), String> {
     let status = child.wait().map_err(|e| e.to_string())?;
     if !status.success() {
         // "route delete" may fail if route doesn't exist; log but don't error.
-        if args.iter().any(|&a| a == "delete") {
+        if args.contains(&"delete") {
             log::debug!("route delete (may be already gone)");
             return Ok(());
         }
@@ -1349,11 +1344,10 @@ fn get_en0_ipv4() -> Option<String> {
     let stdout = String::from_utf8_lossy(&output.stdout);
     for line in stdout.lines() {
         let line = line.trim();
-        if let Some(rest) = line.strip_prefix("inet ") {
-            if let Some(ip) = rest.split_whitespace().next() {
+        if let Some(rest) = line.strip_prefix("inet ")
+            && let Some(ip) = rest.split_whitespace().next() {
                 return Some(ip.to_string());
             }
-        }
     }
     None
 }

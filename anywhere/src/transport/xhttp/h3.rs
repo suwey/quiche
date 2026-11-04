@@ -298,11 +298,10 @@ impl UplinkWriter for H3UplinkWriter {
     }
 
     async fn shutdown(&mut self) -> io::Result<()> {
-        if let Some(sender) = self.body_sender.as_mut() {
-            if poll_fn(|cx| sender.poll_reserve(cx)).await.is_ok() {
+        if let Some(sender) = self.body_sender.as_mut()
+            && poll_fn(|cx| sender.poll_reserve(cx)).await.is_ok() {
                 let _ = sender.send_item(OutboundFrame::Body(Bytes::new(), true));
             }
-        }
         self.body_sender = None;
         Ok(())
     }
@@ -414,11 +413,10 @@ impl H3EventRouter {
             ClientH3Event::Core(H3Event::IncomingHeaders(hdrs)) => {
                 let request_id =
                     self.stream_map.lock().get(&hdrs.stream_id).copied();
-                if let Some(rid) = request_id {
-                    if let Some(tx) = self.subscribers.lock().get(&rid) {
+                if let Some(rid) = request_id
+                    && let Some(tx) = self.subscribers.lock().get(&rid) {
                         let _ = tx.send(event);
                     }
-                }
             },
             _ => {
                 // Other events (ConnectionError, ResetStream, etc.) are not

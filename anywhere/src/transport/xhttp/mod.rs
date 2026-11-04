@@ -451,11 +451,10 @@ impl TransportSession for XhttpSession {
                         io::Error::new(io::ErrorKind::ConnectionReset, e)
                     })?;
 
-                if let Some(pad) = &self.padding {
-                    if !pad.validate_response(response.headers()) {
+                if let Some(pad) = &self.padding
+                    && !pad.validate_response(response.headers()) {
                         log::warn!("xhttp: response XPadding validation failed");
                     }
-                }
 
                 // Extract a cloneable H2 send-request for downlink reconnection.
                 // H1 connections cannot be cloned; reconnect is H2-only.
@@ -655,13 +654,12 @@ impl StreamDownlinkReader {
             .await
             .map_err(|e| io::Error::new(io::ErrorKind::ConnectionReset, e))?;
 
-        if let Some(pad) = &reconnect.padding {
-            if !pad.validate_response(response.headers()) {
+        if let Some(pad) = &reconnect.padding
+            && !pad.validate_response(response.headers()) {
                 log::warn!(
                     "xhttp: response XPadding validation failed on reconnect"
                 );
             }
-        }
 
         log::debug!(
             "xhttp: downlink GET re-issued for session {}",
@@ -705,11 +703,10 @@ impl DownlinkReader for StreamDownlinkReader {
                         io::Error::new(io::ErrorKind::ConnectionReset, e)
                     })?;
                 log::debug!("xhttp: response status={}", response.status());
-                if let Some(pad) = &padding {
-                    if !pad.validate_response(response.headers()) {
+                if let Some(pad) = &padding
+                    && !pad.validate_response(response.headers()) {
                         log::warn!("xhttp: response XPadding validation failed");
                     }
-                }
                 Ok(response.into_body())
             }));
         }
@@ -735,8 +732,8 @@ impl DownlinkReader for StreamDownlinkReader {
 
             // Check stream_up_server_secs: force reconnect if the current
             // GET has been open longer than the configured server duration.
-            if let Some(reconnect) = &self.reconnect {
-                if reconnect.policy.should_reconnect() {
+            if let Some(reconnect) = &self.reconnect
+                && reconnect.policy.should_reconnect() {
                     log::debug!(
                         "xhttp: downlink GET exceeded stream_up_server_secs, reconnecting"
                     );
@@ -744,7 +741,6 @@ impl DownlinkReader for StreamDownlinkReader {
                     self.reissue_get().await?;
                     continue;
                 }
-            }
 
             match body.frame().await {
                 None => {
@@ -826,14 +822,13 @@ impl PacketUplinkWriter {
     /// remaining duration before sending.
     async fn send_packet(&mut self, seq: u64, data: Vec<u8>) -> io::Result<()> {
         // Throttle: enforce minimum interval between POSTs
-        if let Some(interval) = self.min_post_interval {
-            if let Some(last) = self.last_post_time {
+        if let Some(interval) = self.min_post_interval
+            && let Some(last) = self.last_post_time {
                 let elapsed = last.elapsed();
                 if elapsed < interval {
                     tokio::time::sleep(interval - elapsed).await;
                 }
             }
-        }
 
         // Apply obfuscation chain if present
         let data = if let Some(ref mut chain) = self.obf_chain {

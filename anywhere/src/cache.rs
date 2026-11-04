@@ -241,26 +241,23 @@ impl CacheStore {
         if let Some(db) = &self.db {
             let table_def: redb::TableDefinition<&str, &str> =
                 redb::TableDefinition::new("state");
-            if let Ok(txn) = db.begin_read() {
-                if let Ok(table) = txn.open_table(table_def) {
+            if let Ok(txn) = db.begin_read()
+                && let Ok(table) = txn.open_table(table_def) {
                     let range = table.range::<&str>(..);
                     if let Ok(iter) = range {
-                        for item in iter {
-                            if let Ok((k, v)) = item {
-                                let key = k.value();
-                                if let Some(group) =
-                                    key.strip_prefix(Self::SELECT_PREFIX)
-                                {
-                                    result.insert(
-                                        group.to_string(),
-                                        v.value().to_string(),
-                                    );
-                                }
+                        for (k, v) in iter.flatten() {
+                            let key = k.value();
+                            if let Some(group) =
+                                key.strip_prefix(Self::SELECT_PREFIX)
+                            {
+                                result.insert(
+                                    group.to_string(),
+                                    v.value().to_string(),
+                                );
                             }
                         }
                     }
                 }
-            }
         }
         result
     }

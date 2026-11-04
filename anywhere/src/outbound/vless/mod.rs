@@ -68,14 +68,13 @@ pub(crate) fn parse_uuid(
 pub(crate) fn validate_vless_config(
     cfg: &OutboundConfig,
 ) -> Result<(), String> {
-    if let Some(flow) = cfg.flow.as_deref() {
-        if !flow.is_empty() && cfg.reality.is_none() {
+    if let Some(flow) = cfg.flow.as_deref()
+        && !flow.is_empty() && cfg.reality.is_none() {
             return Err(format!(
                 "vless: flow '{flow}' requires a [outbounds.reality] section \
                  (only TLS/REALITY transports support flow)"
             ));
         }
-    }
     if cfg.wss_fronts.as_ref().is_some_and(|f| !f.is_empty()) {
         if cfg.reality.is_none() {
             return Err(
@@ -1021,6 +1020,7 @@ fn split_vless_response(resp: Vec<u8>) -> io::Result<Vec<u8>> {
     Ok(data)
 }
 
+#[allow(clippy::too_many_arguments)] // relay plumbing; grouping would obscure the call sites
 /// Spawn an async relay for an established VLESS connection.
 ///
 /// Performs the VLESS handshake (header + bundled first payload), then splits
@@ -1605,6 +1605,7 @@ impl WsStreamAsync {
     }
 }
 
+#[allow(clippy::too_many_arguments)] // relay plumbing; grouping would obscure the call sites
 /// Build an async WebSocket connection over TCP (optional TLS).
 ///
 /// Uses `tokio_boring` for async TLS and `WsConnAsync` for async WebSocket

@@ -35,32 +35,33 @@ const HYSTERESIS_PCT: u64 = 30;
 /// Selection strategy for a urltest group.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum SelectMode {
     /// Manual selection, no health check, no automatic failover.
     /// Pin is equivalent to manual selection.
     Select,
     /// Pick the lowest-latency child (with hysteresis to avoid flapping).
+    #[default]
     Latency,
     /// Pick the first alive child in configured order (fallback semantics).
     Seq,
 }
 
-impl Default for SelectMode {
-    fn default() -> Self {
-        Self::Latency
-    }
-}
+/// Parse from a config string; unknown values fall back to [`SelectMode::Latency`].
+impl std::str::FromStr for SelectMode {
+    type Err = std::convert::Infallible;
 
-impl SelectMode {
-    /// Parse from a config string.
-    pub fn from_str(s: &str) -> Self {
-        match s.to_ascii_lowercase().as_str() {
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(match s.to_ascii_lowercase().as_str() {
             "seq" | "fallback" => Self::Seq,
             "select" | "selector" => Self::Select,
             _ => Self::Latency,
-        }
+        })
     }
+}
 
+
+impl SelectMode {
     /// Whether this mode runs a background health-check loop.
     pub fn needs_health_check(self) -> bool {
         self != Self::Select
@@ -199,8 +200,8 @@ impl UrlTestOutboundClient {
                 continue;
             }
 
-            if let Ok(r) = record.try_read() {
-                if let Some(rec) = r.as_ref() {
+            if let Ok(r) = record.try_read()
+                && let Some(rec) = r.as_ref() {
                     if i == current_idx {
                         if rec.delay < best_delay {
                             best_delay = rec.delay;
@@ -217,7 +218,6 @@ impl UrlTestOutboundClient {
                         best = i;
                     }
                 }
-            }
         }
 
         best
@@ -226,12 +226,11 @@ impl UrlTestOutboundClient {
     /// Resolve the dial index: pinned child if available (not failed),
     /// otherwise mode-based selection.
     fn dial_index(&self) -> usize {
-        if let Some(pin) = self.state.fixed_index() {
-            if !self.state.failed[pin].load(Ordering::Relaxed) {
+        if let Some(pin) = self.state.fixed_index()
+            && !self.state.failed[pin].load(Ordering::Relaxed) {
                 return pin;
             }
             // Pinned child is failed — fall through to mode-based selection.
-        }
         self.best_child_index()
     }
 }

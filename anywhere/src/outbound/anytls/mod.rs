@@ -233,6 +233,7 @@ impl SessionHandle {
     ///   - success: no SYNACK at all, just CMD_PSH with data when ready
     ///   - reject : either CMD_SYNACK with payload (error message), or CMD_FIN
     ///     before any CMD_PSH
+    ///
     /// Do NOT add an `await` on a "synack arrived" notifier here — it will
     /// hang on the success path. See memory `anytls-synack-success-silent`.
     fn open_stream(&self, target: &str) -> std::io::Result<StreamHandle> {
@@ -502,8 +503,8 @@ impl SessionPool {
                 continue;
             }
             alive += 1;
-            if let Some(idle) = entry.idle_since {
-                if now.duration_since(idle) >= self.config.idle_timeout
+            if let Some(idle) = entry.idle_since
+                && now.duration_since(idle) >= self.config.idle_timeout
                     && alive > self.config.min_idle
                 {
                     log::debug!(
@@ -513,7 +514,6 @@ impl SessionPool {
                     to_remove.push(i);
                     alive = alive.saturating_sub(1);
                 }
-            }
         }
 
         // Remove in reverse to keep indices valid. mark_dead is a no-op for
@@ -779,8 +779,8 @@ fn run_io_loop(
                         "io: send cmd=SYN+PSH sid={sid} len={}",
                         target.len()
                     );
-                    if let Ok(syn) = encode_frame(CMD_SYN, sid, &[]) {
-                        if let Ok(psh) = encode_frame(CMD_PSH, sid, &target) {
+                    if let Ok(syn) = encode_frame(CMD_SYN, sid, &[])
+                        && let Ok(psh) = encode_frame(CMD_PSH, sid, &target) {
                             let mut combined =
                                 Vec::with_capacity(syn.len() + psh.len());
                             // Protocol: packet #1 must carry cmdSettings AND
@@ -806,7 +806,6 @@ fn run_io_loop(
                                 break;
                             }
                         }
-                    }
                 },
                 Ok(OutboundMsg::StreamData(sid, data)) => {
                     if let Ok(frame) = encode_frame(CMD_PSH, sid, &data) {
@@ -1062,6 +1061,7 @@ impl AnyTlsOutboundClient {
         )
     }
 
+    #[allow(clippy::too_many_arguments)] // relay plumbing; grouping would obscure the call sites
     /// Static version of create_session — used both by from_config (eager
     /// pre-connect) and by ensure_session (lazy reconnect).
     fn create_session_inner(

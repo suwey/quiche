@@ -60,6 +60,7 @@ use uuid::Uuid;
 
 /// Options for the engine runner.
 #[derive(Clone)]
+#[derive(Default)]
 pub struct RunOptions {
     /// Path to the configuration file (desktop) or inline config content
     /// (Android, when config_path is None).
@@ -84,18 +85,6 @@ pub struct RunOptions {
     pub start_cmd: Option<String>,
 }
 
-impl Default for RunOptions {
-    fn default() -> Self {
-        Self {
-            config_path: None,
-            config_content: None,
-            #[cfg(unix)]
-            tun_fd: None,
-            cache_dir: None,
-            start_cmd: None,
-        }
-    }
-}
 
 /// Core engine entry point.
 ///
@@ -132,7 +121,8 @@ pub async fn run(opts: RunOptions) -> Result<(), Box<dyn std::error::Error>> {
     let resolved_config_path: Option<String> =
         if let Some(path) = &opts.config_path {
             // config_path was provided — canonicalize it.
-            let abs = std::path::Path::new(path)
+            
+            std::path::Path::new(path)
                 .canonicalize()
                 .or_else(|_| {
                     // File may not exist yet (Android first run with inline content).
@@ -149,8 +139,7 @@ pub async fn run(opts: RunOptions) -> Result<(), Box<dyn std::error::Error>> {
                     std::io::Result::Ok(p)
                 })
                 .map(|p| p.to_string_lossy().to_string())
-                .ok();
-            abs
+                .ok()
         } else if opts.config_content.is_some() {
             // No config_path but we have inline content — we need a file to write
             // back to. Use a default path in CWD (desktop) or cache_dir (Android).
@@ -442,11 +431,10 @@ pub async fn run(opts: RunOptions) -> Result<(), Box<dyn std::error::Error>> {
         // manual selection.
         let saved_selections = cache.get_group_selections();
         for (group, child) in &saved_selections {
-            if let Some(state) = urltest_states.get(group) {
-                if state.set_fixed_by_name(child) {
+            if let Some(state) = urltest_states.get(group)
+                && state.set_fixed_by_name(child) {
                     log::info!("restored selection for '{group}' -> '{child}'");
                 }
-            }
         }
 
         AppContext::new(
@@ -665,11 +653,10 @@ pub async fn run(opts: RunOptions) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     #[cfg(target_os = "macos")]
-    if let Some(guard) = &_tun_guard {
-        if let Some(mgr) = guard.tun_mgr() {
+    if let Some(guard) = &_tun_guard
+        && let Some(mgr) = guard.tun_mgr() {
             ctx.set_tun_mgr(mgr);
         }
-    }
     #[cfg(target_os = "windows")]
     if let Some(guard) = &_tun_guard {
         if let Some(mgr) = guard.tun_mgr() {
@@ -1242,7 +1229,7 @@ async fn run_inbound(mut inbound: impl Inbound + 'static, ctx: AppContext) {
                         // UDP: just drop the packet silently.
                         return;
                     }
-                    let client = match ctx.registry.get(&tag) {
+                    let client = match ctx.registry.get(tag) {
                         Some(c) => c,
                         None => {
                             log::warn!(
@@ -1255,7 +1242,7 @@ async fn run_inbound(mut inbound: impl Inbound + 'static, ctx: AppContext) {
 
                     let conn_id = Uuid::new_v4().to_string();
                     let counters = ui_state::ConnCounters::new_arc();
-                    let tag_stats = ctx.stats.get_or_create_tag(&tag).await;
+                    let tag_stats = ctx.stats.get_or_create_tag(tag).await;
                     let info = ui_state::Connection {
                         id: conn_id.clone(),
                         metadata: ui_state::ConnMetadata {
@@ -1381,7 +1368,7 @@ async fn run_inbound(mut inbound: impl Inbound + 'static, ctx: AppContext) {
                 reset_tcp_stream(&mut stream).await;
                 return;
             }
-            let client = match ctx.registry.get(&tag) {
+            let client = match ctx.registry.get(tag) {
                 Some(c) => c,
                 None => {
                     log::warn!(
@@ -1397,7 +1384,7 @@ async fn run_inbound(mut inbound: impl Inbound + 'static, ctx: AppContext) {
 
             let conn_id = Uuid::new_v4().to_string();
             let counters = ui_state::ConnCounters::new_arc();
-            let tag_stats = ctx.stats.get_or_create_tag(&tag).await;
+            let tag_stats = ctx.stats.get_or_create_tag(tag).await;
             let info = ui_state::Connection {
                 id: conn_id.clone(),
                 metadata: ui_state::ConnMetadata {

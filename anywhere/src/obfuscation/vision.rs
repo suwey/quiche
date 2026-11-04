@@ -193,7 +193,7 @@ fn reshape_pieces(chunk: &[u8]) -> Vec<&[u8]> {
                 .windows(3)
                 .rposition(|w| w == TLS_APPLICATION_DATA_START)
                 .map_or(-1i64, |i| i as i64);
-            if index < FRAME_OVERHEAD || index > BUF_SIZE - FRAME_OVERHEAD {
+            if !(FRAME_OVERHEAD..=BUF_SIZE - FRAME_OVERHEAD).contains(&index) {
                 index = BUF_SIZE / 2;
             }
             pieces.push(&unit[..index as usize]);
@@ -484,7 +484,7 @@ impl VisionWriter {
         out.extend_from_slice(&(padding_len as u16).to_be_bytes());
         out.extend_from_slice(content);
         // buf.Extend zero-fills (common/buf/buffer.go:148-156).
-        out.extend(std::iter::repeat(0u8).take(padding_len as usize));
+        out.extend(std::iter::repeat_n(0u8, padding_len as usize));
     }
 }
 

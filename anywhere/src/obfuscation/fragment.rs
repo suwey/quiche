@@ -284,8 +284,8 @@ fn compute_split_points(
         while splits.len() > max && splits.len() > 2 {
             let mut min_idx = 1;
             let mut min_len = splits[1].1 - splits[1].0;
-            for i in 1..splits.len() {
-                let len = splits[i].1 - splits[i].0;
+            for (i, split) in splits.iter().enumerate().skip(1) {
+                let len = split.1 - split.0;
                 if len < min_len {
                     min_len = len;
                     min_idx = i;
@@ -452,8 +452,8 @@ impl<S: Write> Write for FragmentTcpStream<S> {
         if !self.first_write_done {
             self.first_write_done = true;
 
-            if let Some(config) = &self.config {
-                if let Some(sni) = find_sni_location(buf) {
+            if let Some(config) = &self.config
+                && let Some(sni) = find_sni_location(buf) {
                     let splits = compute_split_points(buf, &sni, config);
 
                     log::debug!(
@@ -503,7 +503,6 @@ impl<S: Write> Write for FragmentTcpStream<S> {
                     }
                     return Ok(total_written);
                 }
-            }
         }
 
         // Not a TLS ClientHello, first write already done, or fragment

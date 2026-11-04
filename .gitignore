@@ -19,3 +19,4 @@ reasonix.toml
 anywhere/harness/config/run/
 anywhere/harness/config/report-*.html
 **/__pycache__/
+.workbuddy/

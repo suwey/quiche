@@ -53,6 +53,7 @@ type PendingMap = Arc<
 ///    oneshot channel.
 /// 3. The background event loop receives H3 events and resolves pending
 ///    oneshots.
+///
 /// Internal mutable state for QuicOutboundClient.
 struct QuicInner {
     request_sender: ClientRequestSender,

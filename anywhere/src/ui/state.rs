@@ -107,6 +107,12 @@ impl TagStats {
     }
 }
 
+impl Default for TagStats {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // AppStats — the global state object
 // ---------------------------------------------------------------------------
@@ -192,13 +198,11 @@ impl AppStats {
 pub fn read_linux_memory() -> u64 {
     if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
         for line in status.lines() {
-            if line.starts_with("VmRSS:") {
-                if let Some(kb_str) = line.split_whitespace().nth(1) {
-                    if let Ok(kb) = kb_str.parse::<u64>() {
+            if line.starts_with("VmRSS:")
+                && let Some(kb_str) = line.split_whitespace().nth(1)
+                    && let Ok(kb) = kb_str.parse::<u64>() {
                         return kb * 1024;
                     }
-                }
-            }
         }
     }
     0
@@ -226,7 +230,7 @@ pub fn read_macos_memory() -> u64 {
         };
         if result == libc::KERN_SUCCESS {
             let info = unsafe { info.assume_init() };
-            return info.resident_size as u64;
+            return info.resident_size;
         }
     }
     0

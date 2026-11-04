@@ -24,6 +24,7 @@ use crate::tlsfragment::FragmentConfig;
 
 const DIRECT_UDP_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
+#[derive(Default)]
 pub struct DirectOutboundClient {
     /// TLS ClientHello fragmentation config (from `[common].tls_fragment`).
     /// When enabled, the first write to each direct TCP connection is
@@ -32,11 +33,6 @@ pub struct DirectOutboundClient {
     tls_fragment: Option<FragmentConfig>,
 }
 
-impl Default for DirectOutboundClient {
-    fn default() -> Self {
-        Self { tls_fragment: None }
-    }
-}
 
 impl DirectOutboundClient {
     pub fn new(tls_fragment: Option<FragmentConfig>) -> Self {

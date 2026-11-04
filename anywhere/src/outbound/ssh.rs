@@ -219,16 +219,14 @@ impl SshOutboundClient {
             let port = if self.has_port_placeholder {
                 let listener = std::net::TcpListener::bind("127.0.0.1:0")
                     .map_err(|e| {
-                        io::Error::new(
-                            io::ErrorKind::Other,
+                        io::Error::other(
                             format!("bind temp port: {e}"),
                         )
                     })?;
                 let p = listener
                     .local_addr()
                     .map_err(|e| {
-                        io::Error::new(
-                            io::ErrorKind::Other,
+                        io::Error::other(
                             format!("get temp port: {e}"),
                         )
                     })?
@@ -266,15 +264,14 @@ impl SshOutboundClient {
                 .spawn()
                 .map_err(|e| {
                     let cmd_tag = self.display_command(port);
-                    io::Error::new(
-                        io::ErrorKind::Other,
+                    io::Error::other(
                         format!("failed to spawn '{}': {e}", cmd_tag),
                     )
                 })?;
 
             // If the child exited immediately (port conflict), retry.
-            if attempt + 1 < max_attempts {
-                if let Ok(Some(status)) = child.try_wait() {
+            if attempt + 1 < max_attempts
+                && let Ok(Some(status)) = child.try_wait() {
                     log::warn!(
                         "ssh outbound '{}': tunnel exited early (status={}), \
                          retrying with fresh port",
@@ -283,7 +280,6 @@ impl SshOutboundClient {
                     );
                     continue;
                 }
-            }
 
             // Log stderr so the user can see SSH connection errors.
             // Use the outbound tag as a concise identifier instead of the full
@@ -407,8 +403,7 @@ impl SshOutboundClient {
         let mut buf = [0u8; 2];
         stream.read_exact(&mut buf).await?;
         if buf != [0x05, 0x00] {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
+            return Err(io::Error::other(
                 format!("SOCKS5 handshake rejected: {buf:02x?}"),
             ));
         }
@@ -442,8 +437,7 @@ impl SshOutboundClient {
         let mut header = [0u8; 4]; // VER + REP + RSV + ATYP
         stream.read_exact(&mut header).await?;
         if header[1] != 0x00 {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
+            return Err(io::Error::other(
                 format!("SOCKS5 CONNECT failed: rep={}", header[1]),
             ));
         }
@@ -478,8 +472,7 @@ impl SshOutboundClient {
         let mut checked_up_to: usize = 0;
         loop {
             if pos >= buf.len() {
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
+                return Err(io::Error::other(
                     "HTTP CONNECT response too large",
                 ));
             }
@@ -496,7 +489,7 @@ impl SshOutboundClient {
             let scan_start = checked_up_to.saturating_sub(3);
             let mut found = false;
             for i in scan_start..pos.saturating_sub(3) {
-                if buf[i..i + 4] == [b'\r', b'\n', b'\r', b'\n'] {
+                if buf[i..i + 4] == *b"\r\n\r\n" {
                     found = true;
                     break;
                 }
@@ -512,8 +505,7 @@ impl SshOutboundClient {
             .and_then(|s| s.lines().next())
             .unwrap_or("");
         if !status_line.contains("200") {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
+            return Err(io::Error::other(
                 format!("HTTP CONNECT failed: {status_line}"),
             ));
         }
@@ -601,16 +593,14 @@ async fn socks5_read_addr(stream: &mut TcpStream) -> io::Result<SocketAddr> {
             let port = u16::from_be_bytes(port_bytes);
             let relay_addr_str = format!("{domain}:{port}");
             crate::outbound::common::resolve_addr(&relay_addr_str).map_err(|e| {
-                io::Error::new(
-                    io::ErrorKind::Other,
+                io::Error::other(
                     format!(
                         "SOCKS5: cannot resolve relay '{relay_addr_str}': {e}"
                     ),
                 )
             })
         },
-        _ => Err(io::Error::new(
-            io::ErrorKind::Other,
+        _ => Err(io::Error::other(
             format!("SOCKS5 unknown ATYP: {}", atyp[0]),
         )),
     }
@@ -827,8 +817,7 @@ impl SshOutboundClient {
         let mut header = [0u8; 4]; // VER + REP + RSV + ATYP
         stream.read_exact(&mut header).await?;
         if header[1] != 0x00 {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
+            return Err(io::Error::other(
                 format!("SOCKS5 UDP ASSOCIATE failed: rep={}", header[1]),
             ));
         }

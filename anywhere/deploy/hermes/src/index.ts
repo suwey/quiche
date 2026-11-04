@@ -106,10 +106,40 @@ function isWSHandoff(result: Response | WSHandoff): result is WSHandoff {
 	);
 }
 
+// 隧道分片：把 mless 连接池的各条隧道分散到多个 DO 实例上。
+//
+// 单实例（getByName('hermes')）下全部隧道挤在一个单线程 DO 里：
+// - CPU 限额被所有流共享，双站高吞吐直接打满 → 全局卡顿；
+// - DO 被 CF 强杀/逐出时一死全死（现场：5 条隧道 30 秒内 1005/1006 全灭）。
+//
+// 客户端（anywhere mless WS 池）在隧道路径上带 `_hslot=<slot>` 标记；
+// 带 `_hslot` 的隧道请求按值取模分片，其余请求（admin/订阅/配置页）
+// 一律落 shard 0 —— KV（config.json 等）只在 shard 0 上有完整状态，
+// 隧道数据面不读 KV，因此各分片 DO 独立持有自己的 WS session 是安全的。
+const DO_SHARD_COUNT = 8;
+
+function 解析隧道分片(request: Request, url: URL): number | null {
+	const upgradeHeader = (request.headers.get('Upgrade') || '').toLowerCase();
+	if (upgradeHeader !== 'websocket' && request.method !== 'POST') {
+		return null;
+	}
+	const raw = url.searchParams.get('_hslot');
+	if (raw === null) return null;
+	const slot = Number(raw);
+	if (!Number.isInteger(slot) || slot < 0) return null;
+	return slot % DO_SHARD_COUNT;
+}
+
 export default {
 	async fetch(request: Request, env: Env): Promise<Response> {
 		try {
-			const stub = env.HERMES_AGENT_DISPATCHER.getByName('hermes');
+			// url 已在 router 归一化过 %3f 等转义，这里用原始 URL 解析一次即可；
+			// `_hslot` 是纯数字参数，不受那些转义影响。
+			const url = new URL(request.url);
+			const shard = 解析隧道分片(request, url) ?? 0;
+			const stub = env.HERMES_AGENT_DISPATCHER.getByName(
+				shard === 0 ? 'hermes' : `hermes:${shard}`,
+			);
 			return await stub.fetch(request);
 		} catch (err) {
 			return 错误响应(err, 'Worker', env, request);

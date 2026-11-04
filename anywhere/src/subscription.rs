@@ -523,8 +523,8 @@ fn parse_clash_ss(proxy: &noyalib::Value, name: &str) -> Option<TomlOutbound> {
         .field("password", password);
 
     // Parse SIP003 plugin
-    if let Some(plugin) = proxy.get("plugin").and_then(|v| v.as_str()) {
-        if plugin == "obfs" || plugin == "v2ray-plugin" {
+    if let Some(plugin) = proxy.get("plugin").and_then(|v| v.as_str())
+        && (plugin == "obfs" || plugin == "v2ray-plugin") {
             ob = ob.field("plugin", "obfs-local");
             if let Some(opts) =
                 proxy.get("plugin-opts").and_then(|v| v.as_mapping())
@@ -541,7 +541,6 @@ fn parse_clash_ss(proxy: &noyalib::Value, name: &str) -> Option<TomlOutbound> {
                 }
             }
         }
-    }
 
     Some(ob)
 }
@@ -887,11 +886,10 @@ fn parse_clash_rules(
 
         // MATCH has no value field: `MATCH,TARGET`.
         if rtype == "MATCH" {
-            if let Some(target) = parts.get(1) {
-                if let Some(ob) = map_rule_target(target, valid_refs, skips) {
+            if let Some(target) = parts.get(1)
+                && let Some(ob) = map_rule_target(target, valid_refs, skips) {
                     standalone.push(TomlRule::new(ob));
                 }
-            }
             continue;
         }
 
@@ -1097,14 +1095,13 @@ fn parse_singbox_ss(ob: &serde_json::Value, tag: &str) -> Option<TomlOutbound> {
         .field("password", password);
 
     // Plugin
-    if let Some(plugin) = ob.get("plugin").and_then(|v| v.as_str()) {
-        if plugin == "obfs-local" {
+    if let Some(plugin) = ob.get("plugin").and_then(|v| v.as_str())
+        && plugin == "obfs-local" {
             out = out.field("plugin", "obfs-local");
             if let Some(opts) = ob.get("plugin_opts").and_then(|v| v.as_str()) {
                 out = out.field("plugin_opts", opts);
             }
         }
-    }
 
     Some(out)
 }
@@ -1196,8 +1193,8 @@ fn parse_singbox_vless(
     }
 
     // WS transport
-    if let Some(transport) = ob.get("transport").and_then(|v| v.as_object()) {
-        if transport.get("type").and_then(|v| v.as_str()) == Some("ws") {
+    if let Some(transport) = ob.get("transport").and_then(|v| v.as_object())
+        && transport.get("type").and_then(|v| v.as_str()) == Some("ws") {
             let mut t = TransportConfig {
                 type_: "ws".to_string(),
                 ws_path: None,
@@ -1221,7 +1218,6 @@ fn parse_singbox_vless(
             }
             out.set_transport(t);
         }
-    }
 
     Some(out)
 }
@@ -1318,7 +1314,6 @@ fn parse_ss_uri(uri: &str, idx: &mut usize) -> Option<TomlOutbound> {
     // Split off name fragment
     let (rest, name) = rest
         .split_once('#')
-        .map(|(r, n)| (r, n))
         .unwrap_or((rest, ""));
     // Split off query params
     let (hostport, query) = rest
@@ -1345,8 +1340,8 @@ fn parse_ss_uri(uri: &str, idx: &mut usize) -> Option<TomlOutbound> {
     // Parse plugin from query params
     if let Some(q) = query {
         for param in q.split('&') {
-            if let Some(val) = param.strip_prefix("plugin=") {
-                if val.starts_with("obfs-local") {
+            if let Some(val) = param.strip_prefix("plugin=")
+                && val.starts_with("obfs-local") {
                     ob = ob.field("plugin", "obfs-local");
                     // Parse obfs-local opts: obfs-local;obfs=http;obfs-host=xxx
                     let opts: Vec<&str> = val.split(';').skip(1).collect();
@@ -1354,7 +1349,6 @@ fn parse_ss_uri(uri: &str, idx: &mut usize) -> Option<TomlOutbound> {
                         ob = ob.field("plugin_opts", opts.join(";"));
                     }
                 }
-            }
         }
     }
 
@@ -1374,7 +1368,6 @@ fn parse_vless_uri(uri: &str, idx: &mut usize) -> Option<TomlOutbound> {
     // Split off name fragment
     let (rest, name) = rest
         .split_once('#')
-        .map(|(r, n)| (r, n))
         .unwrap_or((rest, ""));
     // Split off query params
     let (hostport, query) = rest
@@ -1556,7 +1549,7 @@ pub async fn run_subscription(
 
     if is_html_response(resp.content_type.as_deref(), &resp.body) {
         let save_path = std::path::Path::new("sub_error.html");
-        let saved = std::fs::write(&save_path, &resp.body).is_ok();
+        let saved = std::fs::write(save_path, &resp.body).is_ok();
         let saved_msg = if saved {
             format!(", response body saved to {}", save_path.display())
         } else {

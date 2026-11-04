@@ -1014,8 +1014,8 @@ impl DnsHijack {
                 let dest = plain[idx];
                 let d = dest.to_string();
                 let tag = plan.outbound_tag.clone();
-                if let Some(c) = client {
-                    if let Some(resp) =
+                if let Some(c) = client
+                    && let Some(resp) =
                         self.resolve_via_outbound(query, dest, c).await
                     {
                         log::debug!(
@@ -1023,7 +1023,6 @@ impl DnsHijack {
                         );
                         return Some(resp);
                     }
-                }
             }
         }
         log::warn!("DNS: {qname} (type {qtype}) -> ALL METHODS FAILED");

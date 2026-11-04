@@ -238,7 +238,7 @@ impl XmuxConnectionManager {
         let can_add = {
             let pool = self.connections.lock();
             let max_conn = self.effective_max_connections();
-            max_conn == 0 || pool.len() < max_conn as usize
+            max_conn == 0 || pool.len() < max_conn
         };
 
         if can_add {

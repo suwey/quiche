@@ -102,7 +102,7 @@ fn decode_b32(s: &str) -> Result<[u8; 32], String> {
 
 fn decode_hex(s: &str) -> Result<Vec<u8>, String> {
     let s = s.trim();
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return Err("reality: short_id must be an even-length hex string".into());
     }
     (0..s.len() / 2)
@@ -172,13 +172,13 @@ fn verify_reality_cert(
 
     let cert = ssl_ref.peer_certificate().ok_or_else(fail)?;
     let mut raw_buf = [0u8; 64];
-    if let Ok(pkey) = cert.public_key() {
-        if let Ok(raw) = pkey.raw_public_key(&mut raw_buf) {
-            if raw.len() == 32 {
+    if let Ok(pkey) = cert.public_key()
+        && let Ok(raw) = pkey.raw_public_key(&mut raw_buf)
+            && raw.len() == 32 {
                 // Ed25519 leaf: REALITY authentication is the HMAC check.
                 let mut mac =
                     Hmac::<Sha512>::new_from_slice(&authkey).map_err(|_| fail())?;
-                mac.update(&raw);
+                mac.update(raw);
                 let expected = mac.finalize().into_bytes();
                 if cert.signature().as_slice() == expected.as_slice() {
                     return Ok(authkey);
@@ -187,8 +187,6 @@ fn verify_reality_cert(
                 // (anywhere has no crawl disguise to fall through to).
                 return Err(fail());
             }
-        }
-    }
 
     // Non-Ed25519 leaf: the REALITY server mirrors the borrowed dest's real
     // certificate — fall back to standard CA verification (§S1.3).
@@ -251,33 +249,32 @@ pub(crate) async fn connect_reality_stream(
     fragment: Option<&FragmentConfig>,
 ) -> io::Result<AsyncTlsStream> {
     let mut builder = SslContextBuilder::new(SslMethod::tls())
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        .map_err(io::Error::other)?;
     // Chrome-like ClientHello fingerprint, then the REALITY adjustments on
     // top (sigalgs must include ed25519, see REALITY_VERIFY_ALG_PREFS).
     apply_fingerprint_to_ctx(&mut builder);
     builder
         .set_verify_algorithm_prefs(REALITY_VERIFY_ALG_PREFS)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        .map_err(io::Error::other)?;
     // REALITY requires TLS 1.3 (§S2.7); the handshake is TLS 1.3-only anyway.
     builder
         .set_min_proto_version(Some(SslVersion::TLS1_3))
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        .map_err(io::Error::other)?;
     builder.set_verify(SslVerifyMode::PEER);
     let reality_pub = params.public_key;
     let sni_owned = sni.to_string();
     builder.set_custom_verify_callback(SslVerifyMode::PEER, move |ssl_ref| {
         verify_reality_cert(ssl_ref, &reality_pub, &sni_owned)
             .map(|_| ())
-            .map_err(|e| {
+            .inspect_err(|&e| {
                 log::debug!("reality: certificate verification failed: {e:?}");
-                e
             })
     });
 
     let ctx = builder.build();
-    let mut ssl = Ssl::new(&ctx).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    let mut ssl = Ssl::new(&ctx).map_err(io::Error::other)?;
     ssl.set_hostname(sni)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        .map_err(io::Error::other)?;
 
     // REALITY session_id derivation parameters — consumed by the patched
     // boring inside ssl_add_client_hello, after the hello bytes are final and
@@ -309,15 +306,13 @@ pub(crate) async fn connect_reality_stream(
         .connect()
         .await
         .map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::Other,
+            io::Error::other(
                 format!("reality: handshake failed: {e}"),
             )
         })?;
     // §S2.7: flow=XRV requires the outer transport to be TLS 1.3.
     if stream.ssl().version2() != Some(SslVersion::TLS1_3) {
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
+        return Err(io::Error::other(
             "reality: outer transport did not negotiate TLS 1.3",
         ));
     }

@@ -73,6 +73,8 @@ export class WebSocketSession {
 	/** 处理 WebSocket 关闭（由 DO 的 webSocketClose 调用）。 */
 	handleClose(): void {
 		for (const [, s] of this.流映射) {
+			try { s.remoteConn.writer?.releaseLock(); } catch { /* ignore */ }
+			s.remoteConn.writer = null;
 			try { s.remoteConn.socket?.close(); } catch { /* ignore */ }
 		}
 		this.流映射.clear();
@@ -231,6 +233,8 @@ export class WebSocketSession {
 	/** 关闭流与客户端 CLOSE 共用的拆除动作：中止下行泵、关远端 socket、清映射。CLOSE 帧顺序由调用方保证。 */
 	private 拆除流(streamId: number, s: StreamRecord): void {
 		s.中止.已中止 = true;
+		try { s.remoteConn.writer?.releaseLock(); } catch { /* ignore */ }
+		s.remoteConn.writer = null;
 		try { s.remoteConn.socket?.close(); } catch { /* ignore */ }
 		this.流映射.delete(streamId);
 		this.流待发队列.delete(streamId);
@@ -261,23 +265,36 @@ export class WebSocketSession {
 			connectingPromise: null,
 			retryConnect: null,
 			socketWritePromise: null as Promise<void> | null,
+			writer: null as WritableStreamDefaultWriter | null,
 			get socket() { return _socket; },
 			set socket(value: TCPSocket | null) {
 				_socket = value;
+				// 换新 socket 时先释放旧 writer（旧锁属于旧 socket 的 writable）。
+				if (wrapper.writer) {
+					try { wrapper.writer.releaseLock(); } catch { /* ignore */ }
+					wrapper.writer = null;
+				}
 				if (value) {
+					// writer 获取一次、流生命周期内复用；并发 write 由
+					// WritableStream 按调用顺序排队。
+					let writer: WritableStreamDefaultWriter;
+					try {
+						writer = value.writable.getWriter();
+					} catch {
+						wrapper.writer = null;
+						return;
+					}
+					wrapper.writer = writer;
 					const pending = self.流待发队列.get(streamId);
 					if (pending && pending.length > 0) {
 						const arr = pending.splice(0);
 						self.流待发队列.delete(streamId);
 						wrapper.socketWritePromise = (async () => {
 							try {
-								const writer = value.writable.getWriter();
 								for (const pkt of arr) {
 									try { await writer.write(pkt); }
 									catch { /* ignore */ }
 								}
-								try { writer.releaseLock(); }
-								catch { /* ignore */ }
 							} catch { /* ignore */ }
 							finally { wrapper.socketWritePromise = null; }
 						})();
@@ -440,6 +457,11 @@ export class WebSocketSession {
 		if (flags & 帧关闭标记) {
 			const s = this.流映射.get(流ID);
 			if (s) this.拆除流(流ID, s);
+			// 无论这个流在不在映射里都回一帧 CLOSE。本分支走的是 拆除流（不发帧），
+			// 所以这里不会与 关闭流 重复。客户端因此能区分两种以前看不出差别的尾巴：
+			// 有回帧 = CLOSE 确实到达并被解析、但下行泵还在推；无回帧 = 帧没到或没解析。
+			// 空载荷不占混淆计数器，排在串行链上也在该流已入队的数据之后。
+			this.发送帧到客户端(流ID, 帧关闭标记, null);
 			this.重置空闲超时();
 			return;
 		}
@@ -461,8 +483,8 @@ export class WebSocketSession {
 		const 本次写入 = Promise.all([s.上行写入链, 等待pending]).then(async () => {
 			if (s.关闭标记) return;
 			const plain = await 明文Promise;
-			const targetSocket = s.remoteConn.socket;
-			if (!targetSocket || plain.byteLength === 0) {
+			const writer = s.remoteConn.writer;
+			if (!writer || plain.byteLength === 0) {
 				if (plain.byteLength > 0) {
 					log(`[流#${流ID}] 上行排队 ${plain.byteLength}B (socket未就绪)`);
 					let queue = this.流待发队列.get(流ID);
@@ -474,7 +496,8 @@ export class WebSocketSession {
 				}
 				return;
 			}
-			const writer = targetSocket.writable.getWriter();
+			// 共享 writer（流创建时获取一次）：WritableStream 按调用顺序排队，
+			// 不再每帧 getWriter/releaseLock。
 			try { await writer.write(plain); }
 			catch (err) {
 				log(
@@ -483,7 +506,6 @@ export class WebSocketSession {
 					}`,
 				);
 			}
-			finally { try { writer.releaseLock(); } catch { /* ignore */ } }
 		});
 		s.上行写入链 = 本次写入.catch(() => { /* ignore */ });
 	}

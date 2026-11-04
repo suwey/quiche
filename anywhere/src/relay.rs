@@ -27,11 +27,17 @@ const HALF_CLOSE_TIMEOUT: std::time::Duration =
 /// If the remote side of a TCP relay sends nothing within this window after
 /// the relay starts, the connection is torn down (client gets a RST) instead
 /// of hanging forever. Covers dead upstream proxy sessions and unreachable
-/// targets that never answer. 5 s is already several times a healthy
-/// round trip through the proxy, so a longer window only holds a dead
-/// session open.
+/// targets that never answer.
+///
+/// Field run 2026-11-05 01:55 (sharded hermes pool): ~18% of healthy dials
+/// answered between 5 s and 13 s — the CF Worker's origin dial occasionally
+/// takes that long (DNS + connect from the DO's colo). The old 5 s window
+/// killed exactly those streams mid-handshake, the browser retried the whole
+/// connection, and the retry paid the same slow dial again: visible as page
+/// and video stalls. 15 s still bounds a truly dead session (matching
+/// `HALF_CLOSE_TIMEOUT`), while letting the slow-but-alive tail through.
 const FIRST_BYTE_TIMEOUT: std::time::Duration =
-    std::time::Duration::from_secs(5);
+    std::time::Duration::from_secs(15);
 
 /// Returns the UDP idle timeout for a given sniffed protocol.
 ///
@@ -60,6 +66,7 @@ const UDP_BUF_SIZE: usize = 16 * 1024; // 16 KB
 
 /// Unified async read/write abstraction for proxying data between TCP and H3
 /// bidirectional streams.
+#[allow(clippy::double_must_use)] // async_trait expands to a must_use impl over an already-must_use Result
 #[async_trait]
 pub trait StreamRelay: Send {
     /// Reads up to `buf.len()` bytes into `buf`. Returns the number of bytes
@@ -92,6 +99,7 @@ pub trait StreamRelay: Send {
 /// Each `read_packet` returns one datagram along with the destination it was
 /// addressed to (server-side: the destination the client wanted to reach).
 /// Each `write_packet` sends one datagram to the specified destination.
+#[allow(clippy::double_must_use)] // async_trait expands to a must_use impl over an already-must_use Result
 #[async_trait]
 pub trait PacketRelay: Send {
     /// Reads one datagram. Returns `(bytes_written, destination)`.

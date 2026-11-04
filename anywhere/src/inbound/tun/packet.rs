@@ -48,7 +48,7 @@ pub fn classify(buf: &[u8]) -> Option<IpPacket> {
 
 fn classify_ipv4(buf: &[u8]) -> Option<IpPacket> {
     let ip_hdr = Ipv4Header::from_slice(buf).ok()?.0;
-    let l4_offset = ip_hdr.header_len() as usize;
+    let l4_offset = ip_hdr.header_len();
     let total_len = ip_hdr.total_len as usize;
 
     let src_ip = IpAddr::V4(ip_hdr.source.into());

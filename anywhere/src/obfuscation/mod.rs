@@ -13,6 +13,7 @@ pub mod range;
 pub mod vision;
 
 /// 混淆层接口
+#[allow(clippy::double_must_use)] // async_trait expands to a must_use impl over an already-must_use Result
 #[async_trait]
 pub trait ObfuscationLayer: Send {
     /// 在上行数据发送前调用

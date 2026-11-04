@@ -210,11 +210,10 @@ impl GeoMatcher {
             if matchers.iter().any(|m| m.matches(host)) {
                 return true;
             }
-            if let Some(kw_list) = kw {
-                if kw_list.iter().any(|k| host.contains(k.as_str())) {
+            if let Some(kw_list) = kw
+                && kw_list.iter().any(|k| host.contains(k.as_str())) {
                     return true;
                 }
-            }
         }
         false
     }
@@ -557,6 +556,7 @@ fn read_domain_item(buf: &[u8], pos: &mut usize) -> Option<DomainMatcher> {
 // Trie traversal for dump()
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)] // relay plumbing; grouping would obscure the call sites
 fn extract_keys(
     leaves: &[u64], label_bitmap: &[u64], labels: &[u8], ranks: &[i32],
     selects: &[i32], node_id: usize, bm_idx: usize, current_key: &mut Vec<u8>,
@@ -639,7 +639,7 @@ fn select_ith_one(bm: &[u64], ranks: &[i32], selects: &[i32], i: usize) -> usize
         return bm.len() << 6;
     }
     let mut word_idx = (selects[i >> 5] >> 6) as usize;
-    while word_idx + 1 < ranks.len() && (ranks[word_idx + 1] as i32) <= i as i32 {
+    while word_idx + 1 < ranks.len() && ranks[word_idx + 1] <= i as i32 {
         word_idx += 1;
     }
     let mut w = bm[word_idx];

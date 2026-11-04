@@ -25,6 +25,7 @@ use crate::relay::StreamRelay;
 use self::frame::FLAG_FIRST;
 use self::multiplexer::MlessMessage;
 use self::multiplexer::MlessMultiplexer;
+use self::multiplexer::PoolRetireGate;
 use self::multiplexer::MlessStreamHandle;
 use self::vless::build_vless_header;
 
@@ -54,10 +55,15 @@ pub struct MlessOutboundClient {
     max_streams: usize,
     /// Notified when a stream permit is released.
     capacity_notify: Arc<Notify>,
+    /// Shared across the pool: bounds how often a streak of unanswered dials
+    /// may retire a tunnel, so a globally degraded path cannot keep recycling
+    /// the pool and cutting streams that are still downloading fine.
+    pool_gate: Arc<PoolRetireGate>,
     uuid: [u8; 16],
     uuid_str: String,
-    /// Pluggable connection manager (shared across all pool slots).
-    conn_mgr: Arc<dyn ConnectionManager>,
+    /// Pool-wide wake-up signal fired on any tunnel death so the keepalive
+    /// task reconnects immediately instead of waiting out its poll interval.
+    disconnect_signal: Arc<tokio::sync::Notify>,
     /// Pluggable crypto factory (shared; each slot creates its own instance).
     crypto_factory: Arc<dyn CryptoFactory>,
     /// Direct outbound used for UDP ports that mless can't tunnel (e.g. NTP).
@@ -68,6 +74,15 @@ pub struct MlessOutboundClient {
 struct MuxSlot {
     mux: Arc<MlessMultiplexer>,
     consecutive_fails: AtomicU32,
+    /// Per-slot connection manager: WS managers carry the `_hslot` shard
+    /// marker for this slot, so reconnects land on the same DO shard.
+    conn_mgr: Arc<dyn ConnectionManager>,
+}
+
+/// Appends the hermes DO-shard marker to the tunnel path.
+fn with_hslot_marker(path: &str, slot: usize) -> String {
+    let sep = if path.contains('?') { '&' } else { '?' };
+    format!("{path}{sep}_hslot={slot}")
 }
 
 impl MlessOutboundClient {
@@ -105,19 +120,25 @@ impl MlessOutboundClient {
             .map(|range| range.rand_usize())
             .unwrap_or(0);
         let capacity_notify = Arc::new(Notify::new());
+        let pool_gate = PoolRetireGate::new();
 
-        // Build connection manager from nested [transport] config
+        // Build connection manager(s) from the nested [transport] config.
+        //
+        // Hermes shards its tunnel handling across several Durable Object
+        // instances; each WS tunnel marks its slot with `_hslot=<slot>` in the
+        // path so the worker routes the pool onto distinct DOs (one evicted DO
+        // then only cuts its own tunnels instead of the whole pool, and the
+        // per-DO CPU budget is shared). XHTTP keeps one shared manager (xmux
+        // owns its own connection pool) — its URLs don't carry the marker yet.
         let transport = cfg
             .transport
             .as_ref()
             .ok_or("mless: missing [transport] config")?;
-        let conn_mgr: Arc<dyn ConnectionManager> = match transport.type_.as_str()
-        {
+        use crate::connection::SingleConnectionManager;
+        use crate::transport::TransportContext;
+        use crate::transport::ws::WsTransportFactory;
+        let ws_ctx: Option<TransportContext> = match transport.type_.as_str() {
             "ws" => {
-                use crate::connection::SingleConnectionManager;
-                use crate::transport::{
-                    TransportContext, ws::WsTransportFactory,
-                };
                 let ws = transport
                     .ws
                     .as_ref()
@@ -127,7 +148,7 @@ impl MlessOutboundClient {
                 headers
                     .entry("Host".to_string())
                     .or_insert_with(|| tls_server.clone());
-                let ctx = TransportContext {
+                Some(TransportContext {
                     server: addr.ip().to_string(),
                     port: addr.port(),
                     tls_server: tls_server.clone(),
@@ -140,71 +161,97 @@ impl MlessOutboundClient {
                     } else {
                         None
                     },
-                };
-                Arc::new(SingleConnectionManager::new(
-                    Box::new(WsTransportFactory),
-                    ctx,
-                ))
+                })
             },
-            "xhttp" => {
-                use crate::transport::xhttp::config::XmuxConfig;
-                use crate::transport::xhttp::{
-                    config::HttpVersionPref, xmux::XmuxConnectionManager,
-                };
-                let xc = transport
-                    .xhttp
-                    .as_ref()
-                    .ok_or("mless: missing [transport.xhttp] config")?;
-                let mut xhttp_config = xc.clone();
-                if xhttp_config.host.is_empty() {
-                    xhttp_config.host = tls_server.clone();
-                }
-                if xhttp_config.port == 0 {
-                    xhttp_config.port = addr.port();
-                }
-                xhttp_config.insecure = cfg.insecure;
-                // mless requires a bidirectional streaming transport (uplink POST
-                // body + downlink response body). Force stream-one regardless of
-                // the user's mode setting, since packet-up/stream-up would break
-                // the mless frame io_loop.
-                xhttp_config.mode =
-                    crate::transport::xhttp::config::XhttpMode::StreamOne;
-                // Hermes router intercepts UUID-like paths as logout
-                // (router.ts: uuidRegex.test(访问路径) -> 302 redirect).
-                // session_id is a UUID, so placing it in the path triggers
-                // a 302. Force query placement to keep the path clean.
-                xhttp_config.session_id_placement =
-                    crate::transport::xhttp::config::SessionPlacement::Query;
-                let xhttp_config = Arc::new(xhttp_config);
-                let default_xmux = XmuxConfig::default();
-                let xmux_cfg = cfg.xmux.as_ref().unwrap_or(&default_xmux);
-                if xhttp_config.http_version == HttpVersionPref::Http3 {
-                    use crate::transport::xhttp::h3::H3ConnectionManager;
-                    Arc::new(
-                        H3ConnectionManager::from_config(xhttp_config, xmux_cfg)
-                            .await?,
+            _ => None,
+        };
+        let shared_conn_mgr: Option<Arc<dyn ConnectionManager>> =
+            match transport.type_.as_str() {
+                "ws" => None,
+                "xhttp" => {
+                    use crate::transport::xhttp::config::XmuxConfig;
+                    use crate::transport::xhttp::{
+                        config::HttpVersionPref, xmux::XmuxConnectionManager,
+                    };
+                    let xc = transport
+                        .xhttp
+                        .as_ref()
+                        .ok_or("mless: missing [transport.xhttp] config")?;
+                    let mut xhttp_config = xc.clone();
+                    if xhttp_config.host.is_empty() {
+                        xhttp_config.host = tls_server.clone();
+                    }
+                    if xhttp_config.port == 0 {
+                        xhttp_config.port = addr.port();
+                    }
+                    xhttp_config.insecure = cfg.insecure;
+                    // mless requires a bidirectional streaming transport (uplink POST
+                    // body + downlink response body). Force stream-one regardless of
+                    // the user's mode setting, since packet-up/stream-up would break
+                    // the mless frame io_loop.
+                    xhttp_config.mode =
+                        crate::transport::xhttp::config::XhttpMode::StreamOne;
+                    // Hermes router intercepts UUID-like paths as logout
+                    // (router.ts: uuidRegex.test(访问路径) -> 302 redirect).
+                    // session_id is a UUID, so placing it in the path triggers
+                    // a 302. Force query placement to keep the path clean.
+                    xhttp_config.session_id_placement =
+                        crate::transport::xhttp::config::SessionPlacement::Query;
+                    let xhttp_config = Arc::new(xhttp_config);
+                    let default_xmux = XmuxConfig::default();
+                    let xmux_cfg = cfg.xmux.as_ref().unwrap_or(&default_xmux);
+                    Some(
+                        if xhttp_config.http_version == HttpVersionPref::Http3 {
+                            use crate::transport::xhttp::h3::H3ConnectionManager;
+                            Arc::new(
+                                H3ConnectionManager::from_config(
+                                    xhttp_config,
+                                    xmux_cfg,
+                                )
+                                .await?,
+                            )
+                        } else {
+                            Arc::new(
+                                XmuxConnectionManager::from_config(
+                                    xhttp_config,
+                                    xmux_cfg,
+                                )
+                                .await?,
+                            )
+                        },
                     )
-                } else {
-                    Arc::new(
-                        XmuxConnectionManager::from_config(
-                            xhttp_config,
-                            xmux_cfg,
-                        )
-                        .await?,
+                },
+                other => {
+                    return Err(format!(
+                        "mless: unsupported transport type '{other}'"
                     )
-                }
-            },
-            other => {
-                return Err(format!(
-                    "mless: unsupported transport type '{other}'"
-                )
-                .into());
-            },
+                    .into());
+                },
+            };
+
+        let build_conn_mgr = |slot: usize| -> Arc<dyn ConnectionManager> {
+            match &ws_ctx {
+                Some(ctx) => {
+                    let mut slot_ctx = ctx.clone();
+                    slot_ctx.path = with_hslot_marker(&slot_ctx.path, slot);
+                    Arc::new(SingleConnectionManager::new(
+                        Box::new(WsTransportFactory),
+                        slot_ctx,
+                    ))
+                },
+                None => shared_conn_mgr
+                    .clone()
+                    .expect("xhttp branch built a shared conn mgr"),
+            }
         };
 
         // Build crypto factory
         let crypto_factory: Arc<dyn CryptoFactory> =
             Arc::new(self::crypto::AheadXorFactory);
+
+        // One pool-wide wake-up channel: any tunnel death (transport EOF,
+        // involuntary retirement) notifies the keepalive task immediately.
+        let disconnect_signal = Arc::new(tokio::sync::Notify::new());
 
         // Connect all multiplexer instances in the pool concurrently.
         // Each slot does its own TCP+TLS+WS (or XHTTP stream) handshake with
@@ -216,10 +263,12 @@ impl MlessOutboundClient {
         // failing still fails construction as before.
         let muxes = futures_util::future::try_join_all(
             (0..pool_size).map(|i| {
-                let conn_mgr = conn_mgr.clone();
+                let conn_mgr = build_conn_mgr(i + 1);
                 let crypto_factory = crypto_factory.clone();
                 let capacity_notify = capacity_notify.clone();
                 let uuid_str = uuid_str.clone();
+                let pool_gate = pool_gate.clone();
+                let disconnect_signal = disconnect_signal.clone();
                 let slot = i + 1;
                 async move {
                     let mux = MlessMultiplexer::connect_pluggable(
@@ -229,6 +278,8 @@ impl MlessOutboundClient {
                         max_streams,
                         capacity_notify,
                         slot,
+                        pool_gate,
+                        disconnect_signal,
                     )
                     .await?;
                     // Completion lines may interleave now that the slots
@@ -246,13 +297,16 @@ impl MlessOutboundClient {
 
         let slots: Vec<MuxSlot> = muxes
             .into_iter()
-            .map(|mux| MuxSlot {
+            .enumerate()
+            .map(|(idx, mux)| MuxSlot {
                 mux,
                 consecutive_fails: AtomicU32::new(0),
+                conn_mgr: build_conn_mgr(idx + 1),
             })
             .collect();
 
         Ok(Self {
+            pool_gate,
             pool: tokio::sync::Mutex::new(slots),
             next: AtomicUsize::new(0),
             pool_size,
@@ -260,7 +314,7 @@ impl MlessOutboundClient {
             capacity_notify,
             uuid,
             uuid_str,
-            conn_mgr,
+            disconnect_signal,
             crypto_factory,
             direct_fallback: DirectOutboundClient::default(),
         })
@@ -304,9 +358,11 @@ impl MlessOutboundClient {
     }
 
     async fn reconnect_slot(&self, idx: usize) -> Option<Arc<MlessMultiplexer>> {
-        let fails = {
+        let (fails, conn_mgr) = {
             let pool = self.pool.lock().await;
-            pool[idx].consecutive_fails.fetch_add(1, Ordering::Relaxed)
+            let fails =
+                pool[idx].consecutive_fails.fetch_add(1, Ordering::Relaxed);
+            (fails, pool[idx].conn_mgr.clone())
         };
         let delay_secs = (2u64).pow(fails.min(5)).min(30);
         let slot = idx + 1;
@@ -319,12 +375,14 @@ impl MlessOutboundClient {
         tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
 
         let result = MlessMultiplexer::connect_pluggable(
-            self.conn_mgr.clone(),
+            conn_mgr,
             self.crypto_factory.clone(),
             &self.uuid_str,
             self.max_streams,
             self.capacity_notify.clone(),
             slot,
+            self.pool_gate.clone(),
+            self.disconnect_signal.clone(),
         )
         .await;
 
@@ -353,8 +411,8 @@ impl MlessOutboundClient {
         }
     }
 
-    /// Spawns the pool keepalive task: every 10 s it revives every slot whose
-    /// tunnel has died.
+    /// Spawns the pool keepalive task: wakes on any tunnel-death signal and
+    /// additionally sweeps every 10 s as a backstop.
     ///
     /// Without it a dead slot is only reconnected when `open_stream` finds no
     /// live slot left, and because `max_streams` defaults to unlimited a
@@ -370,7 +428,14 @@ impl MlessOutboundClient {
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             loop {
-                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                // Event-driven wake (transport EOF / tunnel retirement) with
+                // the 10 s sweep as a backstop for any missed signal.
+                tokio::select! {
+                    _ = tokio::time::sleep(
+                        std::time::Duration::from_secs(10),
+                    ) => {},
+                    _ = client.disconnect_signal.notified() => {},
+                }
                 let mut dead: Vec<usize> = Vec::new();
                 while dead.len() < client.pool_size {
                     match client.claim_dead_slot().await.0 {

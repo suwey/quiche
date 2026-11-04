@@ -17,6 +17,7 @@
 //! ```
 
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::Weak;
@@ -24,6 +25,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU32;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
+use std::time::Instant;
 
 use parking_lot::Mutex;
 use tokio::sync::Notify;
@@ -114,6 +116,60 @@ pub(crate) struct MlessMultiplexerInner {
     pub(crate) active_streams: std::collections::HashSet<u64>,
 }
 
+/// Shared by every tunnel in the pool to throttle streak-driven retirements.
+///
+/// The streak test is per tunnel, but the damage it prevents is not: a
+/// retirement frees that tunnel's multiplexer, which EOFs every stream still
+/// downloading on it. When the whole path degrades at once - all five tunnels
+/// answering ~40% - each tunnel independently reaches the streak limit, so an
+/// ungated trigger recycles the pool every few tens of seconds and the remedy
+/// itself becomes the stutter. One retirement at a time, and only once the
+/// replacement has proven it can answer something, keeps the recovery without
+/// the churn. Involuntary teardown (`transport EOF`) is not gated: that tunnel
+/// is already gone.
+pub(crate) struct PoolRetireGate {
+    last_fire: Mutex<Option<Instant>>,
+    good_since_fire: AtomicU32,
+}
+
+/// Shortest gap between two streak-driven retirements, pool-wide. Chosen from
+/// the 21:34 field run, where ungated fires landed ~41 s apart.
+const STREAK_RETIRE_COOLDOWN: std::time::Duration =
+    std::time::Duration::from_secs(120);
+
+impl PoolRetireGate {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            last_fire: Mutex::new(None),
+            good_since_fire: AtomicU32::new(0),
+        })
+    }
+
+    fn observe(&self, answered: bool) {
+        if answered {
+            self.good_since_fire.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Claims the right to retire a tunnel now, or refuses and leaves the
+    /// previous claim in place.
+    fn claim_at(&self, now: Instant) -> bool {
+        let mut last = self.last_fire.lock();
+        let ready = match *last {
+            None => true,
+            Some(t) => {
+                now.duration_since(t) >= STREAK_RETIRE_COOLDOWN
+                    && self.good_since_fire.load(Ordering::Relaxed) > 0
+            }
+        };
+        if ready {
+            *last = Some(now);
+            self.good_since_fire.store(0, Ordering::Relaxed);
+        }
+        ready
+    }
+}
+
 /// Mless stream multiplexer.
 ///
 /// M4: Uses pluggable `ConnectionManager` + `CryptoFactory`. The io_loop
@@ -131,14 +187,46 @@ pub struct MlessMultiplexer {
     pub(crate) dead: AtomicBool,
     pub(crate) reject_count: AtomicU32,
     unanswered_streak: AtomicU32,
+    /// Shared pool throttle for streak-driven retirements.
+    pool_gate: Arc<PoolRetireGate>,
     pub(crate) reconnecting: AtomicBool,
+    /// Pool-wide wake-up signal: fired whenever this tunnel dies so the
+    /// keepalive task reconnects immediately instead of waiting out its
+    /// 10 s poll (a full-pool EOF otherwise blackholes traffic for ~15 s).
+    pub(crate) disconnect_signal: Arc<Notify>,
+    /// Streams closed while `answered == false`, awaiting possible late data.
+    /// Server bytes that land after our close still prove the tunnel answered,
+    /// so late DATA for one of these corrects the dial accounting instead of
+    /// letting a healthy-but-slow tunnel drift toward the retire limit.
+    unanswered_recent: Mutex<VecDeque<u64>>,
+    /// Streams closed by us. Hermes echoes a CLOSE for every client-initiated
+    /// close; that echo names a stream we already tore down, so it must not
+    /// feed the rejection detector.
+    self_closed_recent: Mutex<VecDeque<u64>>,
 }
 
-/// Dials on one tunnel that went unanswered back to back before the tunnel is
-/// recycled. Two field runs put the threshold between the two populations:
-/// healthy tunnels topped out at streaks of 2-3 (66-77% dial answer rate) while
-/// dud tunnels ran 12 and 14 (35-61%).
+/// Dials on one tunnel that go unanswered back to back before it is recycled.
+///
+/// Six is the value validated in the field (one-way-dead tunnels ran 5, 7, 8,
+/// 11, 12 and 14 back-to-back). Four was tried and made the pool churn: with a
+/// globally degraded path every tunnel reaches four quickly, and each
+/// retirement cuts the streams still downloading on that tunnel, so the
+/// remedy itself became visible as stutter.
 const UNANSWERED_DIAL_LIMIT: u32 = 6;
+
+/// How many recently-closed stream ids each of the two late-detection queues
+/// remembers. Ids grow monotonically per tunnel and closes arrive at
+/// browser speeds, so 128 covers several seconds of churn easily.
+const RECENT_CLOSED_CAP: usize = 128;
+
+/// Bounded push for the recently-closed id queues: drops the oldest entry
+/// once the cap is reached.
+fn push_recent(queue: &mut VecDeque<u64>, stream_id: u64) {
+    if queue.len() >= RECENT_CLOSED_CAP {
+        queue.pop_front();
+    }
+    queue.push_back(stream_id);
+}
 
 impl MlessMultiplexer {
     /// Connect using pluggable components.
@@ -146,10 +234,13 @@ impl MlessMultiplexer {
     /// Acquires a `TransportSession` from the `ConnectionManager`, creates
     /// a `CryptoLayer` from the `CryptoFactory`, and spawns an async io_loop
     /// that handles encryption/decryption and frame I/O.
-    pub async fn connect_pluggable(
+    #[allow(clippy::too_many_arguments)] // pool wiring; grouping would obscure the call sites
+    pub(crate) async fn connect_pluggable(
         conn_mgr: Arc<dyn ConnectionManager>,
         crypto_factory: Arc<dyn CryptoFactory>, uuid_str: &str,
         max_streams: usize, capacity_notify: Arc<Notify>, slot: usize,
+        pool_gate: Arc<PoolRetireGate>,
+        disconnect_signal: Arc<Notify>,
     ) -> Result<Arc<Self>, Box<dyn std::error::Error>> {
         log::debug!("mless: [slot {slot}] acquiring transport session...");
         let session = conn_mgr
@@ -178,7 +269,11 @@ impl MlessMultiplexer {
             dead: AtomicBool::new(false),
             reject_count: AtomicU32::new(0),
             unanswered_streak: AtomicU32::new(0),
+            pool_gate,
             reconnecting: AtomicBool::new(false),
+            disconnect_signal,
+            unanswered_recent: Mutex::new(VecDeque::new()),
+            self_closed_recent: Mutex::new(VecDeque::new()),
         });
 
         log::debug!("mless: [slot {slot}] spawning async io_loop...");
@@ -225,6 +320,8 @@ impl MlessMultiplexer {
             0,
             Arc::new(Notify::new()),
             1,
+            PoolRetireGate::new(),
+            Arc::new(Notify::new()),
         )
         .await
     }
@@ -280,6 +377,17 @@ impl MlessMultiplexer {
             stream_id,
             active,
         );
+        // Record that this stream was closed by us: hermes replies with a
+        // CLOSE echo for every client-initiated close, and that echo must not
+        // count as a protocol violation (field ③).
+        push_recent(&mut self.self_closed_recent.lock(), stream_id);
+        if !entry.answered {
+            // The dial is about to be counted unanswered; keep the id around
+            // so in-flight data arriving after the close can correct it.
+            // Field run 2026-11-04: slot 5 was retired on 6 "unanswered"
+            // dials whose responses only landed after the browser aborted.
+            push_recent(&mut self.unanswered_recent.lock(), stream_id);
+        }
         self.note_dial_outcome(entry.answered);
         let _ = self.ws_tx.send(MlessMessage::Close { stream_id });
     }
@@ -292,6 +400,7 @@ impl MlessMultiplexer {
     /// reacts to frames naming unknown streams; a tunnel that simply stops
     /// answering dials keeps its table clean and so never trips it.
     fn note_dial_outcome(&self, answered: bool) {
+        self.pool_gate.observe(answered);
         if answered {
             self.unanswered_streak.store(0, Ordering::Relaxed);
             return;
@@ -302,6 +411,13 @@ impl MlessMultiplexer {
             return;
         }
         self.unanswered_streak.store(0, Ordering::Relaxed);
+        if !self.pool_gate.claim_at(Instant::now()) {
+            log::debug!(
+                "mless: [slot {}] {streak} consecutive unanswered dials, retirement held (pool cooldown)",
+                self.slot,
+            );
+            return;
+        }
         log::warn!(
             "mless: [slot {}] {streak} consecutive unanswered dials, retiring tunnel",
             self.slot,
@@ -312,10 +428,72 @@ impl MlessMultiplexer {
         // frees this tunnel's origin sockets from its own close handler, so no
         // per-stream CLOSE is needed here.
         self.dead.store(true, Ordering::Relaxed);
+        self.disconnect_signal.notify_waiters();
+    }
+
+    /// Late server data on a stream we already closed. The dial that opened
+    /// it was counted unanswered at close time; bytes arriving now prove the
+    /// tunnel did answer, so undo one unanswered count. At most one
+    /// correction per stream id — the id is consumed on use.
+    fn note_late_answer(&self, stream_id: u64) {
+        let found = {
+            let mut queue = self.unanswered_recent.lock();
+            if let Some(pos) = queue.iter().position(|&id| id == stream_id) {
+                queue.remove(pos);
+                true
+            } else {
+                false
+            }
+        };
+        if !found {
+            return;
+        }
+        self.pool_gate.observe(true);
+        // Decrement one unanswered count. CAS loop: concurrent closes on the
+        // relay tasks also touch this counter.
+        let mut cur = self.unanswered_streak.load(Ordering::Relaxed);
+        while cur > 0 {
+            match self.unanswered_streak.compare_exchange_weak(
+                cur,
+                cur - 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => cur = actual,
+            }
+        }
+        log::debug!(
+            "mless: [slot {}] late data on stream#{}, dial re-counted as answered",
+            self.slot,
+            stream_id,
+        );
+    }
+
+    /// Removes `stream_id` from the self-closed queue, returning whether it
+    /// was there. A hit means this CLOSE frame is the hermes echo of our own
+    /// close, not a duplicate or desync.
+    fn take_self_closed(&self, stream_id: u64) -> bool {
+        let mut queue = self.self_closed_recent.lock();
+        if let Some(pos) = queue.iter().position(|&id| id == stream_id) {
+            queue.remove(pos);
+            true
+        } else {
+            false
+        }
     }
 
     /// Send plaintext data - the io_loop handles encryption.
     pub fn send_data(&self, stream_id: u64, data: &[u8]) {
+        // The obfuscation keystream is SHA-256(key || counter) with the counter
+        // implicit: each side advances it once per payload-bearing frame, and
+        // `encrypt` advances it even for an empty payload while hermes skips
+        // empty ones. A zero-length frame would therefore shift the two
+        // counters apart permanently and garble every later frame on this
+        // tunnel, so nothing is sent at all.
+        if data.is_empty() {
+            return;
+        }
         let _ = self.ws_tx.send(MlessMessage::Data {
             stream_id,
             flags: FLAG_DATA,
@@ -337,23 +515,36 @@ impl MlessMultiplexer {
                 (entry, was_active, inner.streams.len())
             };
             if !was_active {
-                let rejects =
-                    self.reject_count.fetch_add(1, Ordering::Relaxed) + 1;
-                log::warn!(
-                    "mless: [slot {}] CLOSE stream#{} rejected ({}, active: {})",
-                    self.slot,
-                    stream_id,
-                    rejects,
-                    active,
-                );
-                if rejects >= 30 {
-                    log::warn!(
-                        "mless: [slot {}] {} consecutive rejections, marking dead",
+                if self.take_self_closed(stream_id) {
+                    // Hermes echoes a CLOSE for every client-initiated close.
+                    // That echo names a stream we tore down ourselves — not a
+                    // protocol violation, so keep it out of the rejection
+                    // detector (a healthy browsing session previously drifted
+                    // toward the 30-rejection kill switch on echoes alone).
+                    log::debug!(
+                        "mless: [slot {}] CLOSE stream#{} echo (own close) ignored",
                         self.slot,
-                        rejects
+                        stream_id,
                     );
-                    self.dead.store(true, Ordering::Relaxed);
-                    self.reject_count.store(0, Ordering::Relaxed);
+                } else {
+                    let rejects =
+                        self.reject_count.fetch_add(1, Ordering::Relaxed) + 1;
+                    log::warn!(
+                        "mless: [slot {}] CLOSE stream#{} rejected ({}, active: {})",
+                        self.slot,
+                        stream_id,
+                        rejects,
+                        active,
+                    );
+                    if rejects >= 30 {
+                        log::warn!(
+                            "mless: [slot {}] {} consecutive rejections, marking dead",
+                            self.slot,
+                            rejects
+                        );
+                        self.dead.store(true, Ordering::Relaxed);
+                        self.reject_count.store(0, Ordering::Relaxed);
+                    }
                 }
             } else {
                 self.reject_count.store(0, Ordering::Relaxed);
@@ -400,6 +591,9 @@ impl MlessMultiplexer {
             let _ = tx.send(payload);
         } else {
             // Stream already closed — silently discard late data from server.
+            // The bytes still prove the tunnel answered: if this dial was
+            // counted unanswered at close time, correct the accounting.
+            self.note_late_answer(stream_id);
             log::debug!(
                 "mless: [slot {}] DATA stream#{} {}B discarded (stream closed)",
                 self.slot,
@@ -420,12 +614,28 @@ impl MlessMultiplexer {
         inner.streams.clear();
         inner.active_streams.clear();
         self.disconnected.notify_waiters();
+        // Wake the pool keepalive task immediately: a transport EOF on a busy
+        // tunnel cuts many streams at once, and the 10 s poll would leave the
+        // whole pool degraded for that long before reviving this slot.
+        self.disconnect_signal.notify_waiters();
     }
 }
 
 // ---------------------------------------------------------------------------
 // Async io_loop
 // ---------------------------------------------------------------------------
+
+/// Period between mless keepalive frames.
+///
+/// Hermes tears a tunnel down after 120 s without traffic (`空闲超时ms` in
+/// `deploy/hermes/src/transport-ws.ts`), and the client never originates
+/// traffic on an idle tunnel — the next dial then lands on a half-open
+/// connection and reads as an unanswered dial. The keepalive frame is an
+/// empty CLOSE on stream 0: both sides skip stream 0, and because the payload
+/// is empty neither side advances its obfuscation counter, so it is safe to
+/// inject at any point in the frame stream.
+const HEARTBEAT_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(30);
 
 /// Async I/O loop: encrypts outgoing data, decrypts incoming data.
 ///
@@ -472,6 +682,12 @@ async fn io_loop(
     let mut accum: Vec<u8> = Vec::new();
 
     log::debug!("mless: [slot {slot}] io_loop ready, entering select loop");
+
+    // First tick of an interval is immediate; push it past the connect so the
+    // tunnel does not emit a keepalive frame the moment it is born.
+    let mut keepalive = tokio::time::interval(HEARTBEAT_INTERVAL);
+    keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    keepalive.reset();
 
     loop {
         tokio::select! {
@@ -621,6 +837,21 @@ async fn io_loop(
                     }
                 }
             }
+            // Keepalive: reset the server's 120 s idle timer on an otherwise
+            // quiet tunnel. Written directly here (never through send_data)
+            // so the empty payload stays unencrypted and no obfuscation
+            // counter moves on either side.
+            _ = keepalive.tick() => {
+                let Some(m) = mux.upgrade() else { return; };
+                let frame = encode_frame(0, FLAG_CLOSE, &[]);
+                if let Err(e) = uplink.write(&frame).await {
+                    log::warn!(
+                        "mless: [slot {slot}] transport write error (keepalive): {e}"
+                    );
+                    m.on_disconnect();
+                    return;
+                }
+            }
         }
     }
 }
@@ -629,9 +860,11 @@ async fn io_loop(
 mod tests {
     use super::*;
 
-    fn multiplexer(max_streams: usize) -> Arc<MlessMultiplexer> {
-        let (ws_tx, _ws_rx) = mpsc::unbounded_channel();
-        Arc::new(MlessMultiplexer {
+    fn build_mux(
+        max_streams: usize, gate: Arc<PoolRetireGate>,
+    ) -> (Arc<MlessMultiplexer>, mpsc::UnboundedReceiver<MlessMessage>) {
+        let (ws_tx, ws_rx) = mpsc::unbounded_channel();
+        let mux = Arc::new(MlessMultiplexer {
             slot: 1,
             inner: Mutex::new(MlessMultiplexerInner {
                 streams: HashMap::new(),
@@ -646,13 +879,54 @@ mod tests {
             dead: AtomicBool::new(false),
             reject_count: AtomicU32::new(0),
             unanswered_streak: AtomicU32::new(0),
+            pool_gate: gate,
             reconnecting: AtomicBool::new(false),
-        })
+            disconnect_signal: Arc::new(Notify::new()),
+            unanswered_recent: Mutex::new(VecDeque::new()),
+            self_closed_recent: Mutex::new(VecDeque::new()),
+        });
+        (mux, ws_rx)
     }
 
-    /// Six dials on one tunnel that never saw a single byte back retire it;
-    /// five do not. The threshold sits between the two populations seen in the
-    /// field (healthy streaks of 2-3, dud tunnels at 12 and 14).
+    fn multiplexer_with_rx(
+        max_streams: usize,
+    ) -> (Arc<MlessMultiplexer>, mpsc::UnboundedReceiver<MlessMessage>) {
+        build_mux(max_streams, PoolRetireGate::new())
+    }
+
+    fn multiplexer_with_gate(
+        max_streams: usize, gate: Arc<PoolRetireGate>,
+    ) -> Arc<MlessMultiplexer> {
+        build_mux(max_streams, gate).0
+    }
+
+    fn multiplexer(max_streams: usize) -> Arc<MlessMultiplexer> {
+        multiplexer_with_rx(max_streams).0
+    }
+
+    /// The counter-safety rule behind `send_data`: an empty payload must not
+    /// reach the io_loop, because encrypting it would advance our send counter
+    /// while the peer leaves its receive counter untouched.
+    #[test]
+    fn empty_payload_produces_no_frame() {
+        let (mux, mut ws_rx) = multiplexer_with_rx(0);
+
+        mux.send_data(7, &[]);
+        assert!(
+            ws_rx.try_recv().is_err(),
+            "an empty DATA frame would desynchronise the obfuscation counters"
+        );
+
+        mux.send_data(7, b"x");
+        assert!(matches!(
+            ws_rx.try_recv(),
+            Ok(MlessMessage::Data { stream_id: 7, payload, .. })
+                if payload == b"x"
+        ));
+    }
+
+    /// A streak of unanswered dials retires the tunnel at the limit and not
+    /// before. Healthy tunnels in the field never ran the streak past 3.
     #[test]
     fn unanswered_dial_streak_retires_tunnel() {
         let mux = multiplexer(0);
@@ -665,6 +939,41 @@ mod tests {
         let (stream_id, _rx) = mux.try_register_stream().unwrap();
         mux.close_stream(stream_id);
         assert!(mux.dead.load(Ordering::Relaxed));
+    }
+
+    /// Two tunnels share one gate: the second streak inside the cooldown is
+    /// held, because a retirement cuts the streams the first tunnel is still
+    /// downloading and a second one back-to-back cuts more for no gain.
+    #[test]
+    fn pool_cooldown_holds_the_second_retirement() {
+        let gate = PoolRetireGate::new();
+        let first = multiplexer_with_gate(0, Arc::clone(&gate));
+        let second = multiplexer_with_gate(0, Arc::clone(&gate));
+        for _ in 0..UNANSWERED_DIAL_LIMIT {
+            let (id, _rx) = first.try_register_stream().unwrap();
+            first.close_stream(id);
+        }
+        assert!(first.dead.load(Ordering::Relaxed));
+
+        for _ in 0..UNANSWERED_DIAL_LIMIT {
+            let (id, _rx) = second.try_register_stream().unwrap();
+            second.close_stream(id);
+        }
+        assert!(!second.dead.load(Ordering::Relaxed));
+    }
+
+    /// The cooldown only reopens once something on the pool has actually been
+    /// answered: while nothing answers, replacing tunnels cannot help.
+    #[test]
+    fn cooldown_reopens_only_after_a_dial_is_answered() {
+        let gate = PoolRetireGate::new();
+        let t0 = Instant::now();
+        assert!(gate.claim_at(t0));
+        let later = t0 + STREAK_RETIRE_COOLDOWN
+            + std::time::Duration::from_secs(1);
+        assert!(!gate.claim_at(later));
+        gate.observe(true);
+        assert!(gate.claim_at(later));
     }
 
     #[test]
@@ -702,6 +1011,74 @@ mod tests {
         mux.on_frame(stream_id, FLAG_CLOSE, Vec::new());
         mux.close_stream(stream_id);
         assert!(mux.dead.load(Ordering::Relaxed));
+    }
+
+    /// Late data on a stream that was closed unanswered corrects the streak,
+    /// so a slow-but-alive tunnel is not retired on browser fast-aborts.
+    /// Field run 2026-11-04: slot 5 reached the 6-dial retire limit while its
+    /// responses were only landing after each abort (logged as
+    /// "DATA ... discarded").
+    #[test]
+    fn late_data_corrects_unanswered_streak() {
+        let mux = multiplexer(0);
+        let mut ids = Vec::new();
+        for _ in 0..3 {
+            let (id, _rx) = mux.try_register_stream().unwrap();
+            mux.close_stream(id);
+            ids.push(id);
+        }
+        // Late data for one of them: the tunnel did answer after all.
+        mux.on_frame(ids[0], 0, vec![1, 2, 3]);
+        // With one correction, three more unanswered closes must still fit
+        // under the limit of 6 (3 - 1 + 3 = 5).
+        for _ in 0..UNANSWERED_DIAL_LIMIT - 3 {
+            let (id, _rx) = mux.try_register_stream().unwrap();
+            mux.close_stream(id);
+        }
+        assert!(!mux.dead.load(Ordering::Relaxed));
+
+        // The next unanswered close trips the limit again.
+        let (id, _rx) = mux.try_register_stream().unwrap();
+        mux.close_stream(id);
+        assert!(mux.dead.load(Ordering::Relaxed));
+    }
+
+    /// A late correction is consumed once: the same id cannot be re-armed to
+    /// suppress further unanswered counts.
+    #[test]
+    fn late_answer_correction_is_single_use() {
+        let mux = multiplexer(0);
+        let (id, _rx) = mux.try_register_stream().unwrap();
+        mux.close_stream(id);
+        assert_eq!(mux.unanswered_recent.lock().len(), 1);
+
+        mux.on_frame(id, 0, vec![1]);
+        assert_eq!(
+            mux.unanswered_recent.lock().len(),
+            0,
+            "correction consumes the id"
+        );
+
+        // A duplicate late frame must not re-arm the id.
+        mux.on_frame(id, 0, vec![1]);
+        assert_eq!(mux.unanswered_recent.lock().len(), 0);
+    }
+
+    /// A server CLOSE for a stream we closed ourselves is the hermes echo and
+    /// must not feed the rejection detector; a CLOSE for a stream we never
+    /// closed still does (field run: 46 echoes logged as "rejected").
+    #[test]
+    fn close_echo_of_own_close_is_not_counted() {
+        let mux = multiplexer(0);
+        let (id, _rx) = mux.try_register_stream().unwrap();
+        mux.close_stream(id);
+
+        mux.on_frame(id, FLAG_CLOSE, Vec::new());
+        assert_eq!(mux.reject_count.load(Ordering::Relaxed), 0);
+
+        // A duplicate echo (id already consumed) counts again.
+        mux.on_frame(id, FLAG_CLOSE, Vec::new());
+        assert_eq!(mux.reject_count.load(Ordering::Relaxed), 1);
     }
 
     #[test]

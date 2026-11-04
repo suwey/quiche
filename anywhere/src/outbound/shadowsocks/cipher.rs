@@ -363,6 +363,9 @@ fn compute_psk_hash(psk_list: &[Vec<u8>]) -> Vec<u8> {
 // ─── SsAead ─────────────────────────────────────────────────────────────────
 
 /// AEAD cipher wrapper for the three SS2022 methods.
+// Cipher state is ~1 KB per variant by design (AES round tables); boxing the
+// inner cipher would add an indirection to every hot-path encrypt/decrypt.
+#[allow(clippy::large_enum_variant)]
 pub enum SsAead {
     Aes128(aes_gcm::Aes128Gcm),
     Aes256(aes_gcm::Aes256Gcm),
@@ -465,6 +468,8 @@ pub struct AesEcb {
     inner: AesEcbInner,
 }
 
+// Same rationale as SsAead: full AES key-schedule state, hot path.
+#[allow(clippy::large_enum_variant)]
 enum AesEcbInner {
     Aes128(aes::Aes128),
     Aes256(aes::Aes256),

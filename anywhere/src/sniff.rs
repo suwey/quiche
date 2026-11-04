@@ -55,7 +55,7 @@ pub fn looks_sniffable(payload: &[u8]) -> bool {
         return true;
     }
     // BT: starts with 0x13 + "BitTorrent protocol"
-    if payload.len() >= 1
+    if !payload.is_empty()
         && payload[0] == 0x13
         && payload.len() >= 20
         && &payload[1..20] == b"BitTorrent protoco"
@@ -74,7 +74,7 @@ pub fn looks_sniffable(payload: &[u8]) -> bool {
         }
     }
     // NTP: 48 bytes, first byte has LI(2) + VN(3) + Mode(3) in high nibble
-    if payload.len() >= 1 && (payload[0] & 0xc7) != 0 && payload.len() <= 48 {
+    if !payload.is_empty() && (payload[0] & 0xc7) != 0 && payload.len() <= 48 {
         // Heuristic — many protocols could match, but combined with
         // other checks this is good enough. Skip if not clearly NTP.
     }
@@ -83,7 +83,7 @@ pub fn looks_sniffable(payload: &[u8]) -> bool {
         // DNS header: ID(2) + flags(2) + QDCOUNT(2) + ANCOUNT(2) + NSCOUNT(2) + ARCOUNT(2)
         // QDCOUNT should be >= 1 for a query
         let qdcount = u16::from_be_bytes([payload[4], payload[5]]);
-        if qdcount >= 1 && qdcount <= 10 {
+        if (1..=10).contains(&qdcount) {
             return true;
         }
     }
@@ -509,15 +509,15 @@ fn decrypt_quic_initial(payload: &[u8], dcid: &[u8]) -> Option<Vec<u8>> {
 
     // Unprotect packet number bytes
     let mut pn_bytes = [0u8; 4];
-    for i in 0..pn_len {
-        pn_bytes[i] = ciphertext[i] ^ hp_mask[1 + i];
+    for (i, byte) in ciphertext[..pn_len].iter().enumerate() {
+        pn_bytes[i] = byte ^ hp_mask[1 + i];
     }
 
     // Reconstruct full packet number (assume 4 bytes, pad with zeros for truncated)
     let packet_number = {
         let mut val: u32 = 0;
-        for i in 0..pn_len {
-            val = (val << 8) | pn_bytes[i] as u32;
+        for &byte in &pn_bytes[..pn_len] {
+            val = (val << 8) | byte as u32;
         }
         val
     };
@@ -544,12 +544,11 @@ fn decrypt_quic_initial(payload: &[u8], dcid: &[u8]) -> Option<Vec<u8>> {
     // We need to modify the first byte and pn bytes in a copy for proper AAD
     let mut aad_copy = aad.to_vec();
     aad_copy[0] = first_byte; // unprotected first byte
-    for i in 0..pn_len {
-        aad_copy[pos + i] = pn_bytes[i]; // unprotected pn bytes
-    }
+    // unprotected pn bytes
+    aad_copy[pos..pos + pn_len].copy_from_slice(&pn_bytes[..pn_len]);
 
     let cipher = Aes128Gcm::new_from_slice(&key).ok()?;
-    let nonce: &aes_gcm::Nonce<_> = (&nonce).try_into().ok()?;
+    let nonce: &aes_gcm::Nonce<_> = (&nonce).into();
     let plaintext = cipher
         .decrypt(
             nonce,
@@ -599,8 +598,8 @@ fn read_varint(data: &[u8]) -> Option<(usize, usize)> {
         return None;
     }
     let mut val: usize = (data[0] & 0x3f) as usize;
-    for i in 1..len {
-        val = (val << 8) | data[i] as usize;
+    for &byte in &data[1..len] {
+        val = (val << 8) | byte as usize;
     }
     Some((val, len))
 }

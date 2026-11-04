@@ -12,6 +12,7 @@ use async_trait::async_trait;
 // ========== 传输层 Trait ==========
 
 /// 上行写入器：把数据写到远端
+#[allow(clippy::double_must_use)] // async_trait expands to a must_use impl over an already-must_use Result
 #[async_trait]
 pub trait UplinkWriter: Send {
     async fn write(&mut self, data: &[u8]) -> io::Result<()>;
@@ -19,6 +20,7 @@ pub trait UplinkWriter: Send {
 }
 
 /// 下行读取器：从远端读数据
+#[allow(clippy::double_must_use)] // async_trait expands to a must_use impl over an already-must_use Result
 #[async_trait]
 pub trait DownlinkReader: Send {
     async fn read(&mut self, buf: &mut [u8]) -> io::Result<usize>;
@@ -30,6 +32,7 @@ pub trait DownlinkReader: Send {
 /// 非对称传输（stream-up、packet-up）：uplink 和 downlink 是独立连接
 ///
 /// M0 阶段：仅定义，不创建新实现。WsTransportSession 适配现有 WsStream。
+#[allow(clippy::double_must_use)] // async_trait expands to a must_use impl over an already-must_use Result
 #[async_trait]
 pub trait TransportSession: Send {
     /// 获取上行写入器
@@ -57,6 +60,7 @@ pub struct TransportContext {
 
 /// 传输层工厂 trait（M0 定义但不使用）
 #[allow(dead_code)]
+#[allow(clippy::double_must_use)] // async_trait expands to a must_use impl over an already-must_use Result
 #[async_trait]
 pub trait TransportFactory: Send + Sync {
     async fn create(

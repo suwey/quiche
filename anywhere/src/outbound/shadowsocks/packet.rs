@@ -266,7 +266,7 @@ impl SsUdpRelay {
         let cipher = XChaCha20Poly1305::new_from_slice(self.method.last_psk())
             .expect("invalid PSK length for XChaCha20Poly1305");
         let n: Nonce<XChaCha20Poly1305> =
-            nonce.try_into().expect("nonce must be 24 bytes");
+            nonce.into();
         let enc = cipher
             .encrypt(&n, plain.as_ref())
             .expect("XChaCha20Poly1305 encryption failed");
@@ -423,7 +423,7 @@ impl SsUdpRelay {
         let timestamp = i64::from_be_bytes(body[1..9].try_into().unwrap());
         let now = Self::now_secs() as i64;
         let diff = (now - timestamp).abs();
-        if diff > TIMESTAMP_TOLERANCE_SECS as i64 {
+        if diff > TIMESTAMP_TOLERANCE_SECS {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("bad timestamp: diff {diff}s"),

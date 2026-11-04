@@ -11,7 +11,7 @@ import type { TCPSocket } from './types';
 export async function 处理gRPC请求(request: Request, yourUUID: string): Promise<Response> {
 	if (!request.body) return new Response('Bad Request', { status: 400 });
 	const reader = request.body.getReader();
-	const remoteConnWrapper: RemoteConnWrapper = { socket: null, connectingPromise: null, retryConnect: null, socketWritePromise: null };
+	const remoteConnWrapper: RemoteConnWrapper = { socket: null, connectingPromise: null, retryConnect: null, socketWritePromise: null, writer: null };
 	let isDnsQuery = false;
 	const 木马UDP上下文 = { 缓存: new Uint8Array(0) };
 	let 判断是否是木马: boolean | null = null;

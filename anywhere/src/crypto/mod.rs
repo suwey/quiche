@@ -11,6 +11,7 @@ use async_trait::async_trait;
 use std::io;
 
 /// 加密层接口
+#[allow(clippy::double_must_use)] // async_trait expands to a must_use impl over an already-must_use Result
 #[async_trait]
 pub trait CryptoLayer: Send {
     /// 加密上行数据
