@@ -11,10 +11,10 @@
 
 ```sh
 # 真实节点矩阵（分发测试）：全节点测单个平台
-python3 anywhere/harness/conformance.py -c ~/anywhere-test -r ~/quiche/releases -p windows
+python3 anywhere/harness/conformance.py -c ~/anywhere-test -r ~/quiche/packs/release -p windows
 
 # 多平台（可带 -arch 后缀）
-python3 anywhere/harness/conformance.py -c ~/anywhere-test -r ~/quiche/releases -p windows-x64,android-arm64
+python3 anywhere/harness/conformance.py -c ~/anywhere-test -r ~/quiche/packs/release -p windows-x64,android-arm64
 
 # 自环测试（与分发测试解耦）：设备连自己的 anywhere server，逐协议测
 python3 anywhere/harness/conformance.py -c ~/anywhere-test -p mac -s

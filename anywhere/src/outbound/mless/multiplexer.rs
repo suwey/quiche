@@ -543,19 +543,25 @@ impl MlessMultiplexer {
         }
 
         // payload is already decrypted by the io_loop
-        let hex_preview = payload
-            .iter()
-            .take(16)
-            .map(|b| format!("{:02x}", b))
-            .collect::<Vec<_>>()
-            .join(" ");
-        log::trace!(
-            "mless: [slot {}] DATA stream#{} {}B [{}] -> channel",
-            self.slot,
-            stream_id,
-            payload.len(),
-            hex_preview,
-        );
+        // Guard the preview construction: the trace! macro alone only skips
+        // its own formatting, while this hex dump (16 format! allocations
+        // per frame) would still run on every downlink DATA frame when
+        // trace logging is off — measurable on video throughput.
+        if log::log_enabled!(log::Level::Trace) {
+            let hex_preview = payload
+                .iter()
+                .take(16)
+                .map(|b| format!("{:02x}", b))
+                .collect::<Vec<_>>()
+                .join(" ");
+            log::trace!(
+                "mless: [slot {}] DATA stream#{} {}B [{}] -> channel",
+                self.slot,
+                stream_id,
+                payload.len(),
+                hex_preview,
+            );
+        }
 
         let mut inner = self.inner.lock();
         // Only insert into active_streams if the stream channel still exists.
@@ -651,7 +657,15 @@ async fn io_loop(
     // Keep session alive to prevent connection closure.
     let _session = &mut session;
 
-    let mut buf = vec![0u8; 16 * 1024];
+    // Downlink read buffer, sized above the typical server frame so a WS/H2
+    // message is consumed in one read. WsDownlinkReader stashes the unread
+    // tail of an oversized message in a VecDeque, and every byte of that
+    // tail is then copied twice more (extend into recv_buf, copy back out)
+    // across extra select iterations — at the old 16KB read size a 64KB
+    // video frame paid 4 reads and ~6 copies, on exactly the highest-rate
+    // path. 256KB per slot (5 slots = 1.25MB) makes even the ~1MB
+    // ws-frame-cap messages a single read.
+    let mut buf = vec![0u8; 256 * 1024];
     // Accumulation buffer for cross-read frame boundaries.
     // When a WS message is larger than `buf` or a mless frame spans
     // two WS messages, we need to buffer the incomplete tail and

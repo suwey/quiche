@@ -235,7 +235,15 @@ if wants windows-x64-gnu && [[ -n "$(command -v x86_64-w64-mingw32-gcc 2>/dev/nu
     if [[ -d "$MINGW_SYSROOT" ]]; then
         export BINDGEN_EXTRA_CLANG_ARGS="--target=x86_64-pc-windows-gnu -isystem $MINGW_SYSROOT"
     fi
-    cargo build --target x86_64-pc-windows-gnu $PROFILE_FLAG --bin anywhere
+    # The global RUSTFLAGS (path remapping above) overrides the
+    # [target.x86_64-pc-windows-gnu] rustflags in anywhere/.cargo/config.toml
+    # (cargo precedence: env > config) — which is where
+    # -Wl,--exclude-all-symbols lives. Without it a debug cdylib auto-exports
+    # 140k+ symbols and mingw ld dies with "export ordinal too large"
+    # (>65535). Re-add it here; host build units never receive RUSTFLAGS, so
+    # the flag stays on windows-target compilations only.
+    RUSTFLAGS="${RUSTFLAGS} -C link-arg=-Wl,--exclude-all-symbols" \
+        cargo build --target x86_64-pc-windows-gnu $PROFILE_FLAG --bin anywhere
     cd "$SCRIPT_DIR/.."
     echo "  Product: target/x86_64-pc-windows-gnu/$PROFILE_DIR/anywhere.exe"
 elif wants windows-x64-gnu; then

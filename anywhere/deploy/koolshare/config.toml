@@ -108,7 +108,7 @@ outbounds = ["A", "S", "CF1", "CF2"]
 [[rules]]
 # protocol examples: "both:1232" "tcp:123,1132" "udp:123,2222"
 protocol = "stun"  # both:3748,3749
-outbound = "none" # drop the traffic
+outbound = "reject" # drop the traffic
 
 [[rules]]
 # some software use other ports such as Xunlei, recommend set direct mode in ui when download.
@@ -157,8 +157,8 @@ outbound = "direct"
 [[rules]]
 geo_url = "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/private.srs"
 # update_interval = "3d"
-# on router is none, linux desktop set direct
-outbound = "none"
+# on router is reject, linux desktop set direct
+outbound = "reject"
 
 [[rules]]
 geo_url = "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/cn.srs"
@@ -174,7 +174,7 @@ outbound = "direct"
 
 [[rules]]
 geo_url = "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/category-ads-all.srs"
-outbound = "none"
+outbound = "reject"
 
 [[rules]]
 geo_url = "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/geolocation-!cn.srs"

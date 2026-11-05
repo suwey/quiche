@@ -272,7 +272,11 @@ impl MlessOutboundClient {
                         wiring,
                         slot,
                     )
-                    .await?;
+                    .await
+                    // `Box<dyn Error>` is not `Send`, and that would make this
+                    // future non-Send — which only bites on Android, where the
+                    // engine is spawned on a multi-thread runtime.
+                    .map_err(|e| e.to_string())?;
                     // Completion lines may interleave now that the slots
                     // connect in parallel; the slot number is what matters.
                     if pool_size > 1 {
@@ -280,7 +284,7 @@ impl MlessOutboundClient {
                             "mless: [slot {slot}] pool connected ({slot}/{pool_size})",
                         );
                     }
-                    Ok::<_, Box<dyn std::error::Error>>(mux)
+                    Ok::<_, String>(mux)
                 }
             }),
         )

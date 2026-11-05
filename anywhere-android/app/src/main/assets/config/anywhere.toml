@@ -91,7 +91,7 @@ outbound = "direct"
 
 [[rules]]
 geo_url = "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/category-ads-all.srs"
-outbound = "none"
+outbound = "reject"
 
 [[rules]]
 geo_url = "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/geolocation-!cn.srs"

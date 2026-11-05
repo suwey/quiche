@@ -70,7 +70,7 @@ NON_TESTABLE_TYPES = {"urltest", "direct", "reject"}
 RELEASE_ARTIFACT_KEY = {
     "mac": {"arm64": "mac-arm64", "x64": "mac-x64"},
     "windows": {"x64": "windows-x64-gnu", "arm64": "windows-arm64"},
-    "linux": {"x64": "linux-x86_64-musl", "arm64": "linux-aarch64-musl",
+    "linux": {"x64": "linux-x64-musl", "arm64": "linux-aarch64-musl",
               "armv7": "linux-armv7"},
     # raw executables produced by `cargo ndk -t <target> build`. The releases
     # .apk only carries the cdylib, which cannot be exec'd.
