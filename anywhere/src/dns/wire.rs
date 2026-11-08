@@ -1,8 +1,9 @@
 //! DNS wire-format helpers.
 //!
 //! Pure functions for parsing and building DNS messages: query parsing,
-//! fake-IP A responses, empty NOERROR responses, REFUSED responses, and
-//! transaction-ID patching. No state, no I/O.
+//! fake-IP A responses, hosts-table AAAA responses, empty NOERROR
+//! responses, REFUSED responses, and transaction-ID patching. No state,
+//! no I/O.
 
 /// Parsed question from a DNS query.
 pub struct DnsQuestion {
@@ -29,6 +30,32 @@ pub fn build_a_response(
     r.extend_from_slice(&[0x00, 0x01]);
     r.extend_from_slice(&60u32.to_be_bytes());
     r.extend_from_slice(&[0x00, 0x04]);
+    r.extend_from_slice(&ip.octets());
+    Some(r)
+}
+
+/// Build an AAAA-record response that answers `query` with `ip` (static
+/// hosts table; the fake-ip v6 pool is ipv6-plan Phase 2). Wire-shape
+/// identical to [`build_a_response`] apart from TYPE=28 and a 16-octet
+/// RDATA — upstream passthrough needs no per-record rewriting, so this is
+/// the only AAAA-specific builder.
+pub fn build_aaaa_response(
+    query: &[u8], ip: std::net::Ipv6Addr,
+) -> Option<Vec<u8>> {
+    let q_end = dns_question_end(query)?;
+    let mut r = Vec::with_capacity(q_end + 28);
+    r.extend_from_slice(&query[..2]);
+    r.extend_from_slice(&[0x81, 0x80]);
+    r.extend_from_slice(&[0x00, 0x01]);
+    r.extend_from_slice(&[0x00, 0x01]);
+    r.extend_from_slice(&[0x00, 0x00]);
+    r.extend_from_slice(&[0x00, 0x00]);
+    r.extend_from_slice(&query[12..q_end]);
+    r.extend_from_slice(&[0xC0, 0x0C]);
+    r.extend_from_slice(&[0x00, 0x1C]);
+    r.extend_from_slice(&[0x00, 0x01]);
+    r.extend_from_slice(&60u32.to_be_bytes());
+    r.extend_from_slice(&[0x00, 0x10]);
     r.extend_from_slice(&ip.octets());
     Some(r)
 }
@@ -127,7 +154,8 @@ pub fn parse_dns_query(buf: &[u8]) -> Option<DnsQuestion> {
 }
 
 /// Build an empty DNS response (NOERROR, 0 answers) from a query. Used to
-/// short-circuit AAAA queries.
+/// answer AAAA queries in fake-ip mode (the fake pool is v4-only), reject
+/// plans, and hosts entries pinned to the other address family.
 pub fn build_empty_response(query: &[u8]) -> Option<Vec<u8>> {
     if query.len() < 12 {
         return None;
@@ -290,6 +318,46 @@ mod tests {
     fn parse_rejects_truncated() {
         let q = make_query("a.b", 1);
         assert!(parse_dns_query(&q[..10]).is_none());
+    }
+
+    #[test]
+    fn aaaa_response_round_trips() {
+        let ip =
+            std::net::Ipv6Addr::new(0x240e, 0x56, 0x400c, 0x8000, 0, 0, 0, 0x11);
+        let q = make_query("example.org", 28);
+        let r = build_aaaa_response(&q, ip).expect("AAAA response must build");
+
+        // Header: txn id echoed, QR set, QD=1, AN=1.
+        assert_eq!(&r[..2], &q[..2]);
+        assert_eq!(r[2] & 0x80, 0x80);
+        assert_eq!(u16::from_be_bytes([r[4], r[5]]), 1, "QDCOUNT");
+        assert_eq!(u16::from_be_bytes([r[6], r[7]]), 1, "ANCOUNT");
+
+        // Question section copied verbatim; one answer right after it.
+        let q_end = q.len();
+        assert_eq!(&r[12..q_end], &q[12..]);
+        let a = &r[q_end..];
+        assert_eq!(&a[..2], &[0xC0, 0x0C], "answer name must be a pointer");
+        assert_eq!(&a[2..4], &[0x00, 0x1C], "TYPE must be AAAA (28)");
+        assert_eq!(&a[4..6], &[0x00, 0x01], "CLASS must be IN");
+        assert_eq!(&a[6..10], &60u32.to_be_bytes(), "TTL");
+        assert_eq!(&a[10..12], &[0x00, 0x10], "RDLENGTH must be 16");
+        assert_eq!(&a[12..28], &ip.octets(), "RDATA must carry the address");
+        assert_eq!(r.len(), q_end + 28);
+    }
+
+    #[test]
+    fn a_response_round_trips() {
+        let ip = std::net::Ipv4Addr::new(192, 168, 50, 10);
+        let q = make_query("nas.lan", 1);
+        let r = build_a_response(&q, ip).expect("A response must build");
+
+        let q_end = q.len();
+        let a = &r[q_end..];
+        assert_eq!(&a[2..4], &[0x00, 0x01], "TYPE must be A (1)");
+        assert_eq!(&a[10..12], &[0x00, 0x04], "RDLENGTH must be 4");
+        assert_eq!(&a[12..16], &ip.octets());
+        assert_eq!(r.len(), q_end + 16);
     }
 
     #[test]

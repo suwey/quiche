@@ -3,9 +3,11 @@
 //! Intercepts UDP/53 at the TUN inbound, parses the query domain, runs it
 //! through the rule engine, and forwards to either the `direct` upstream
 //! (default 223.5.5.5) or the `remote` upstream (default 8.8.8.8). AAAA
-//! queries are short-circuited to an empty NOERROR response (no IPv6
-//! support end-to-end yet). Responses are cached in a small LRU keyed by
-//! `{domain}/{qtype}`.
+//! queries follow the fake-ip mode: enabled → empty NOERROR (the fake pool
+//! is v4-only, so a real AAAA would let apps bypass the proxy over v6);
+//! disabled → real resolution through the normal upstream chain, with
+//! upstream AAAA records passed through untouched. Responses are cached in
+//! a small LRU keyed by `{domain}/{qtype}`.
 //!
 //! Sub-modules:
 //! - [`wire`] — DNS wire-format parsing/building (pure functions).
@@ -49,7 +51,7 @@ use crate::rules::Rules;
 use doh::DohClient;
 use upstream::{Upstream, parse_upstream, parse_upstreams_ordered};
 use wire::{
-    apply_txn_id, build_empty_response, build_a_response,
+    apply_txn_id, build_a_response, build_aaaa_response, build_empty_response,
     build_refused_response, parse_dns_query, txn_id,
 };
 
@@ -112,9 +114,13 @@ pub struct DnsConfig {
 
     /// Static hosts table consulted before rules, cache and upstreams alike.
     /// Keys are domains (case-insensitive, trailing dot tolerated), values
-    /// are IPv4 addresses; `0.0.0.0` yields an unroutable answer (block
-    /// semantics). IPv6 values are ignored (anywhere answers AAAA empty).
-    /// Example: `hosts = { "nas.lan" = "192.168.50.10", "ads.x.com" = "0.0.0.0" }`
+    /// are IPv4 or IPv6 addresses: v4 values answer A queries, v6 values
+    /// answer AAAA queries, and a hit on the other family answers empty
+    /// NOERROR — that is what keeps the `0.0.0.0` / `::` block semantics
+    /// effective on both query types (an upstream lookup would leak a real
+    /// address of the other family).
+    /// Example: `hosts = { "nas.lan" = "192.168.50.10", "ads.x.com" =
+    /// "0.0.0.0", "v6.nas.lan" = "fd00::10" }`
     #[serde(default)]
     pub hosts: Option<HashMap<String, String>>,
 }
@@ -281,23 +287,51 @@ fn reject_plan_response(outbound_tag: &str, query: &[u8]) -> Option<Vec<u8>> {
         .flatten()
 }
 
-/// Case-insensitive static hosts lookup. Trailing dots in the query name
-/// (`"example.com."`) are tolerated; IPv6 values never match (there is no
-/// AAAA path yet).
+/// What the static hosts table answers for a query.
+#[derive(Debug, PartialEq, Eq)]
+enum HostsAnswer {
+    /// Answer A with the configured v4 value (`0.0.0.0` included — an
+    /// unroutable answer is the block semantics).
+    V4(std::net::Ipv4Addr),
+    /// Answer AAAA with the configured v6 value (`::` included — same
+    /// unroutable block semantics as `0.0.0.0` on the v4 side).
+    V6(std::net::Ipv6Addr),
+    /// The name has a hosts entry but it is pinned to the other address
+    /// family: answer NOERROR with zero answers instead of resolving
+    /// upstream — an upstream lookup would hand back a real address of
+    /// the other family and bypass a `0.0.0.0`/`::` block entry.
+    Empty,
+}
+
+/// Family-aware static hosts lookup: a v4 value answers A, a v6 value
+/// answers AAAA, and a hit on the opposite family is answered empty
+/// ([`HostsAnswer::Empty`]). Case-insensitive; trailing dots in the query
+/// name (`"example.com."`) are tolerated. `None` when the name is not in
+/// the table or the qtype is neither A nor AAAA (other qtypes fall through
+/// to normal resolution).
 fn hosts_lookup(
     hosts: Option<&HashMap<String, std::net::IpAddr>>, name: &str,
-) -> Option<std::net::Ipv4Addr> {
+    qtype: u16,
+) -> Option<HostsAnswer> {
     let hosts = hosts?;
     let key = name.trim_end_matches('.').to_ascii_lowercase();
-    match hosts.get(&key)? {
-        std::net::IpAddr::V4(v4) => Some(*v4),
-        std::net::IpAddr::V6(_) => None,
+    let ip = hosts.get(&key)?;
+    match (qtype, ip) {
+        (1, std::net::IpAddr::V4(v4)) => Some(HostsAnswer::V4(*v4)),
+        (28, std::net::IpAddr::V6(v6)) => Some(HostsAnswer::V6(*v6)),
+        // Hit on the other family: the entry is the complete answer set
+        // for the name, so never fall through to upstream.
+        (1, std::net::IpAddr::V6(_)) | (28, std::net::IpAddr::V4(_)) => {
+            Some(HostsAnswer::Empty)
+        },
+        _ => None,
     }
 }
 
 /// Normalize a configured hosts table: lowercase keys, parse values to IPs.
-/// Invalid values and IPv6 addresses (anywhere answers AAAA empty) are
-/// skipped with a warning; an all-invalid table yields an empty map.
+/// Both families are kept — v4 values answer A, v6 values answer AAAA
+/// (`0.0.0.0`/`::` keep their unroutable block semantics). Invalid values
+/// are skipped with a warning; an all-invalid table yields an empty map.
 fn parse_hosts_table(
     map: &HashMap<String, String>,
 ) -> HashMap<String, std::net::IpAddr> {
@@ -305,13 +339,8 @@ fn parse_hosts_table(
     for (name, value) in map {
         let key = name.trim().trim_end_matches('.').to_ascii_lowercase();
         match value.trim().parse::<std::net::IpAddr>() {
-            Ok(ip @ std::net::IpAddr::V4(_)) => {
+            Ok(ip) => {
                 out.insert(key, ip);
-            },
-            Ok(std::net::IpAddr::V6(_)) => {
-                log::warn!(
-                    "DNS hosts: {key} → {value} ignored (IPv6 not supported yet)"
-                );
             },
             Err(_) => {
                 log::warn!("DNS hosts: {key} → {value} ignored (invalid IP)");
@@ -328,6 +357,18 @@ fn parse_hosts_table(
 /// DoH.
 fn proxy_plan_cannot_answer_svcb(qtype: u16, outbound_tag: &str) -> bool {
     qtype == 65 && outbound_tag != "direct"
+}
+
+/// AAAA query policy: under fake-ip mode AAAA is answered with an empty
+/// NOERROR (0 answers) — the fake pool is v4-only, so a real AAAA would
+/// hand applications a routable v6 that bypasses the TUN entirely (Happy
+/// Eyeballs prefers v6); sing-box/clash answer empty AAAA in fake-ip mode
+/// too. With fake-ip off (redir-host) AAAA resolves through the normal
+/// upstream chain like A does; the passthrough paths (DoH / plain UDP /
+/// proxy relay) are raw byte relays, so upstream AAAA records pass through
+/// untouched (only `apply_txn_id` rewrites bytes, record-type agnostic).
+fn aaaa_short_circuit(fakeip_enabled: bool, qtype: u16) -> bool {
+    qtype == 28 && fakeip_enabled
 }
 
 /// DNS hijack handler. One instance per TUN inbound, shared by reference.
@@ -471,8 +512,9 @@ impl DnsHijack {
         };
 
         // Static hosts table: normalize keys to lowercase (DNS names are
-        // case-insensitive) and parse values to IPs. Invalid and IPv6 values
-        // are skipped with a warning (anywhere answers AAAA empty today).
+        // case-insensitive) and parse values to IPs. Both families are
+        // kept (v4 answers A, v6 answers AAAA); invalid values are skipped
+        // with a warning.
         let hosts = config
             .hosts
             .as_ref()
@@ -548,25 +590,49 @@ impl DnsHijack {
             src_ip
         );
 
-        // AAAA -> empty answer (no v6 end-to-end yet).
-        if q.qtype == 28 {
-            log::debug!("DNS resolve: {} type AAAA -> empty (no v6)", q.name);
+        // Static hosts table wins over fake-ip mode, local-direct mode,
+        // rules, cache and upstreams alike (its whole point is to override
+        // resolution). A v4 value answers A, a v6 value answers AAAA, and
+        // a hit on the other family answers empty so a `0.0.0.0`/`::`
+        // block entry can't leak a real address from upstream.
+        match hosts_lookup(self.hosts.as_ref(), &q.name, q.qtype) {
+            Some(HostsAnswer::V4(ip)) => {
+                self.reverse_cache
+                    .insert(IpAddr::V4(ip), q.name.clone())
+                    .await;
+                log::debug!("DNS: {} (type {}) → hosts {}", q.name, q.qtype, ip);
+                return build_a_response(query, ip);
+            },
+            Some(HostsAnswer::V6(ip)) => {
+                // No reverse-cache insert: the reverse map is v4-keyed and
+                // TUN cannot carry v6 packets yet (ipv6-plan Phase 2).
+                log::debug!("DNS: {} (type {}) → hosts {}", q.name, q.qtype, ip);
+                return build_aaaa_response(query, ip);
+            },
+            Some(HostsAnswer::Empty) => {
+                log::debug!(
+                    "DNS: {} (type {}) → hosts {}-only, empty answer",
+                    q.name,
+                    q.qtype,
+                    if q.qtype == 1 { "v6" } else { "v4" }
+                );
+                return build_empty_response(query);
+            },
+            None => {},
+        }
+
+        // fake-ip mode answers AAAA empty (see `aaaa_short_circuit` for
+        // why); with fake-ip off the query falls through to the normal
+        // upstream chain below and AAAA records pass through untouched.
+        if aaaa_short_circuit(self.fakeip.is_some(), q.qtype) {
+            log::debug!(
+                "DNS resolve: {} type AAAA -> empty (fake-ip mode)",
+                q.name
+            );
             return build_empty_response(query);
         }
 
         let cache_key_base = format!("{}/{}", q.name, q.qtype);
-
-        // Static hosts table wins over local-direct mode, rules, cache and
-        // upstreams alike (its whole point is to override resolution).
-        if q.qtype == 1
-            && let Some(ip) = hosts_lookup(self.hosts.as_ref(), &q.name)
-        {
-            self.reverse_cache
-                .insert(IpAddr::V4(ip), q.name.clone())
-                .await;
-            log::debug!("DNS: {} (type {}) → hosts {}", q.name, q.qtype, ip);
-            return build_a_response(query, ip);
-        }
 
         // Local-direct mode: queries from the router itself (127.0.0.1)
         // skip rule matching and go directly to the direct upstream.
@@ -1162,21 +1228,92 @@ mod tests {
         let cfg: DnsConfig = toml::from_str(toml).unwrap();
         let hosts = cfg.hosts.expect("hosts table must parse");
 
-        // Normalization: lowercase keys, parsed IPs, invalid/v6 dropped.
+        // Normalization: lowercase keys, parsed IPs (both families kept),
+        // invalid values dropped.
         let parsed = parse_hosts_table(&hosts);
-        assert_eq!(parsed.len(), 2, "invalid and IPv6 entries must be dropped");
+        assert_eq!(parsed.len(), 3, "invalid entries must be dropped");
 
         // Exact hit, case-insensitive, trailing dot tolerated.
         assert_eq!(
-            hosts_lookup(Some(&parsed), "NAS.LAN"),
-            Some(std::net::Ipv4Addr::new(192, 168, 50, 10))
+            hosts_lookup(Some(&parsed), "NAS.LAN", 1),
+            Some(HostsAnswer::V4(std::net::Ipv4Addr::new(192, 168, 50, 10)))
         );
         assert_eq!(
-            hosts_lookup(Some(&parsed), "ads.x.com."),
-            Some(std::net::Ipv4Addr::new(0, 0, 0, 0))
+            hosts_lookup(Some(&parsed), "ads.x.com.", 1),
+            Some(HostsAnswer::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)))
         );
-        assert!(hosts_lookup(Some(&parsed), "other.lan").is_none());
-        assert!(hosts_lookup(None, "nas.lan").is_none());
+        assert!(hosts_lookup(Some(&parsed), "other.lan", 1).is_none());
+        assert!(hosts_lookup(None, "nas.lan", 1).is_none());
+    }
+
+    #[test]
+    fn hosts_lookup_serves_both_families() {
+        let mut table = HashMap::new();
+        for (name, value) in [
+            ("v4.lan", "192.168.50.10"),
+            ("v6.lan", "fd00:1986::10"),
+            ("block4.lan", "0.0.0.0"),
+            ("block6.lan", "::"),
+        ] {
+            table.insert(name.to_string(), value.parse::<IpAddr>().unwrap());
+        }
+
+        // v4 value answers A, v6 value answers AAAA; `0.0.0.0`/`::` keep
+        // their unroutable block semantics on their own family.
+        assert_eq!(
+            hosts_lookup(Some(&table), "v4.lan", 1),
+            Some(HostsAnswer::V4(std::net::Ipv4Addr::new(192, 168, 50, 10)))
+        );
+        assert_eq!(
+            hosts_lookup(Some(&table), "v6.lan", 28),
+            Some(HostsAnswer::V6(
+                "fd00:1986::10".parse::<std::net::Ipv6Addr>().unwrap()
+            ))
+        );
+        assert_eq!(
+            hosts_lookup(Some(&table), "block4.lan", 1),
+            Some(HostsAnswer::V4(std::net::Ipv4Addr::UNSPECIFIED))
+        );
+        assert_eq!(
+            hosts_lookup(Some(&table), "block6.lan", 28),
+            Some(HostsAnswer::V6(std::net::Ipv6Addr::UNSPECIFIED))
+        );
+
+        // A hit on the other family answers empty instead of resolving
+        // upstream — otherwise a block entry would leak a real address of
+        // the other family.
+        assert_eq!(
+            hosts_lookup(Some(&table), "v4.lan", 28),
+            Some(HostsAnswer::Empty)
+        );
+        assert_eq!(
+            hosts_lookup(Some(&table), "v6.lan", 1),
+            Some(HostsAnswer::Empty)
+        );
+
+        // Non-address qtypes never get a hosts answer.
+        assert!(hosts_lookup(Some(&table), "v4.lan", 65).is_none());
+    }
+
+    #[test]
+    fn aaaa_queries_short_circuit_only_under_fakeip() {
+        // fake-ip on: AAAA → empty NOERROR (v4-only fake pool; a real AAAA
+        // would bypass the proxy over v6). fake-ip off: AAAA falls through
+        // to the upstream chain. Every other qtype keeps its own path.
+        for (fakeip, qtype, want) in [
+            (true, 28u16, true),
+            (true, 1u16, false),
+            (true, 65u16, false),
+            (false, 28, false),
+            (false, 1, false),
+            (false, 65, false),
+        ] {
+            assert_eq!(
+                aaaa_short_circuit(fakeip, qtype),
+                want,
+                "fakeip={fakeip} qtype={qtype}"
+            );
+        }
     }
 
     #[test]
@@ -1187,6 +1324,27 @@ mod tests {
         let ips: Vec<std::net::Ipv4Addr> =
             parse_a_records(&resp).into_iter().map(|(ip, _)| ip).collect();
         assert_eq!(ips, vec![std::net::Ipv4Addr::new(192, 168, 50, 10)]);
+    }
+
+    #[test]
+    fn hosts_aaaa_answer_wire_format_resolves_query_name() {
+        let query = wire::build_dns_query("v6.lan", 28);
+        let ip = std::net::Ipv6Addr::new(0xfd00, 0x1986, 0, 0, 0, 0, 0, 10);
+        let resp =
+            build_aaaa_response(&query, ip).expect("AAAA response must build");
+
+        // Question section echoed (txn id and question bytes); the single
+        // answer carries TYPE=28, RDLENGTH=16 and the configured address.
+        assert_eq!(&resp[..2], &query[..2]);
+        assert_eq!(&resp[12..query.len()], &query[12..]);
+        let answer = &resp[query.len()..];
+        assert_eq!(
+            &answer[..2], &[0xC0, 0x0C],
+            "answer name must be a pointer"
+        );
+        assert_eq!(&answer[2..4], &[0x00, 0x1C], "TYPE must be AAAA (28)");
+        assert_eq!(&answer[10..12], &[0x00, 0x10], "RDLENGTH must be 16");
+        assert_eq!(&answer[12..28], &ip.octets());
     }
 
     #[test]
