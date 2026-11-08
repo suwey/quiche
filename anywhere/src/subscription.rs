@@ -9,7 +9,8 @@
 //!
 //! Supported outbound types (converted to anywhere TOML):
 //! - `ss` / `shadowsocks`  → `[[outbounds]] type = "shadowsocks"`
-//! - `anytls`              → `[[outbounds]] type = "anytls"`
+//! - `anytls`              → `[[outbounds]] type = "anytls"` (Clash proxies
+//!   and `anytls://` share links)
 //! - `vless`               → `[[outbounds]] type = "vless"` (WS transport, or
 //!   the REALITY transport when the source carries REALITY params:
 //!   `security=reality&pbk=&sid=` in URIs, Clash `reality-opts`, sing-box
@@ -1273,9 +1274,11 @@ fn parse_uri_list(
         } else if let Some(uri) = line.strip_prefix("trojan://") {
             let _ = uri;
             skips.push("trojan".to_string());
-        } else if line.starts_with("anytls://") {
-            // anytls URI scheme — parse if possible
-            skips.push("anytls-uri".to_string());
+        } else if let Some(ob) = line
+            .strip_prefix("anytls://")
+            .and_then(|uri| parse_anytls_uri(uri, &mut idx))
+        {
+            outbounds.push(ob);
         }
     }
 
@@ -1479,6 +1482,68 @@ fn parse_vless_uri(uri: &str, idx: &mut usize) -> Option<TomlOutbound> {
     Some(ob)
 }
 
+/// Parse `anytls://` URI (sing-box share-link scheme).
+///
+/// Format: `anytls://<password>@<host>:<port>?<params>#<name>` with the
+/// optional query params `sni=` and `insecure=1` (same field mapping as
+/// [`parse_clash_anytls`]); unknown params are ignored. Returns `None` when
+/// the mandatory parts (`password@host:port`) are missing.
+fn parse_anytls_uri(uri: &str, idx: &mut usize) -> Option<TomlOutbound> {
+    let (password, rest) = uri.split_once('@')?;
+    // Split off name fragment
+    let (rest, name) = rest
+        .split_once('#')
+        .unwrap_or((rest, ""));
+    // Split off query params
+    let (hostport, query) = rest
+        .split_once('?')
+        .map(|(r, q)| (r, Some(q)))
+        .unwrap_or((rest, None));
+
+    let hostport = hostport.trim();
+    if hostport.is_empty() {
+        return None;
+    }
+    let name = name.trim();
+    let name = if name.is_empty() {
+        *idx += 1;
+        format!("anytls-{}", idx)
+    } else {
+        urlencoding::decode(name)
+            .map(|s| s.into_owned())
+            .unwrap_or_else(|_| name.to_string())
+    };
+    let password = urlencoding::decode(password)
+        .map(|s| s.into_owned())
+        .unwrap_or_else(|_| password.to_string());
+    if password.is_empty() {
+        return None;
+    }
+
+    let mut ob = TomlOutbound::new("anytls", &name)
+        .field("server", hostport)
+        .field("password", password);
+
+    if let Some(q) = query {
+        for param in q.split('&') {
+            if let Some(val) = param.strip_prefix("sni=") {
+                ob = ob.field(
+                    "sni",
+                    urlencoding::decode(val)
+                        .map(|s| s.into_owned())
+                        .unwrap_or_else(|_| val.to_string()),
+                );
+            } else if let Some(val) = param.strip_prefix("insecure=")
+                && (val == "1" || val.eq_ignore_ascii_case("true"))
+            {
+                ob = ob.field("insecure", true);
+            }
+        }
+    }
+
+    Some(ob)
+}
+
 // ---------------------------------------------------------------------------
 // Main entry point (called from main.rs when --sub is given)
 // ---------------------------------------------------------------------------
@@ -1625,5 +1690,69 @@ mod tests {
 
         assert_eq!(map_rule_target("NopeGroup", &valid_refs, &mut skips), None);
         assert_eq!(skips, vec!["rule-target:NopeGroup".to_string()]);
+    }
+
+    /// Field helper: pull a scalar field out of a parsed TomlOutbound.
+    fn field<'a>(ob: &'a TomlOutbound, key: &str) -> Option<&'a TomlValue> {
+        ob.fields
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v)
+    }
+
+    #[test]
+    fn anytls_uri_full_parse() {
+        let mut idx = 0;
+        let ob = parse_anytls_uri(
+            "pw%40ss@1.2.3.4:8443?sni=example.com&insecure=1#My%20Node",
+            &mut idx,
+        )
+        .expect("full anytls URI must parse");
+        assert_eq!(ob.type_, "anytls");
+        assert_eq!(ob.tag, "My Node");
+        assert!(matches!(
+            field(&ob, "server"),
+            Some(TomlValue::Str(s)) if s == "1.2.3.4:8443"
+        ));
+        assert!(matches!(
+            field(&ob, "password"),
+            Some(TomlValue::Str(s)) if s == "pw@ss"
+        ));
+        assert!(matches!(
+            field(&ob, "sni"),
+            Some(TomlValue::Str(s)) if s == "example.com"
+        ));
+        assert!(matches!(field(&ob, "insecure"), Some(TomlValue::Bool(true))));
+    }
+
+    #[test]
+    fn anytls_uri_minimal_gets_autoname() {
+        let mut idx = 7;
+        let ob = parse_anytls_uri("pass@host.example:443", &mut idx)
+            .expect("minimal anytls URI must parse");
+        assert_eq!(ob.tag, "anytls-8");
+        assert!(field(&ob, "sni").is_none());
+        assert!(field(&ob, "insecure").is_none());
+    }
+
+    #[test]
+    fn anytls_uri_missing_parts_are_dropped() {
+        let mut idx = 0;
+        assert!(parse_anytls_uri("@host:443", &mut idx).is_none());
+        assert!(parse_anytls_uri("pass@", &mut idx).is_none());
+        assert!(parse_anytls_uri("pass", &mut idx).is_none());
+    }
+
+    #[test]
+    fn uri_list_parses_anytls_and_skips_vmess() {
+        let list = "anytls://pass@1.2.3.4:8443?sni=a.com#n1\n\
+                    vmess://eyJhZGQiOiJleGFtcGxlIn0=\n";
+        let mut skips = Vec::new();
+        let out =
+            parse_uri_list(list, &mut skips).expect("uri list must parse");
+        assert_eq!(out.len(), 1, "vmess must be skipped, anytls parsed");
+        assert_eq!(out[0].type_, "anytls");
+        assert_eq!(out[0].tag, "n1");
+        assert_eq!(skips, vec!["vmess".to_string()]);
     }
 }
