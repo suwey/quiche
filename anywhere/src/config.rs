@@ -98,6 +98,20 @@ pub struct InboundConfig {
     #[serde(default)]
     pub bypass_lan_ifaces: Option<Vec<String>>,
 
+    /// Android per-app VPN filter: when non-empty, ONLY these packages'
+    /// traffic enters the TUN (`VpnService.addAllowedApplication`). The
+    /// excluded-by-omission apps keep using the physical network directly.
+    /// Mutually exclusive with `exclude_package`; ignored outside Android.
+    #[serde(default)]
+    pub include_package: Option<Vec<String>>,
+
+    /// Android per-app VPN filter: these packages' traffic bypasses the VPN
+    /// entirely (`VpnService.addDisallowedApplication`) — it never reaches
+    /// the TUN, so routing rules never see it. Mutually exclusive with
+    /// `include_package`; ignored outside Android.
+    #[serde(default)]
+    pub exclude_package: Option<Vec<String>>,
+
     /// Custom padding scheme text for anytls inbound (optional).
     #[serde(default)]
     pub padding_scheme: Option<String>,
@@ -549,5 +563,34 @@ fn resolve_path(base: &std::path::Path, path: &mut Option<String>) {
         if p_path.is_relative() {
             *p = base.join(p_path).to_string_lossy().to_string();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The Android per-app filter fields parse from the tun inbound and stay
+    /// optional — every other platform's config has neither field.
+    #[test]
+    fn package_filter_fields_parse_from_tun_inbound() {
+        let config = Config::from_string(
+            "[[inbounds]]\n\
+             type = \"tun\"\n\
+             include_package = [\"com.example.app\", \"com.example.net\"]\n\
+             [[inbounds]]\n\
+             type = \"tun\"\n",
+        )
+        .unwrap();
+        assert_eq!(config.inbounds.len(), 2);
+        assert_eq!(
+            config.inbounds[0].include_package.as_deref(),
+            Some(&["com.example.app".to_string(), "com.example.net".to_string()][..])
+        );
+        assert!(config.inbounds[0].exclude_package.is_none());
+        // A tun inbound without the fields (every non-Android config) parses
+        // with both unset.
+        assert!(config.inbounds[1].include_package.is_none());
+        assert!(config.inbounds[1].exclude_package.is_none());
     }
 }

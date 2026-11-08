@@ -4,6 +4,13 @@ secret = "admin"
 [[inbounds]]
 type = "tun"
 tag = "tun-in"
+# Android 分应用分流（VpnService 层，两者互斥只能设其一）：
+# include_package = ["com.example.app"]  # 仅这些应用的流量进 VPN
+# exclude_package = ["com.bank.app"]     # 这些应用的流量绕过 VPN 直连
+
+# DNS 静态 hosts 表（优先于规则/缓存/上游；0.0.0.0 = 屏蔽）：
+# [dns]
+# hosts = { "nas.lan" = "192.168.50.10", "ads.example.com" = "0.0.0.0" }
 
 [[outbounds]]
 type = "mless"

@@ -145,6 +145,19 @@ impl TunConfig {
         }
         let auto_route = cfg.auto_route;
 
+        // Per-app VPN filtering is applied by the Android shell
+        // (VpnService.addAllowedApplication/addDisallowedApplication) before
+        // the TUN fd is ever created — the engine never sees excluded apps'
+        // traffic. Elsewhere the fields have no meaning; say so once.
+        if !cfg!(target_os = "android")
+            && (cfg.include_package.is_some() || cfg.exclude_package.is_some())
+        {
+            log::warn!(
+                "tun: include_package/exclude_package only apply to the \
+                 Android VPN layer — ignored on this platform"
+            );
+        }
+
         let mtu = cfg.mtu.unwrap_or(1500);
 
         let name = cfg.name.clone().unwrap_or_else(|| "tun0".to_string());

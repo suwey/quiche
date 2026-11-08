@@ -119,6 +119,22 @@ class ProxyVpnService : VpnService() {
         }.start()
         prefetchLatch.await(60, java.util.concurrent.TimeUnit.SECONDS)
 
+        // Apply per-app VPN filtering (include_package/exclude_package) to
+        // the builder BEFORE establishing the tunnel. Failures (unknown
+        // package, both lists set) must not crash the service — surface them
+        // through engine_status.json like every other pre-engine error.
+        try {
+            applyPackageFilter(builder, config)
+        } catch (e: Exception) {
+            Log.e(TAG, "Per-app package filter failed", e)
+            writeEngineStatus(
+                running = false,
+                errors = listOf("分应用配置错误: ${e.message}")
+            )
+            stopSelf()
+            return
+        }
+
         // Establish the VPN tunnel AFTER geo rules are cached.
         tunFd = builder.establish()
         if (tunFd == null) {
@@ -453,6 +469,54 @@ class ProxyVpnService : VpnService() {
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to pre-download geo rule $url", e)
             }
+        }
+    }
+
+    /**
+     * Extract a string-array TOML field from the config text, e.g.
+     * `include_package = ["com.a", "com.b"]` (single- or multi-line arrays,
+     * quoted items). Returns an empty list when the field is absent.
+     *
+     * Same lightweight-regex approach as [prefetchGeoRules] for `geo_url` —
+     * the Kotlin side never parses the full TOML, it only pre-reads the few
+     * fields that must be known BEFORE `establish()`.
+     */
+    private fun tomlStringArray(config: String, key: String): List<String> {
+        val arrayRegex = Regex("""(?s)\b$key\s*=\s*\[([^\]]*)\]""")
+        val inner = arrayRegex.find(config)?.groupValues?.get(1) ?: return emptyList()
+        val itemRegex = Regex("""["']([^"']+)["']""")
+        return itemRegex.findAll(inner).map { it.groupValues[1] }.toList()
+    }
+
+    /**
+     * Apply the Android per-app VPN filter ([inbounds.tun]
+     * include_package / exclude_package) to the VPN builder, BEFORE
+     * establish():
+     *
+     *  - include_package → addAllowedApplication: ONLY these apps' traffic
+     *    enters the TUN; every other app keeps using the physical network.
+     *  - exclude_package → addDisallowedApplication: these apps' traffic
+     *    bypasses the VPN entirely and never reaches the Rust engine.
+     *
+     * The two lists are mutually exclusive (VpnService enforces the same
+     * rule). Unknown package names make the Builder throw with the package
+     * name in the message — the caller surfaces that to engine_status.json.
+     */
+    private fun applyPackageFilter(builder: Builder, config: String) {
+        val include = tomlStringArray(config, "include_package")
+        val exclude = tomlStringArray(config, "exclude_package")
+        if (include.isNotEmpty() && exclude.isNotEmpty()) {
+            throw IllegalStateException(
+                "include_package 与 exclude_package 不能同时设置（Android VpnService 限制）"
+            )
+        }
+        for (pkg in include) {
+            Log.i(TAG, "VPN include package: $pkg")
+            builder.addAllowedApplication(pkg)
+        }
+        for (pkg in exclude) {
+            Log.i(TAG, "VPN exclude package: $pkg")
+            builder.addDisallowedApplication(pkg)
         }
     }
 
