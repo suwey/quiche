@@ -203,7 +203,14 @@ pub struct MlessMultiplexer {
     unanswered_streak: AtomicU32,
     /// Shared pool throttle for streak-driven retirements.
     pool_gate: Arc<PoolRetireGate>,
+    /// Claimed by `claim_dead_slot` while a reconnect for this tunnel is in
+    /// flight. Held as a guard by whoever claimed it, so caller cancellation
+    /// releases it instead of wedging the slot (see `ReconnectGuard`).
     pub(crate) reconnecting: AtomicBool,
+    /// When `reconnecting` was claimed (`Some` only while the flag is set).
+    /// The pool keepalive force-releases a claim that outlived every sane
+    /// reconnect duration — defense in depth against a leaked flag.
+    pub(crate) reconnecting_since: Mutex<Option<Instant>>,
     /// Pool-wide wake-up signal: fired whenever this tunnel dies so the
     /// keepalive task reconnects immediately instead of waiting out its
     /// 10 s poll (a full-pool EOF otherwise blackholes traffic for ~15 s).
@@ -289,6 +296,7 @@ impl MlessMultiplexer {
             unanswered_streak: AtomicU32::new(0),
             pool_gate,
             reconnecting: AtomicBool::new(false),
+            reconnecting_since: Mutex::new(None),
             disconnect_signal,
             unanswered_recent: Mutex::new(VecDeque::new()),
             self_closed_recent: Mutex::new(VecDeque::new()),
@@ -336,6 +344,39 @@ impl MlessMultiplexer {
             );
         }
         Some((stream_id, rx))
+    }
+
+    /// Test-only constructor: a multiplexer with no transport wired up.
+    /// Lives on the impl (not in `mod tests`) because the struct has private
+    /// fields and sibling modules' tests need to build instances too.
+    #[cfg(test)]
+    pub(crate) fn test_mux(
+        slot: usize, max_streams: usize, gate: Arc<PoolRetireGate>,
+    ) -> (Arc<Self>, mpsc::UnboundedReceiver<MlessMessage>) {
+        let (ws_tx, ws_rx) = mpsc::unbounded_channel();
+        let mux = Arc::new(Self {
+            slot,
+            inner: Mutex::new(MlessMultiplexerInner {
+                streams: HashMap::new(),
+                active_streams: std::collections::HashSet::new(),
+            }),
+            ws_tx,
+            stream_slots: (max_streams > 0)
+                .then(|| Arc::new(Semaphore::new(max_streams))),
+            capacity_notify: Arc::new(Notify::new()),
+            disconnected: Notify::new(),
+            next_stream_id: AtomicU64::new(1),
+            dead: AtomicBool::new(false),
+            reject_count: AtomicU32::new(0),
+            unanswered_streak: AtomicU32::new(0),
+            pool_gate: gate,
+            reconnecting: AtomicBool::new(false),
+            reconnecting_since: Mutex::new(None),
+            disconnect_signal: Arc::new(Notify::new()),
+            unanswered_recent: Mutex::new(VecDeque::new()),
+            self_closed_recent: Mutex::new(VecDeque::new()),
+        });
+        (mux, ws_rx)
     }
 
     pub fn close_stream(&self, stream_id: u64) {
@@ -854,29 +895,7 @@ mod tests {
     fn build_mux(
         max_streams: usize, gate: Arc<PoolRetireGate>,
     ) -> (Arc<MlessMultiplexer>, mpsc::UnboundedReceiver<MlessMessage>) {
-        let (ws_tx, ws_rx) = mpsc::unbounded_channel();
-        let mux = Arc::new(MlessMultiplexer {
-            slot: 1,
-            inner: Mutex::new(MlessMultiplexerInner {
-                streams: HashMap::new(),
-                active_streams: std::collections::HashSet::new(),
-            }),
-            ws_tx,
-            stream_slots: (max_streams > 0)
-                .then(|| Arc::new(Semaphore::new(max_streams))),
-            capacity_notify: Arc::new(Notify::new()),
-            disconnected: Notify::new(),
-            next_stream_id: AtomicU64::new(1),
-            dead: AtomicBool::new(false),
-            reject_count: AtomicU32::new(0),
-            unanswered_streak: AtomicU32::new(0),
-            pool_gate: gate,
-            reconnecting: AtomicBool::new(false),
-            disconnect_signal: Arc::new(Notify::new()),
-            unanswered_recent: Mutex::new(VecDeque::new()),
-            self_closed_recent: Mutex::new(VecDeque::new()),
-        });
-        (mux, ws_rx)
+        MlessMultiplexer::test_mux(1, max_streams, gate)
     }
 
     fn multiplexer_with_rx(

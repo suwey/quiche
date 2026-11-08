@@ -6,6 +6,7 @@
 use std::sync::Arc;
 use std::sync::Weak;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::time::Instant;
 
 use async_trait::async_trait;
 use tokio::sync::Notify;
@@ -76,6 +77,45 @@ struct MuxSlot {
 fn with_hslot_marker(path: &str, slot: usize) -> String {
     let sep = if path.contains('?') { '&' } else { '?' };
     format!("{path}{sep}_hslot={slot}")
+}
+
+/// Longest a dial waits inside `open_stream` for the pool to yield a live
+/// slot — covering both "a reconnect is in flight" and "pool at stream
+/// capacity". Bounds the 2026-11-07 failure mode where leaked
+/// `reconnecting` claims kept every dial spinning on the 200 ms poll with
+/// no timeout, no log and no recovery until the process was restarted.
+const OPEN_STREAM_MAX_WAIT: std::time::Duration =
+    std::time::Duration::from_secs(30);
+
+/// A `reconnecting` claim legitimately spans at most one 30 s backoff plus
+/// one bounded connect (`TCP_CONNECT_TIMEOUT` = 5 s plus the TLS/WS
+/// upgrade), so a claim older than this means the flag leaked anyway — the
+/// keepalive force-releases it before the pool wedges permanently.
+const RECONNECT_STUCK_AFTER: std::time::Duration =
+    std::time::Duration::from_secs(120);
+
+/// Owes the release of one `reconnecting` claim.
+///
+/// `claim_dead_slot` flips the slot's `reconnecting` flag with `swap(true)`,
+/// and the flag used to be cleared only when `reconnect_slot` finished. But
+/// `reconnect_slot` is awaited inline inside arbitrary caller tasks —
+/// urltest probes wrap `dial` in a 5 s timeout, relay tasks are dropped on
+/// client disconnect — so any cancellation between claim and completion
+/// leaked `reconnecting == true` forever. The slot became unclaimable, and
+/// once every slot had been wedged that way, dials hung with no error and
+/// no log: the 2026-11-07 outage (five probe timeouts wedged all five
+/// slots between 16:11 and 16:21; proxy dead until the 00:16 restart) is
+/// exactly this chain. Dropping the guard — on completion, on failure, or
+/// on cancellation — always releases the flag.
+struct ReconnectGuard {
+    mux: Arc<MlessMultiplexer>,
+}
+
+impl Drop for ReconnectGuard {
+    fn drop(&mut self) {
+        self.mux.reconnecting.store(false, Ordering::Release);
+        *self.mux.reconnecting_since.lock() = None;
+    }
 }
 
 impl MlessOutboundClient {
@@ -330,7 +370,7 @@ impl MlessOutboundClient {
         None
     }
 
-    async fn claim_dead_slot(&self) -> (Option<usize>, bool) {
+    async fn claim_dead_slot(&self) -> (Option<(usize, ReconnectGuard)>, bool) {
         let pool = self.pool.lock().await;
         let mut has_reconnecting = false;
         for (idx, slot) in pool.iter().enumerate() {
@@ -342,7 +382,11 @@ impl MlessOutboundClient {
                 continue;
             }
             if !slot.mux.reconnecting.swap(true, Ordering::Acquire) {
-                return (Some(idx), has_reconnecting);
+                *slot.mux.reconnecting_since.lock() = Some(Instant::now());
+                let guard = ReconnectGuard {
+                    mux: Arc::clone(&slot.mux),
+                };
+                return (Some((idx, guard)), has_reconnecting);
             }
             has_reconnecting = true;
         }
@@ -350,11 +394,14 @@ impl MlessOutboundClient {
     }
 
     async fn reconnect_slot(&self, idx: usize) -> Option<Arc<MlessMultiplexer>> {
-        let (fails, conn_mgr) = {
+        let (fails, conn_mgr, claimed_mux) = {
             let pool = self.pool.lock().await;
-            let fails =
-                pool[idx].consecutive_fails.fetch_add(1, Ordering::Relaxed);
-            (fails, pool[idx].conn_mgr.clone())
+            let slot = &pool[idx];
+            (
+                slot.consecutive_fails.fetch_add(1, Ordering::Relaxed),
+                slot.conn_mgr.clone(),
+                Arc::clone(&slot.mux),
+            )
         };
         let delay_secs = (2u64).pow(fails.min(5)).min(30);
         let slot = idx + 1;
@@ -380,23 +427,35 @@ impl MlessOutboundClient {
         let new_mux = result.ok();
 
         let mut pool = self.pool.lock().await;
-        pool[idx].mux.reconnecting.store(false, Ordering::Release);
-
-        if let Some(new_mux) = new_mux {
-            pool[idx].consecutive_fails.store(0, Ordering::Relaxed);
-            pool[idx].mux = new_mux.clone();
-            drop(pool);
-            log::info!(
-                "{}: [slot {slot}] pool reconnected",
-                self.log_tag()
+        // Install only if the slot still holds the mux this reconnect was
+        // claimed against: a stale claim (force-released by the keepalive
+        // stuck-claim watchdog, then re-claimed) must not clobber a newer
+        // tunnel with an older one.
+        if !Arc::ptr_eq(&pool[idx].mux, &claimed_mux) {
+            log::debug!(
+                "{}: [slot {slot}] reconnect attempt stale, slot already revived",
+                self.log_tag(),
             );
-            Some(new_mux)
-        } else {
-            log::warn!(
-                "{}: [slot {slot}] pool reconnect failed",
-                self.log_tag()
-            );
-            None
+            return None;
+        }
+        match new_mux {
+            Some(new_mux) => {
+                pool[idx].consecutive_fails.store(0, Ordering::Relaxed);
+                pool[idx].mux = new_mux.clone();
+                drop(pool);
+                log::info!(
+                    "{}: [slot {slot}] pool reconnected",
+                    self.log_tag()
+                );
+                Some(new_mux)
+            },
+            None => {
+                log::warn!(
+                    "{}: [slot {slot}] pool reconnect failed",
+                    self.log_tag()
+                );
+                None
+            },
         }
     }
 
@@ -425,10 +484,39 @@ impl MlessOutboundClient {
                     ) => {},
                     _ = client.wiring.disconnect_signal.notified() => {},
                 }
-                let mut dead: Vec<usize> = Vec::new();
+                // Defense in depth: the claim guard makes a leaked
+                // `reconnecting` flag unreachable, but if some future change
+                // breaks that invariant the pool would wedge exactly like
+                // the 2026-11-07 outage. Force-release any claim older than
+                // `RECONNECT_STUCK_AFTER` instead of letting the slot stay
+                // unclaimable forever.
+                {
+                    let pool = client.pool.lock().await;
+                    for (idx, slot) in pool.iter().enumerate() {
+                        if !slot.mux.reconnecting.load(Ordering::Acquire) {
+                            continue;
+                        }
+                        let Some(since) = *slot.mux.reconnecting_since.lock()
+                        else {
+                            continue;
+                        };
+                        let held = since.elapsed();
+                        if held < RECONNECT_STUCK_AFTER {
+                            continue;
+                        }
+                        log::warn!(
+                            "{}: [slot {}] reconnecting claim held for {held:?}, force-releasing (stuck claim?)",
+                            client.log_tag(),
+                            idx + 1,
+                        );
+                        slot.mux.reconnecting.store(false, Ordering::Release);
+                        *slot.mux.reconnecting_since.lock() = None;
+                    }
+                }
+                let mut dead: Vec<(usize, ReconnectGuard)> = Vec::new();
                 while dead.len() < client.pool_size {
                     match client.claim_dead_slot().await.0 {
-                        Some(idx) => dead.push(idx),
+                        Some(claimed) => dead.push(claimed),
                         None => break,
                     }
                 }
@@ -437,18 +525,27 @@ impl MlessOutboundClient {
                 // loop left the last slot down for ~20 s. The jitter also
                 // stops the replacements from sharing a birth time, which is
                 // what made them all get recycled together again.
-                futures_util::future::join_all(dead.into_iter().map(|idx| {
-                    let client = Arc::clone(&client);
-                    async move {
-                        let jitter =
-                            crate::obfuscation::range::rand_range(0, 4_000);
-                        tokio::time::sleep(
-                            std::time::Duration::from_millis(jitter as u64),
-                        )
-                        .await;
-                        client.reconnect_slot(idx).await;
-                    }
-                }))
+                futures_util::future::join_all(dead.into_iter().map(
+                    |(idx, guard)| {
+                        let client = Arc::clone(&client);
+                        async move {
+                            // The claim guard rides with this future: whether
+                            // the reconnect completes, fails, or the whole
+                            // task is torn down, the flag is released exactly
+                            // once.
+                            let _guard = guard;
+                            let jitter =
+                                crate::obfuscation::range::rand_range(0, 4_000);
+                            tokio::time::sleep(
+                                std::time::Duration::from_millis(
+                                    jitter as u64,
+                                ),
+                            )
+                            .await;
+                            client.reconnect_slot(idx).await;
+                        }
+                    },
+                ))
                 .await;
             }
         })
@@ -460,23 +557,36 @@ impl MlessOutboundClient {
         (Arc<MlessMultiplexer>, u64, mpsc::UnboundedReceiver<Vec<u8>>),
         Box<dyn std::error::Error>,
     > {
+        // Every wait below is bounded by one shared deadline: a dial may
+        // wait for a reconnect or for stream capacity, but never forever.
+        let deadline = tokio::time::Instant::now() + OPEN_STREAM_MAX_WAIT;
         loop {
             if let Some(stream) = self.try_register_stream().await {
                 return Ok(stream);
             }
 
-            let (claimed_slot, has_reconnecting) = self.claim_dead_slot().await;
-            if let Some(idx) = claimed_slot {
+            let (claimed, has_reconnecting) = self.claim_dead_slot().await;
+            if let Some((idx, guard)) = claimed {
                 let mux = self
                     .reconnect_slot(idx)
                     .await
                     .ok_or("mless: connection unavailable")?;
+                drop(guard);
                 if let Some((stream_id, rx)) = mux.try_register_stream() {
                     return Ok((mux, stream_id, rx));
                 }
                 continue;
             }
             if has_reconnecting {
+                if tokio::time::Instant::now() >= deadline {
+                    log::warn!(
+                        "mless: dial gave up after {OPEN_STREAM_MAX_WAIT:?}: pool reconnect still in flight"
+                    );
+                    return Err(
+                        "mless: connection unavailable (reconnect still in progress)"
+                            .into(),
+                    );
+                }
                 tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                 continue;
             }
@@ -486,7 +596,18 @@ impl MlessOutboundClient {
             if let Some(stream) = self.try_register_stream().await {
                 return Ok(stream);
             }
-            notified.await;
+            tokio::select! {
+                _ = &mut notified => {},
+                _ = tokio::time::sleep_until(deadline) => {
+                    log::warn!(
+                        "mless: dial gave up after {OPEN_STREAM_MAX_WAIT:?}: pool at stream capacity"
+                    );
+                    return Err(
+                        "mless: connection unavailable (pool at stream capacity)"
+                            .into(),
+                    );
+                },
+            }
         }
     }
 
@@ -818,6 +939,82 @@ impl PacketRelay for MlessPacketRelay {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::{HashMap, HashSet, VecDeque};
+    use std::sync::atomic::{AtomicBool, AtomicU64};
+
+    use crate::connection::ConnError;
+    use crate::crypto::{CryptoLayer, NoCrypto};
+    use crate::transport::TransportSession;
+
+    /// Connection manager that never yields a session; only exists so the
+    /// test client can be constructed. `reconnect_slot` would fail fast
+    /// against it (acquire error), which the claim tests never reach.
+    struct DeadConnMgr;
+
+    #[async_trait]
+    impl ConnectionManager for DeadConnMgr {
+        async fn acquire_uplink(
+            &self,
+        ) -> Result<Box<dyn TransportSession>, ConnError> {
+            Err(ConnError::Closed)
+        }
+
+        async fn acquire_downlink(
+            &self,
+        ) -> Result<Box<dyn TransportSession>, ConnError> {
+            Err(ConnError::Closed)
+        }
+
+        async fn release(&self, _session: Box<dyn TransportSession>) {}
+
+        fn is_healthy(&self) -> bool {
+            false
+        }
+
+        async fn shutdown(&self) {}
+    }
+
+    struct TestCryptoFactory;
+
+    impl CryptoFactory for TestCryptoFactory {
+        fn create(&self, _secret: &str) -> Box<dyn CryptoLayer> {
+            Box::new(NoCrypto)
+        }
+
+        fn name(&self) -> &'static str {
+            "test"
+        }
+    }
+
+    fn test_client(
+        slots: Vec<Arc<MlessMultiplexer>>,
+    ) -> Arc<MlessOutboundClient> {
+        let pool_size = slots.len();
+        Arc::new(MlessOutboundClient {
+            pool: tokio::sync::Mutex::new(
+                slots
+                    .into_iter()
+                    .map(|mux| MuxSlot {
+                        mux,
+                        consecutive_fails: AtomicU32::new(0),
+                        conn_mgr: Arc::new(DeadConnMgr),
+                    })
+                    .collect(),
+            ),
+            next: AtomicUsize::new(0),
+            pool_size,
+            wiring: MuxPoolWiring {
+                max_streams: 0,
+                capacity_notify: Arc::new(Notify::new()),
+                pool_gate: PoolRetireGate::new(),
+                disconnect_signal: Arc::new(Notify::new()),
+            },
+            uuid: [0u8; 16],
+            uuid_str: String::new(),
+            crypto_factory: Arc::new(TestCryptoFactory),
+            direct_fallback: DirectOutboundClient::default(),
+        })
+    }
 
     fn new_relay(rx: mpsc::UnboundedReceiver<Vec<u8>>) -> MlessStreamRelay {
         MlessStreamRelay {
@@ -874,5 +1071,75 @@ mod tests {
         let mut buf = [0u8; 16];
         let n = relay.read(&mut buf).await.unwrap();
         assert_eq!(n, 0, "channel close must surface EOF");
+    }
+
+    /// Dropping the claim guard — on completion, failure or cancellation —
+    /// must release the slot's `reconnecting` flag. This is the invariant
+    /// whose absence wedged all five pool slots in the 2026-11-07 outage.
+    #[tokio::test]
+    async fn guard_releases_reconnecting_flag_on_drop() {
+        let (mux, _ws_rx) = MlessMultiplexer::test_mux(
+            1,
+            0,
+            PoolRetireGate::new(),
+        );
+        mux.dead.store(true, Ordering::Relaxed);
+        let client = test_client(vec![Arc::clone(&mux)]);
+
+        let (claimed, _) = client.claim_dead_slot().await;
+        let (_, guard) = claimed.expect("dead slot must be claimable");
+        assert!(mux.reconnecting.load(Ordering::Acquire));
+        assert!(mux.reconnecting_since.lock().is_some());
+
+        drop(guard);
+        assert!(!mux.reconnecting.load(Ordering::Acquire));
+        assert!(mux.reconnecting_since.lock().is_none());
+    }
+
+    /// A claiming task aborted mid-reconnect (a probe timeout dropping the
+    /// dial, a relay task dropped on client disconnect) must leave the slot
+    /// claimable again. Regression test for the 2026-11-07 outage: five
+    /// probe timeouts leaked five `reconnecting` flags, every dial then
+    /// spun on the 200 ms poll forever, and the proxy stayed dead until the
+    /// process was restarted.
+    #[tokio::test]
+    async fn aborted_claimer_releases_reconnecting_flag() {
+        let (mux, _ws_rx) = MlessMultiplexer::test_mux(
+            1,
+            0,
+            PoolRetireGate::new(),
+        );
+        mux.dead.store(true, Ordering::Relaxed);
+        let client = test_client(vec![Arc::clone(&mux)]);
+
+        let task = tokio::spawn({
+            let client = Arc::clone(&client);
+            async move {
+                // Claim like a dial-path reconnect would, then park —
+                // standing in for the 30 s backoff a probe timeout would
+                // cut short.
+                let (claimed, _) = client.claim_dead_slot().await;
+                let _guard = claimed.expect("dead slot claimable").1;
+                futures_util::future::pending::<()>().await;
+            }
+        });
+        for _ in 0..100 {
+            if mux.reconnecting.load(Ordering::Acquire) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(
+            mux.reconnecting.load(Ordering::Acquire),
+            "claim must be visible before the abort"
+        );
+
+        task.abort();
+        let _ = task.await;
+        assert!(
+            !mux.reconnecting.load(Ordering::Acquire),
+            "aborting the claiming task must release the reconnecting flag"
+        );
+        assert!(mux.reconnecting_since.lock().is_none());
     }
 }
