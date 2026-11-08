@@ -20,17 +20,22 @@
 **范围**：`anywhere/src/dns/wire.rs`、`dns/mod.rs`。
 
 1. `build_aaaa_response`：参照 `build_a_response`（本就为 hosts 表改造过，
-   签名收 query + ip），承载 128-bit 地址。上游响应透传路径若逐字节重写，
-   需同步支持 AAAA 记录类型。
+   签名收 query + ip），承载 128-bit 地址。~~上游响应透传路径若逐字节重写，
+   需同步支持 AAAA 记录类型~~（Phase 1 实测：上游透传是纯字节中继，唯一改写
+   是缓存命中时的 apply_txn_id，与记录类型无关，无需改动）。
 2. **hosts 表放开 v6**：`parse_hosts_table` 已解析 V6 只是丢弃（日志
    "IPv6 not supported yet"）；`hosts_lookup` 返回值改为枚举 v4/v6，AAAA 查询
    命中 v6 值、A 查询命中 v4 值；`0.0.0.0` 屏蔽语义扩展 `::` 同义。
+   **跨族命中答空 NOERROR**（名字在表里但值是另一族）：否则 `0.0.0.0`/`::`
+   屏蔽条目会被另一族的真地址绕过——Phase 1 实现补全的语义。
 3. **AAAA 查询策略（关键决策）**：
    - fake-ip 开（现状默认）：AAAA → **空 NOERROR**（0 answer），A → fake-ip
      v4。这是 sing-box/clash 同款行为，避免 v4-only fake 池下应用拿到真实
      v6 绕过代理。Phase 2 落地 fake-ip v6 池后再切真映射。
-   - fake-ip 关（真解析）：AAAA 走现有 upstream 链路真解析（当前对 type 28
-     的处理按现状为准——先读代码确认，勿凭日志猜）。
+   - fake-ip 关（真解析）：AAAA 走现有 upstream 链路真解析。
+     （Phase 1 代码确认：改前 fake-ip 开关两种情况下 AAAA 都是空应答——
+     `resolve_query` 开头无条件短路 type 28，位于 hosts/rules/cache/fake-ip
+     之前；本阶段已改为按 fake-ip 开关区分。）
 4. type 65 (HTTPS/SVCB) 维持现状（proxy plan 回空）。
 5. 单测：wire 层编解码往返、hosts v4/v6/屏蔽、fake-ip 模式 AAAA 空。
 
