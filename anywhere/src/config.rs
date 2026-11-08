@@ -98,6 +98,14 @@ pub struct InboundConfig {
     #[serde(default)]
     pub bypass_lan_ifaces: Option<Vec<String>>,
 
+    /// IPv6 leak guard (macOS TUN, default true): when the physical network
+    /// has a global IPv6 address but the tunnel is IPv4-only, install reject
+    /// routes for ::/1 + 8000::/1 so IPv6 fails fast (ICMP unreachable) and
+    /// clients fall back to IPv4 instead of leaking past the TUN.
+    /// Re-evaluated on route/address changes; no effect on other platforms yet.
+    #[serde(default)]
+    pub ipv6_leak_guard: Option<bool>,
+
     /// Android per-app VPN filter: when non-empty, ONLY these packages'
     /// traffic enters the TUN (`VpnService.addAllowedApplication`). The
     /// excluded-by-omission apps keep using the physical network directly.

@@ -121,6 +121,9 @@ pub struct TunConfig {
     /// system DNS servers are changed to public IPs (only when fakeip is on).
     /// Set by runner from DnsConfig before setup_routing is called.
     pub fakeip_enabled: bool,
+    /// IPv6 leak guard (macOS TUN, default true): see
+    /// `InboundConfig::ipv6_leak_guard`.
+    pub ipv6_leak_guard: bool,
 }
 
 impl TunConfig {
@@ -181,6 +184,7 @@ impl TunConfig {
             sniff,
             bypass_ips: Vec::new(),
             fakeip_enabled: false,
+            ipv6_leak_guard: cfg.ipv6_leak_guard.unwrap_or(true),
         })
     }
 }
@@ -607,6 +611,7 @@ impl TunInbound {
             let mut mgr =
                 MacosTunManager::new(name.clone(), addr, config.auto_hijack);
             mgr.set_fakeip_enabled(config.fakeip_enabled);
+            mgr.set_ipv6_leak_guard(config.ipv6_leak_guard);
 
             if let Err(e) = mgr.setup_interface() {
                 log::warn!("Failed to setup TUN interface: {e}");

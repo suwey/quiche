@@ -12,6 +12,9 @@ use std::time::Instant;
 use tokio::io::AsyncBufReadExt;
 
 const ROUTE_ECHO_SUPPRESSION: Duration = Duration::from_secs(10);
+/// IPv6 prefixes covered by the leak guard: ::/1 + 8000::/1 = the entire
+/// IPv6 unicast space.
+const V6_GUARD_ROUTES: [&str; 2] = ["::/1", "8000::/1"];
 static RECENT_ROUTE_COMMAND_PIDS: std::sync::Mutex<Vec<(u32, Instant)>> =
     std::sync::Mutex::new(Vec::new());
 static NETWORK_DIAGNOSTICS_LAST: std::sync::Mutex<Option<Instant>> =
@@ -38,6 +41,12 @@ pub struct MacosTunManager {
     physical_iface: Option<String>,
     /// Whether DNS hijacking is active (copied from config at startup).
     auto_hijack: bool,
+    /// IPv6 leak guard (from config, default on): when the physical network
+    /// has global IPv6 but the tunnel is IPv4-only, install reject routes so
+    /// v6 fails fast instead of leaking past the TUN.
+    ipv6_leak_guard: bool,
+    /// Whether the v6 leak-guard reject routes are installed.
+    v6_guard_installed: bool,
     /// Whether fake-ip mode is enabled (only set system DNS when fakeip is on).
     fakeip_enabled: bool,
     /// Original system DNS servers (saved for cleanup).
@@ -59,6 +68,8 @@ impl MacosTunManager {
             original_gateway: None,
             physical_iface: None,
             auto_hijack,
+            ipv6_leak_guard: true,
+            v6_guard_installed: false,
             fakeip_enabled: false,
             original_dns: None,
             network_service: None,
@@ -73,6 +84,47 @@ impl MacosTunManager {
     /// expected when fake-ip is disabled).
     pub fn set_fakeip_enabled(&mut self, enabled: bool) {
         self.fakeip_enabled = enabled;
+    }
+
+    /// Set whether the IPv6 leak guard is enabled (default on).
+    pub fn set_ipv6_leak_guard(&mut self, enabled: bool) {
+        self.ipv6_leak_guard = enabled;
+    }
+
+    /// Install the IPv6 leak-guard reject routes.
+    ///
+    /// `::/1` and `8000::/1` cover the whole v6 space; per-interface link-local
+    /// routes (fe80::/64) are more specific and keep working, so NDP, mDNS and
+    /// other local v6 services are unaffected.
+    fn install_v6_guard_routes(&mut self) {
+        for dest in V6_GUARD_ROUTES {
+            if let Err(e) =
+                run_route_cmd(&["-n", "add", "-inet6", dest, "-reject"])
+            {
+                log::warn!(
+                    "macOS v6 leak guard: add {dest} reject failed: {e}"
+                );
+            }
+        }
+        self.v6_guard_installed = true;
+        log::warn!(
+            "macOS v6 leak guard: reject routes installed (::/1 + 8000::/1) — \
+             the physical network has global IPv6 but the tunnel is IPv4-only, \
+             so IPv6 is contained to prevent leaks"
+        );
+    }
+
+    /// Remove the IPv6 leak-guard reject routes (cleanup, or the physical
+    /// network lost global IPv6 again).
+    fn remove_v6_guard_routes(&mut self) {
+        if !self.v6_guard_installed {
+            return;
+        }
+        for dest in V6_GUARD_ROUTES {
+            let _ = run_route_cmd(&["-n", "delete", "-inet6", dest]);
+        }
+        self.v6_guard_installed = false;
+        log::info!("macOS v6 leak guard: reject routes removed");
     }
 
     /// Set up the TUN interface address and MTU.
@@ -119,6 +171,18 @@ impl MacosTunManager {
         if self.tun_addr.is_ipv6() {
             run_route_cmd(&["-n", "add", "-net", "::/1", &tun_addr_str])?;
             run_route_cmd(&["-n", "add", "-net", "8000::/1", &tun_addr_str])?;
+        } else {
+            // IPv4-only tunnel: make IPv6 fail fast instead of leaking.
+            //
+            // The TUN only covers IPv4 (split routes above), so any IPv6 the
+            // host has connectivity for bypasses the proxy entirely — and
+            // Happy Eyeballs makes clients PREFER it the moment the physical
+            // interface holds a global address. Reject routes (::/1 +
+            // 8000::/1, RTF_REJECT) answer with ICMPv6 unreachable so clients
+            // fall back to IPv4 immediately instead of timing out.
+            if self.ipv6_leak_guard && physical_iface_global_v6() {
+                self.install_v6_guard_routes();
+            }
         }
 
         // Bypass routes for private networks so LAN traffic doesn't
@@ -668,6 +732,12 @@ impl MacosTunManager {
             self.routes_installed = false;
         }
 
+        // Guard removal is its own idempotent step (tracked by
+        // `v6_guard_installed`), NOT nested in `routes_installed`: the guard
+        // installs mid-way through setup_routing, so a later pf/DNS failure
+        // can return before routes_installed is ever set.
+        self.remove_v6_guard_routes();
+
         // Restore original system DNS servers.
         self.restore_system_dns();
     }
@@ -743,6 +813,21 @@ impl MacosTunManager {
             }
             if replace_route(&["-net", "8000::/1", &tun_addr]).is_err() {
                 return false;
+            }
+        }
+
+        // Re-evaluate the v6 leak guard: a global v6 address can appear
+        // mid-session (router RA after TUN start — RTM_NEWADDR triggers this
+        // reconcile) or disappear again.
+        if !self.tun_addr.is_ipv6() {
+            if self.ipv6_leak_guard {
+                match (self.v6_guard_installed, physical_iface_global_v6()) {
+                    (false, true) => self.install_v6_guard_routes(),
+                    (true, false) => self.remove_v6_guard_routes(),
+                    _ => {},
+                }
+            } else {
+                self.remove_v6_guard_routes();
             }
         }
 
@@ -1144,6 +1229,48 @@ fn physical_iface_is_ready(iface: &str, require_ipv4: bool) -> bool {
     interface_output_is_ready(&stdout, require_ipv4)
 }
 
+/// True when the physical interface holds a global IPv6 address (2000::/3).
+///
+/// Link-local (fe80::/10), ULA (fc00::/7) and multicast addresses never
+/// represent a routable v6 network that could leak past the TUN, so they
+/// don't count.
+fn physical_iface_global_v6() -> bool {
+    let Some(iface) = default_physical_iface() else {
+        return false;
+    };
+    let output = Command::new("ifconfig").arg(&iface).output();
+    let stdout = match output {
+        Ok(output) => String::from_utf8_lossy(&output.stdout).into_owned(),
+        Err(_) => return false,
+    };
+    ifconfig_output_has_global_v6(&stdout)
+}
+
+/// Pure parser for [`physical_iface_global_v6`], unit-testable.
+fn ifconfig_output_has_global_v6(stdout: &str) -> bool {
+    stdout.lines().any(|line| {
+        let line = line.trim_start();
+        let Some(rest) = line.strip_prefix("inet6 ") else {
+            return false;
+        };
+        // First token is the address, e.g. "inet6 240e:f7::41 prefixlen 64"
+        // — with an optional %iface suffix on scoped addresses.
+        let addr = rest
+            .split(|c: char| c.is_whitespace() || c == '%')
+            .next()
+            .unwrap_or(rest);
+        global_v6_address(addr)
+    })
+}
+
+/// Global unicast = 2000::/3, i.e. the first hextet in 0x2000..=0x3fff.
+fn global_v6_address(addr: &str) -> bool {
+    addr.split(':')
+        .next()
+        .and_then(|hextet| u16::from_str_radix(hextet, 16).ok())
+        .is_some_and(|first| (0x2000..=0x3fff).contains(&first))
+}
+
 fn interface_output_is_ready(stdout: &str, require_ipv4: bool) -> bool {
     let Some(status_line) = stdout.lines().next() else {
         return false;
@@ -1217,9 +1344,42 @@ fn get_default_gateway() -> Option<IpAddr> {
 
 #[cfg(test)]
 mod tests {
+    use super::ifconfig_output_has_global_v6;
     use super::interface_output_is_ready;
     use super::route_event_pid;
     use super::route_event_requires_reconciliation;
+
+    #[test]
+    fn global_v6_on_physical_iface_is_detected() {
+        // China Telecom / Unicom / Mobile global prefixes.
+        let global = "\
+            en0: flags=<UP, RUNNING>\n\
+            \tinet6 fe80::1%en0 prefixlen 64 secured scopeid 0xe\n\
+            \tinet6 240e:f7:c010:119:3::41 prefixlen 64 autoconf secured\n";
+        assert!(ifconfig_output_has_global_v6(global));
+        assert!(ifconfig_output_has_global_v6(
+            "en0: flags=<UP>\n\tinet6 2001:db8::1 prefixlen 64\n"
+        ));
+        assert!(ifconfig_output_has_global_v6(
+            "en0: flags=<UP>\n\tinet6 3fff:dead::1 prefixlen 64\n"
+        ));
+    }
+
+    #[test]
+    fn link_local_ula_and_multicast_are_not_global() {
+        let local_only = "\
+            en0: flags=<UP, RUNNING>\n\
+            \tinet6 fe80::18f5:a812:eeef:d10f%en0 prefixlen 64 secured\n";
+        assert!(!ifconfig_output_has_global_v6(local_only));
+        assert!(!ifconfig_output_has_global_v6(
+            "en0: flags=<UP>\n\tinet6 fd12:3456::1 prefixlen 64\n"
+        ));
+        assert!(!ifconfig_output_has_global_v6(
+            "en0: flags=<UP>\n\tinet6 ff02::1 prefixlen 8\n"
+        ));
+        assert!(!ifconfig_output_has_global_v6(""));
+        assert!(!ifconfig_output_has_global_v6("en0: flags=<UP>\n\tinet 192.168.50.3\n"));
+    }
 
     #[test]
     fn route_and_interface_changes_trigger_reconciliation() {
