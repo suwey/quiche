@@ -49,7 +49,7 @@ use crate::rules::Rules;
 use doh::DohClient;
 use upstream::{Upstream, parse_upstream, parse_upstreams_ordered};
 use wire::{
-    apply_txn_id, build_empty_response, build_fake_a_response,
+    apply_txn_id, build_empty_response, build_a_response,
     build_refused_response, parse_dns_query, txn_id,
 };
 
@@ -109,6 +109,14 @@ pub struct DnsConfig {
     /// default list (Windows connectivity checks) is used.
     #[serde(default)]
     pub fakeip_filter: Option<Vec<String>>,
+
+    /// Static hosts table consulted before rules, cache and upstreams alike.
+    /// Keys are domains (case-insensitive, trailing dot tolerated), values
+    /// are IPv4 addresses; `0.0.0.0` yields an unroutable answer (block
+    /// semantics). IPv6 values are ignored (anywhere answers AAAA empty).
+    /// Example: `hosts = { "nas.lan" = "192.168.50.10", "ads.x.com" = "0.0.0.0" }`
+    #[serde(default)]
+    pub hosts: Option<HashMap<String, String>>,
 }
 
 impl Default for DnsConfig {
@@ -118,6 +126,7 @@ impl Default for DnsConfig {
             remote: default_remote(),
             fakeip: default_fakeip(),
             fakeip_filter: None,
+            hosts: None,
         }
     }
 }
@@ -272,6 +281,46 @@ fn reject_plan_response(outbound_tag: &str, query: &[u8]) -> Option<Vec<u8>> {
         .flatten()
 }
 
+/// Case-insensitive static hosts lookup. Trailing dots in the query name
+/// (`"example.com."`) are tolerated; IPv6 values never match (there is no
+/// AAAA path yet).
+fn hosts_lookup(
+    hosts: Option<&HashMap<String, std::net::IpAddr>>, name: &str,
+) -> Option<std::net::Ipv4Addr> {
+    let hosts = hosts?;
+    let key = name.trim_end_matches('.').to_ascii_lowercase();
+    match hosts.get(&key)? {
+        std::net::IpAddr::V4(v4) => Some(*v4),
+        std::net::IpAddr::V6(_) => None,
+    }
+}
+
+/// Normalize a configured hosts table: lowercase keys, parse values to IPs.
+/// Invalid values and IPv6 addresses (anywhere answers AAAA empty) are
+/// skipped with a warning; an all-invalid table yields an empty map.
+fn parse_hosts_table(
+    map: &HashMap<String, String>,
+) -> HashMap<String, std::net::IpAddr> {
+    let mut out: HashMap<String, std::net::IpAddr> = HashMap::new();
+    for (name, value) in map {
+        let key = name.trim().trim_end_matches('.').to_ascii_lowercase();
+        match value.trim().parse::<std::net::IpAddr>() {
+            Ok(ip @ std::net::IpAddr::V4(_)) => {
+                out.insert(key, ip);
+            },
+            Ok(std::net::IpAddr::V6(_)) => {
+                log::warn!(
+                    "DNS hosts: {key} → {value} ignored (IPv6 not supported yet)"
+                );
+            },
+            Err(_) => {
+                log::warn!("DNS hosts: {key} → {value} ignored (invalid IP)");
+            },
+        }
+    }
+    out
+}
+
 /// True for an HTTPS/SVCB (type 65) query on a proxy plan: the record only
 /// exists upstream, and proxy outbounds refuse UDP relay (`dial_udp` →
 /// ERR_UDP_NOT_SUPPORTED), so the attempt can never succeed and answering
@@ -316,6 +365,10 @@ pub struct DnsHijack {
     /// `Arc<AsyncDevice>` (held via `writer`) is released before the next
     /// `run()` iteration recreates the TUN device.
     pub(crate) shutdown: CancellationToken,
+    /// Static hosts table (normalized lowercase keys → parsed IP). `None`
+    /// when unset or every entry was invalid. Consulted before rules, cache
+    /// and upstreams.
+    hosts: Option<HashMap<String, std::net::IpAddr>>,
 }
 
 impl DnsHijack {
@@ -339,26 +392,25 @@ impl DnsHijack {
             parse_upstreams_ordered(&config.direct)?,
         );
 
-        // remote group: DoH over the proxy outbound is not supported, but
-        // we reuse the `direct` DoH upstreams to resolve remote domains via
-        // encrypted DoH (bypassing TUN) before falling back to proxy UDP.
-        // Drop any DoH entries explicitly configured in `remote` — they
-        // would need proxy-outbound DoH transport which doesn't exist yet.
+        // remote group: resolution happens EXCLUSIVELY at the proxy server
+        // side — queries ride the tunnel and are forwarded as plain UDP to
+        // the upstream (8.8.8.8 etc.). The tunnel TLS already encrypts the
+        // query path, so DoH/DoT on this hop would protect nothing; DoH
+        // entries configured in `remote` are dropped.
         let mut remote_upstreams = parse_upstreams_ordered(&config.remote)?;
         let remote_doh_count =
             remote_upstreams.iter().filter(|u| u.is_doh()).count();
         if remote_doh_count > 0 {
             log::info!(
                 "DNS: {remote_doh_count} DoH upstream(s) in `remote` ignored \
-                 (DoH over proxy outbound not supported); remote domains will\
-                 \n be resolved via direct DoH + proxy UDP fallback"
+                 — remote domains resolve at the proxy side via tunnel UDP"
             );
             remote_upstreams.retain(|u| !u.is_doh());
         }
         if remote_upstreams.is_empty() {
             log::info!(
                 "DNS: `remote` has no plain upstream; remote domains will be\
-                 \n resolved via direct DoH + proxy UDP fallback (default 8.8.8.8)"
+                 \n resolved at the proxy side via tunnel UDP (default 8.8.8.8)"
             );
             remote_upstreams.push(parse_upstream("8.8.8.8")?);
         }
@@ -417,6 +469,16 @@ impl DnsHijack {
                 Some(crate::dns::fakeip_filter::FakeIPFilter::default_filter())
             },
         };
+
+        // Static hosts table: normalize keys to lowercase (DNS names are
+        // case-insensitive) and parse values to IPs. Invalid and IPv6 values
+        // are skipped with a warning (anywhere answers AAAA empty today).
+        let hosts = config
+            .hosts
+            .as_ref()
+            .map(parse_hosts_table)
+            .filter(|h| !h.is_empty());
+
         Ok(Self {
             remote_upstreams,
             direct_doh_upstreams,
@@ -436,6 +498,7 @@ impl DnsHijack {
             socket_pool: Mutex::new(Vec::new()),
             socket_pool_cap: 8,
             shutdown,
+            hosts,
         })
     }
 
@@ -492,6 +555,18 @@ impl DnsHijack {
         }
 
         let cache_key_base = format!("{}/{}", q.name, q.qtype);
+
+        // Static hosts table wins over local-direct mode, rules, cache and
+        // upstreams alike (its whole point is to override resolution).
+        if q.qtype == 1
+            && let Some(ip) = hosts_lookup(self.hosts.as_ref(), &q.name)
+        {
+            self.reverse_cache
+                .insert(IpAddr::V4(ip), q.name.clone())
+                .await;
+            log::debug!("DNS: {} (type {}) → hosts {}", q.name, q.qtype, ip);
+            return build_a_response(query, ip);
+        }
 
         // Local-direct mode: queries from the router itself (127.0.0.1)
         // skip rule matching and go directly to the direct upstream.
@@ -562,7 +637,7 @@ impl DnsHijack {
             self.reverse_cache
                 .insert(IpAddr::V4(ip), q.name.clone())
                 .await;
-            if let Some(resp) = build_fake_a_response(query, ip) {
+            if let Some(resp) = build_a_response(query, ip) {
                 self.cache
                     .lock()
                     .await
@@ -1075,6 +1150,43 @@ mod tests {
         let cfg: DnsConfig = toml::from_str(toml).unwrap();
         assert_eq!(cfg.direct, vec!["8.8.8.8"]);
         assert_eq!(cfg.remote, vec!["1.1.1.1"]);
+    }
+
+    #[test]
+    fn hosts_table_parses_and_looks_up_case_insensitively() {
+        let toml = r#"
+            direct = ["223.5.5.5"]
+            remote = ["8.8.8.8"]
+            hosts = { "nas.lan" = "192.168.50.10", "ads.x.com" = "0.0.0.0", "v6.x.com" = "::1", "bad.x.com" = "not-an-ip" }
+        "#;
+        let cfg: DnsConfig = toml::from_str(toml).unwrap();
+        let hosts = cfg.hosts.expect("hosts table must parse");
+
+        // Normalization: lowercase keys, parsed IPs, invalid/v6 dropped.
+        let parsed = parse_hosts_table(&hosts);
+        assert_eq!(parsed.len(), 2, "invalid and IPv6 entries must be dropped");
+
+        // Exact hit, case-insensitive, trailing dot tolerated.
+        assert_eq!(
+            hosts_lookup(Some(&parsed), "NAS.LAN"),
+            Some(std::net::Ipv4Addr::new(192, 168, 50, 10))
+        );
+        assert_eq!(
+            hosts_lookup(Some(&parsed), "ads.x.com."),
+            Some(std::net::Ipv4Addr::new(0, 0, 0, 0))
+        );
+        assert!(hosts_lookup(Some(&parsed), "other.lan").is_none());
+        assert!(hosts_lookup(None, "nas.lan").is_none());
+    }
+
+    #[test]
+    fn hosts_answer_wire_format_resolves_query_name() {
+        let query = wire::build_dns_query("nas.lan", 1);
+        let resp = build_a_response(&query, std::net::Ipv4Addr::new(192, 168, 50, 10))
+            .expect("A response must build");
+        let ips: Vec<std::net::Ipv4Addr> =
+            parse_a_records(&resp).into_iter().map(|(ip, _)| ip).collect();
+        assert_eq!(ips, vec![std::net::Ipv4Addr::new(192, 168, 50, 10)]);
     }
 
     #[test]

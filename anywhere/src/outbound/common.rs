@@ -1578,7 +1578,7 @@ mod resolve_bypass_tests {
         let server = tokio::spawn(async move {
             let mut buf = vec![0u8; 1500];
             let (n, peer) = mock.recv_from(&mut buf).await.unwrap();
-            let resp = crate::dns::wire::build_fake_a_response(
+            let resp = crate::dns::wire::build_a_response(
                 &buf[..n],
                 answer_ip,
             )

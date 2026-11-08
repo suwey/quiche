@@ -10,8 +10,9 @@ pub struct DnsQuestion {
     pub qtype: u16,
 }
 
-/// Build a fake A-record response that answers `query` with `ip`.
-pub fn build_fake_a_response(
+/// Build an A-record response that answers `query` with `ip` (used for
+/// both FakeIP allocation and the static hosts table).
+pub fn build_a_response(
     query: &[u8], ip: std::net::Ipv4Addr,
 ) -> Option<Vec<u8>> {
     let q_end = dns_question_end(query)?;
