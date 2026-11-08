@@ -939,8 +939,6 @@ impl PacketRelay for MlessPacketRelay {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::{HashMap, HashSet, VecDeque};
-    use std::sync::atomic::{AtomicBool, AtomicU64};
 
     use crate::connection::ConnError;
     use crate::crypto::{CryptoLayer, NoCrypto};
