@@ -383,6 +383,9 @@ impl MlessMultiplexer {
         let (entry, active) = {
             let mut inner = self.inner.lock();
             let entry = inner.streams.remove(&stream_id);
+            // active_streams 也必须清理：残留条目会让迟到的服务端 CLOSE
+            // 走 was_active 分支（伪装成"活跃流正常关闭"）而不是 echo 分支。
+            inner.active_streams.remove(&stream_id);
             let active = inner.streams.len();
             (entry, active)
         };
@@ -488,17 +491,19 @@ impl MlessMultiplexer {
         );
     }
 
-    /// Removes `stream_id` from the self-closed queue, returning whether it
-    /// was there. A hit means this CLOSE frame is the hermes echo of our own
+    /// Checks `stream_id` against the self-closed queue, returning whether it
+    /// is there. A hit means this CLOSE frame is the hermes echo of our own
     /// close, not a duplicate or desync.
+    ///
+    /// The entry is deliberately KEPT on a hit instead of removed: hermes can
+    /// legitimately deliver more than one CLOSE for the same client-closed
+    /// stream (its own pump-teardown close plus the unconditional echo of
+    /// ours — 2026-11-09 field log: "echo ignored" immediately followed by
+    /// "rejected" for the same id). Ids are monotonic per tunnel, so a stale
+    /// entry can only over-forgive a duplicate echo, never under-forgive a
+    /// real desync; the 128-entry cap bounds the staleness window.
     fn take_self_closed(&self, stream_id: u64) -> bool {
-        let mut queue = self.self_closed_recent.lock();
-        if let Some(pos) = queue.iter().position(|&id| id == stream_id) {
-            queue.remove(pos);
-            true
-        } else {
-            false
-        }
+        self.self_closed_recent.lock().contains(&stream_id)
     }
 
     /// Send plaintext data - the io_loop handles encryption.
@@ -543,6 +548,21 @@ impl MlessMultiplexer {
                         "mless: [slot {}] CLOSE stream#{} echo (own close) ignored",
                         self.slot,
                         stream_id,
+                    );
+                } else if entry.is_some() {
+                    // Server closed a stream we dialed but never received data
+                    // on: a normal upstream failure (target refused, DNS fail,
+                    // TLS handshake error — hermes closes and echoes these).
+                    // Not a protocol violation; counting it fed the
+                    // 30-rejection kill switch during ordinary browsing
+                    // (2026-11-09 field log: slot 3 at 6 rejections with 4
+                    // healthy streams still active).
+                    self.reject_count.store(0, Ordering::Relaxed);
+                    log::debug!(
+                        "mless: [slot {}] CLOSE stream#{} (unanswered dial closed by server, active: {})",
+                        self.slot,
+                        stream_id,
+                        active,
                     );
                 } else {
                     let rejects =
@@ -1086,9 +1106,14 @@ mod tests {
         mux.on_frame(id, FLAG_CLOSE, Vec::new());
         assert_eq!(mux.reject_count.load(Ordering::Relaxed), 0);
 
-        // A duplicate echo (id already consumed) counts again.
+        // A duplicate echo (pump-teardown close + unconditional echo on the
+        // server side) must ALSO be forgiven: 2026-11-09 field log showed the
+        // duplicate landing right after the first echo and feeding the
+        // 30-rejection kill switch during ordinary browsing. Ids are
+        // monotonic per tunnel, so keeping the self-closed entry can only
+        // over-forgive, never mask a real desync on a fresh id.
         mux.on_frame(id, FLAG_CLOSE, Vec::new());
-        assert_eq!(mux.reject_count.load(Ordering::Relaxed), 1);
+        assert_eq!(mux.reject_count.load(Ordering::Relaxed), 0);
     }
 
     #[test]

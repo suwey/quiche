@@ -1,11 +1,15 @@
-// HermesAgentDispatcher Durable Object：包揽所有请求处理。
-// 用 ctx.storage.sql 模拟原 Pages 项目里的 env.KV 接口。
-// 使用 DO hibernation 模式处理 WebSocket 连接。
+// Hermes 部署入口：Worker + Durable Object 分层架构。
+//
+// 数据面（WS upgrade、隧道 POST → transport-ws/xhttp/grpc）完全不碰 KV，
+// 由 Worker 侧直接调用 `处理请求`，不经过 DO —— 省掉每请求 1 次 DO 计费。
+// 仅 KV 路径（sub / admin）转发给 Durable Object `HermesAgentDispatcher`，
+// DO 内用 ctx.storage.sql 模拟原 Pages 项目里的 env.KV 接口。
+// WebSocket 由 Worker 原生 WebSocket + 事件监听驱动，不再进 DO hibernation。
 
 import { DurableObject } from 'cloudflare:workers';
 
 import { 处理请求 } from './router';
-import type { WSHandoff, WebSocketSession } from './transport-ws';
+import type { WSHandoff } from './transport-ws';
 import type { Env, KVAdapter, RuntimeEnv } from './types';
 
 /** 把 ctx.storage.sql 包成兼容 `env.KV.get/put` 的简单 KV。 */
@@ -24,6 +28,16 @@ function 创建SQL_KV(state: DurableObjectState): KVAdapter {
 	};
 }
 
+/** Worker 侧占位 KV：非 KV 路径意外触到 KV 时显式报错，不静默。 */
+const 不可用KV适配器: KVAdapter = {
+	async get(): Promise<string | null> {
+		throw new Error('KV 仅在 DO 上下文可用（sub/admin 路径）');
+	},
+	async put(): Promise<void> {
+		throw new Error('KV 仅在 DO 上下文可用（sub/admin 路径）');
+	},
+};
+
 function 错误响应(err: unknown, label: string, env: Env, request: Request): Response {
 	console.error(`[${label}] ${request.method} ${new URL(request.url).pathname} crashed:`, err);
 	console.error(`[${label}] stack:`, (err as { stack?: string })?.stack);
@@ -39,7 +53,6 @@ function 错误响应(err: unknown, label: string, env: Env, request: Request): 
 
 export class HermesAgentDispatcher extends DurableObject<Env> {
 	private readonly kv: KVAdapter;
-	private sessions = new Map<WebSocket, WebSocketSession>();
 
 	constructor(ctx: DurableObjectState, env: Env) {
 		super(ctx, env);
@@ -56,42 +69,12 @@ export class HermesAgentDispatcher extends DurableObject<Env> {
 		try {
 			const result = await 处理请求(request, runtimeEnv, exec);
 			if (isWSHandoff(result)) {
-				this.ctx.acceptWebSocket(result.serverSock);
-				this.sessions.set(result.serverSock, result.session);
-				return result.response;
+				// WS 数据面已由 Worker 直接处理，不应路由到 DO；防御性兜底。
+				throw new Error('WS 请求不应路由到 DO（sub/admin 路径不含 WS upgrade）');
 			}
 			return result;
 		} catch (err) {
 			return 错误响应(err, 'DO', this.env, request);
-		}
-	}
-
-	override async webSocketMessage(
-		ws: WebSocket, message: string | ArrayBuffer,
-	): Promise<void> {
-		const session = this.sessions.get(ws);
-		if (session) {
-			session.handleMessage(message);
-		}
-	}
-
-	override async webSocketClose(
-		ws: WebSocket, code: number, reason: string, wasClean: boolean,
-	): Promise<void> {
-		const session = this.sessions.get(ws);
-		console.log(`[DO] webSocketClose code=${code} reason=${JSON.stringify(reason)} wasClean=${wasClean} hasSession=${!!session}`);
-		if (session) {
-			session.handleClose();
-			this.sessions.delete(ws);
-		}
-	}
-
-	override async webSocketError(ws: WebSocket, error: unknown): Promise<void> {
-		const session = this.sessions.get(ws);
-		console.log(`[DO] webSocketError error=${JSON.stringify((error as { message?: string })?.message ?? String(error))} hasSession=${!!session}`);
-		if (session) {
-			session.handleError();
-			this.sessions.delete(ws);
 		}
 	}
 }
@@ -106,62 +89,49 @@ function isWSHandoff(result: Response | WSHandoff): result is WSHandoff {
 	);
 }
 
-// 隧道分片：把 mless 连接池的各条隧道分散到多个 DO 实例上。
-//
-// 单实例（getByName('hermes')）下全部隧道挤在一个单线程 DO 里：
-// - CPU 限额被所有流共享，双站高吞吐直接打满 → 全局卡顿；
-// - DO 被 CF 强杀/逐出时一死全死（现场：5 条隧道 30 秒内 1005/1006 全灭）。
-//
-// 客户端（anywhere mless WS 池）在隧道路径上带 `_hslot=<slot>` 标记；
-// 带 `_hslot` 的隧道请求按值取模分片。其余请求（admin/订阅/配置页）
-// 一律落 shard 0 —— KV（config.json 等）只在 shard 0 上有完整状态，
-// 隧道数据面不读 KV（反代参数也只从 URL 解析），因此各分片 DO 独立持有
-// 自己的隧道会话是安全的。
-const DO_SHARD_COUNT = 8;
-
-/** FNV-1a 32bit：分片哈希只需确定性 + 均匀，不需要密码学强度（保持同步）。 */
-function 隧道哈希分片(文本: string): number {
-	let hash = 0x811c9dc5;
-	for (let i = 0; i < 文本.length; i++) {
-		hash ^= 文本.charCodeAt(i);
-		hash = Math.imul(hash, 0x01000193);
-	}
-	return (hash >>> 0) % DO_SHARD_COUNT;
-}
-
-function 解析隧道分片(request: Request, url: URL): number | null {
-	const upgradeHeader = (request.headers.get('Upgrade') || '').toLowerCase();
-	if (upgradeHeader !== 'websocket' && request.method !== 'POST') {
-		return null;
-	}
-	const raw = url.searchParams.get('_hslot');
-	if (raw !== null) {
-		const slot = Number(raw);
-		if (!Number.isInteger(slot) || slot < 0) return null;
-		return slot % DO_SHARD_COUNT;
-	}
-	// 无标记的隧道 POST（xhttp / gRPC 协议，外部订阅客户端如 sing-box）
-	// 与 router 的判定对齐（router.ts：非 admin/login 的 POST 即隧道请求，
-	// 每个 POST 独立成一条 stream-one 隧道、无跨请求会话状态），按完整
-	// URL 确定性哈希分片 —— 同一会话的所有请求 URL 相同，落同一 shard；
-	// 不同隧道的并发流摊到各 shard DO 上，避免全部挤在 shard 0。
-	if (request.method !== 'POST') return null;
-	const pathname = url.pathname.toLowerCase();
-	if (pathname.startsWith('/admin') || pathname === '/login') return null;
-	return 隧道哈希分片(url.pathname + url.search);
-}
-
 export default {
-	async fetch(request: Request, env: Env): Promise<Response> {
+	async fetch(
+		request: Request,
+		env: Env,
+		ctx: ExecutionContext,
+	): Promise<Response> {
 		try {
-			// url 已在 router 归一化过 %3f 等转义，这里用原始 URL 解析一次即可；
-			// `_hslot` 是纯数字参数，不受那些转义影响。
-			const url = new URL(request.url);
-			const shard = 解析隧道分片(request, url) ?? 0;
-			const stub = env.HERMES_AGENT_DISPATCHER.getByName(
-				shard === 0 ? 'hermes' : `hermes:${shard}`,
-			);
-			return await stub.fetch(request);
+			// 与 router.ts 开头相同的 URL 归一化（%5C / 反斜杠剔除、%3f 还原），
+			// 只用于解析访问路径做分流；原始 request 原样传下去，
+			// `处理请求` 内部会自己再归一化一次，行为与现状保持一致。
+			let 请求URL文本 = request.url.replace(/%5[Cc]/g, '').replace(/\\/g, '');
+			const 请求URL锚点索引 = 请求URL文本.indexOf('#');
+			const 请求URL主体部分 = 请求URL锚点索引 === -1 ? 请求URL文本 : 请求URL文本.slice(0, 请求URL锚点索引);
+			if (!请求URL主体部分.includes('?') && /%3f/i.test(请求URL主体部分)) {
+				const 请求URL锚点部分 = 请求URL锚点索引 === -1 ? '' : 请求URL文本.slice(请求URL锚点索引);
+				请求URL文本 = 请求URL主体部分.replace(/%3f/i, '?') + 请求URL锚点部分;
+			}
+			const url = new URL(请求URL文本);
+
+			// KV 只在 sub / admin 路径用到；这些请求转发给 DO，
+			// 其余（隧道数据面等）留在 Worker 直接处理，节省 DO 计费。
+			const 访问路径 = url.pathname.slice(1).toLowerCase();
+			const 需要KV = 访问路径 === 'sub' || 访问路径 === 'admin' || 访问路径.startsWith('admin/');
+			if (需要KV) {
+				const stub = env.HERMES_AGENT_DISPATCHER.getByName('hermes');
+				return await stub.fetch(request);
+			}
+
+			const runtimeEnv: RuntimeEnv = Object.assign({}, env, { KV: 不可用KV适配器 });
+			const result = await 处理请求(request, runtimeEnv, ctx);
+			if (isWSHandoff(result)) {
+				// Worker 原生 WebSocket：事件监听驱动会话，不进 DO hibernation。
+				result.serverSock.accept();
+				result.serverSock.addEventListener('message', (e) => result.session.handleMessage(e.data));
+				result.serverSock.addEventListener('close', () => {
+					result.session.handleClose();
+				});
+				result.serverSock.addEventListener('error', () => {
+					result.session.handleError();
+				});
+				return result.response;
+			}
+			return result;
 		} catch (err) {
 			return 错误响应(err, 'Worker', env, request);
 		}

@@ -1,5 +1,5 @@
 // WebSocket 多路复用通道（自定义帧 + 流ID + AES-XOR 混淆）。
-// 使用 DO hibernation 模式：由 DO 的 webSocketMessage / webSocketClose 驱动。
+// 由 Worker 原生 WebSocket 的事件监听（message/close/error）驱动。
 
 import { log } from './state';
 import { 帧首帧标记, 帧关闭标记, WS早期数据最大字节, WS早期数据最大头长度 } from './state';
@@ -19,14 +19,14 @@ interface StreamRecord {
 	上行写入链: Promise<void>;
 }
 
-/** `处理WS请求` 返回给 DO 的交接信息。 */
+/** `处理WS请求` 返回给 Worker 的交接信息。 */
 export interface WSHandoff {
 	response: Response;
 	serverSock: WebSocket;
 	session: WebSocketSession;
 }
 
-/** 单条 WebSocket 连接的全部状态，供 DO hibernation 模式使用。 */
+/** 单条 WebSocket 连接的全部状态，由 Worker 侧事件监听驱动。 */
 export class WebSocketSession {
 	readonly serverSock: WebSocket;
 	readonly yourUUID: string;
@@ -62,7 +62,7 @@ export class WebSocketSession {
 		this.重置空闲超时();
 	}
 
-	/** 处理来自客户端的 WebSocket 消息（由 DO 的 webSocketMessage 调用）。 */
+	/** 处理来自客户端的 WebSocket 消息（由 Worker 的 message 事件监听调用）。 */
 	handleMessage(message: string | ArrayBuffer): void {
 		const data = 数据转Uint8Array(
 			message as ArrayBuffer | ArrayBufferView | Uint8Array,
@@ -70,7 +70,7 @@ export class WebSocketSession {
 		this.处理传入帧(data).catch(() => {});
 	}
 
-	/** 处理 WebSocket 关闭（由 DO 的 webSocketClose 调用）。 */
+	/** 处理 WebSocket 关闭（由 Worker 的 close 事件监听调用）。 */
 	handleClose(): void {
 		for (const [, s] of this.流映射) {
 			try { s.remoteConn.writer?.releaseLock(); } catch { /* ignore */ }
@@ -83,7 +83,7 @@ export class WebSocketSession {
 		this.空闲定时器 = null;
 	}
 
-	/** 处理 WebSocket 错误（由 DO 的 webSocketError 调用）。 */
+	/** 处理 WebSocket 错误（由 Worker 的 error 事件监听调用）。 */
 	handleError(): void {
 		this.handleClose();
 	}
@@ -456,12 +456,18 @@ export class WebSocketSession {
 
 		if (flags & 帧关闭标记) {
 			const s = this.流映射.get(流ID);
-			if (s) this.拆除流(流ID, s);
-			// 无论这个流在不在映射里都回一帧 CLOSE。本分支走的是 拆除流（不发帧），
-			// 所以这里不会与 关闭流 重复。客户端因此能区分两种以前看不出差别的尾巴：
-			// 有回帧 = CLOSE 确实到达并被解析、但下行泵还在推；无回帧 = 帧没到或没解析。
-			// 空载荷不占混淆计数器，排在串行链上也在该流已入队的数据之后。
-			this.发送帧到客户端(流ID, 帧关闭标记, null);
+			if (s) {
+				this.拆除流(流ID, s);
+				// 回显仅在真正拆除时发送。原来的无条件回显会与本流的
+				// 关闭流()（下行泵结束时）产生重复 CLOSE：泵先结束 → 关闭流
+				// 发一条；客户端 CLOSE 随后到达 → 流已不在映射 → 再无条件
+				// 回显一条。客户端的 self-closed 队列只能匹配一条，多余的
+				// 一条被计成协议失步（2026-11-09 客户端日志："echo ignored"
+				// 后紧跟 "rejected"，同一流 ID）。旧注释里"区分尾巴"的诊断
+				// 信号由客户端分支日志承担，不依赖这条回显。
+				// 空载荷不占混淆计数器，排在串行链上也在该流已入队的数据之后。
+				this.发送帧到客户端(流ID, 帧关闭标记, null);
+			}
 			this.重置空闲超时();
 			return;
 		}
@@ -526,7 +532,7 @@ export async function 处理WS请求(
 			new TextEncoder().encode(yourUUID + 'anywhere-obfuscation-v1'),
 		),
 	);
-	// 在 fetch() 期间捕获 TCP connector，之后 DO hibernation 时 request.fetcher 不可用。
+	// 在 fetch() 期间捕获 TCP connector，之后事件回调里 request.fetcher 不可用。
 	const tcpConnector = 创建请求TCP连接器(request);
 	const session = new WebSocketSession(
 		serverSock, 混淆密钥, yourUUID, tcpConnector,

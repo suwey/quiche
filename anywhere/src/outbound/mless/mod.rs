@@ -68,15 +68,9 @@ pub struct MlessOutboundClient {
 struct MuxSlot {
     mux: Arc<MlessMultiplexer>,
     consecutive_fails: AtomicU32,
-    /// Per-slot connection manager: WS managers carry the `_hslot` shard
-    /// marker for this slot, so reconnects land on the same DO shard.
+    /// Per-slot connection manager: each slot reconnects independently, so a
+    /// dead slot's handshake doesn't block the others.
     conn_mgr: Arc<dyn ConnectionManager>,
-}
-
-/// Appends the hermes DO-shard marker to the tunnel path.
-fn with_hslot_marker(path: &str, slot: usize) -> String {
-    let sep = if path.contains('?') { '&' } else { '?' };
-    format!("{path}{sep}_hslot={slot}")
 }
 
 /// Longest a dial waits inside `open_stream` for the pool to yield a live
@@ -155,12 +149,10 @@ impl MlessOutboundClient {
 
         // Build connection manager(s) from the nested [transport] config.
         //
-        // Hermes shards its tunnel handling across several Durable Object
-        // instances; each WS tunnel marks its slot with `_hslot=<slot>` in the
-        // path so the worker routes the pool onto distinct DOs (one evicted DO
-        // then only cuts its own tunnels instead of the whole pool, and the
-        // per-DO CPU budget is shared). XHTTP keeps one shared manager (xmux
-        // owns its own connection pool) — its URLs don't carry the marker yet.
+        // Hermes 老版本把隧道按 DO 分片，WS 路径带 `_hslot=<slot>` 标记；
+        // 现在隧道数据面已移出 DO（仅 sub/admin 的 KV 路径进 DO），
+        // 服务端不再读取该参数，客户端也不再附加。
+        // XHTTP 共用一个 manager（xmux 自带连接池）。
         let transport = cfg
             .transport
             .as_ref()
@@ -260,16 +252,12 @@ impl MlessOutboundClient {
                 },
             };
 
-        let build_conn_mgr = |slot: usize| -> Arc<dyn ConnectionManager> {
+        let build_conn_mgr = || -> Arc<dyn ConnectionManager> {
             match &ws_ctx {
-                Some(ctx) => {
-                    let mut slot_ctx = ctx.clone();
-                    slot_ctx.path = with_hslot_marker(&slot_ctx.path, slot);
-                    Arc::new(SingleConnectionManager::new(
-                        Box::new(WsTransportFactory),
-                        slot_ctx,
-                    ))
-                },
+                Some(ctx) => Arc::new(SingleConnectionManager::new(
+                    Box::new(WsTransportFactory),
+                    ctx.clone(),
+                )),
                 None => shared_conn_mgr
                     .clone()
                     .expect("xhttp branch built a shared conn mgr"),
@@ -299,7 +287,7 @@ impl MlessOutboundClient {
         // failing still fails construction as before.
         let muxes = futures_util::future::try_join_all(
             (0..pool_size).map(|i| {
-                let conn_mgr = build_conn_mgr(i + 1);
+                let conn_mgr = build_conn_mgr();
                 let crypto_factory = crypto_factory.clone();
                 let wiring = wiring.clone();
                 let uuid_str = uuid_str.clone();
@@ -332,11 +320,10 @@ impl MlessOutboundClient {
 
         let slots: Vec<MuxSlot> = muxes
             .into_iter()
-            .enumerate()
-            .map(|(idx, mux)| MuxSlot {
+            .map(|mux| MuxSlot {
                 mux,
                 consecutive_fails: AtomicU32::new(0),
-                conn_mgr: build_conn_mgr(idx + 1),
+                conn_mgr: build_conn_mgr(),
             })
             .collect();
 

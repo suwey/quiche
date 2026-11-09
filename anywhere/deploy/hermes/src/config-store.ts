@@ -70,6 +70,14 @@ interface FullConfig extends ConfigJSON {
 	};
 }
 
+// config 跨请求缓存：键为 hostname|userID，60 秒 TTL。
+// 命中时跳过 config.json/tg.json/cf.json 三次 KV get 及 CF 用量外呼，避免每请求 1 次行读 + blob 重写。
+let config缓存: { 键: string; 配置: FullConfig; 时间: number } | null = null;
+
+export function 失效config缓存(): void {
+	config缓存 = null;
+}
+
 export interface CloudflareUsage {
 	success: boolean;
 	pages: number;
@@ -146,6 +154,19 @@ export async function getCloudflareUsage(Email: string | null, GlobalAPIKey: str
 }
 
 export async function 读取config_JSON(env: RuntimeEnv, hostname: string, userID: string, UA = 'Mozilla/5.0', 重置配置 = false): Promise<FullConfig> {
+	const 缓存键 = `${hostname}|${userID}`;
+	if (重置配置 !== true) {
+		const 缓存 = config缓存;
+		if (缓存 && 缓存.键 === 缓存键 && Date.now() - 缓存.时间 < 60_000) {
+			const cfg = 缓存.配置;
+			// 同一部署可能多域名/多 UUID，host 相关字段必须按本次请求重设，其余保持缓存版本。
+			cfg.HOST = hostname;
+			cfg.UUID = userID;
+			cfg.加载时间 = 'cached';
+			state.config_JSON = cfg as ConfigJSON;
+			return cfg;
+		}
+	}
 	const host = hostname;
 	const Ali_DoH = 'https://dns.alidns.com/dns-query';
 	const ECH_SNI = 'cloudflare-ech.com';
@@ -352,6 +373,8 @@ export async function 读取config_JSON(env: RuntimeEnv, hostname: string, userI
 	}
 
 	cfg.加载时间 = (performance.now() - 初始化开始时间).toFixed(2) + 'ms';
+	// 重置配置后不缓存新配置，下次请求按完整逻辑重建；常规路径写入缓存。
+	config缓存 = 重置配置 === true ? null : { 键: 缓存键, 配置: cfg, 时间: Date.now() };
 	state.config_JSON = cfg as ConfigJSON;
 	return cfg;
 }
@@ -468,6 +491,8 @@ export async function 请求日志记录(env: RuntimeEnv, request: Request, 访�
 		if (关闭日志) 是否写入KV日志 = false;
 		if (!是否写入KV日志) return;
 		let 日志数组: typeof 日志内容[] = [];
+		// 紧凑 JSON（无缩进）：前端 JSON.parse 消费，体积比带缩进小约一半，降低 KV 写放大。
+		let 日志文本: string | null = null;
 		const 现有日志 = await env.KV.get('log.json');
 		const KV容量限制 = 4; // MB
 		if (现有日志) {
@@ -490,7 +515,21 @@ export async function 请求日志记录(env: RuntimeEnv, request: Request, 访�
 					} else {
 						日志数组.push(日志内容);
 					}
-					while (JSON.stringify(日志数组, null, 2).length > KV容量限制 * 1024 * 1024 && 日志数组.length > 0) 日志数组.shift();
+					// 有限轮次比例裁剪：替代原来每删一条全量 stringify 的 O(n²) 循环，总 stringify 最多 4 次。
+					let 裁剪轮次 = 0;
+					日志文本 = JSON.stringify(日志数组);
+					while (日志文本.length > KV容量限制 * 1024 * 1024 && 日志数组.length > 0) {
+						if (裁剪轮次 >= 3) {
+							// 极端情况兜底：只保留最后 100 条。
+							日志数组 = 日志数组.slice(-100);
+							日志文本 = JSON.stringify(日志数组);
+							break;
+						}
+						const 丢弃数 = Math.ceil(日志数组.length * (1 - KV容量限制 * 1024 * 1024 / 日志文本.length)) + 1;
+						日志数组.splice(0, 丢弃数);
+						日志文本 = JSON.stringify(日志数组);
+						裁剪轮次++;
+					}
 				}
 			} catch {
 				日志数组 = [日志内容];
@@ -498,7 +537,7 @@ export async function 请求日志记录(env: RuntimeEnv, request: Request, 访�
 		} else {
 			日志数组 = [日志内容];
 		}
-		await env.KV.put('log.json', JSON.stringify(日志数组, null, 2));
+		await env.KV.put('log.json', 日志文本 ?? JSON.stringify(日志数组));
 	} catch (error) {
 		console.error(`日志记录失败: ${(error as { message?: string })?.message || error}`);
 	}

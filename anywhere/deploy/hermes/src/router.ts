@@ -9,7 +9,7 @@ import { 处理WS请求 } from './transport-ws';
 import type { WSHandoff } from './transport-ws';
 import { 处理叉HTTP请求, 获取叉HTTPPadding标识 } from './transport-xhttp';
 import { 处理gRPC请求 } from './transport-grpc';
-import { 读取config_JSON, 请求日志记录, 识别运营商, 生成随机IP, getCloudflareUsage } from './config-store';
+import { 读取config_JSON, 请求日志记录, 识别运营商, 生成随机IP, getCloudflareUsage, 失效config缓存 } from './config-store';
 import { 请求优选API, 获取优选订阅生成器数据 } from './best-ip';
 import { Clash订阅配置文件热补丁, Singbox订阅配置文件热补丁, Surge订阅配置文件热补丁 } from './subscription';
 import { 获取传输协议配置, 获取传输路径参数值 } from './sub-helpers';
@@ -332,6 +332,7 @@ async function 处理ADMIN_POST(request: Request, env: RuntimeEnv, ctx: Executio
 				return new Response(JSON.stringify({ error: '配置不完整' }), { status: 400, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
 			}
 			await env.KV.put('config.json', JSON.stringify(newConfig, null, 2));
+			失效config缓存();
 			ctx.waitUntil(请求日志记录(env, request, 访问IP, 'Save_Config', cfg));
 			return new Response(JSON.stringify({ success: true, message: '配置已保存' }), { status: 200, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
 		} catch (error) {
