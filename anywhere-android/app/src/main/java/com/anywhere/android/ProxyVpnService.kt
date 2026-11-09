@@ -101,6 +101,12 @@ class ProxyVpnService : VpnService() {
         copyDefaultConfig()
         val config = getConfig()
 
+        // IPv6 data plane: when the config sets tun addr6 (e.g.
+        // "fdfe:dcba:9876::1/64"), add the v6 address and a ::/0 route so
+        // fake-ip AAAA answers are actually reachable through the tunnel.
+        // Unset → v4-only VPN, identical to previous behavior.
+        applyVpnV6Address(builder, config)
+
         // Pre-download geo rule-set files BEFORE establishing the VPN tunnel.
         // Once the TUN interface is up, all unprotected sockets get routed
         // into the TUN — but the rules engine (which decides routing) hasn't
@@ -486,6 +492,44 @@ class ProxyVpnService : VpnService() {
         val inner = arrayRegex.find(config)?.groupValues?.get(1) ?: return emptyList()
         val itemRegex = Regex("""["']([^"']+)["']""")
         return itemRegex.findAll(inner).map { it.groupValues[1] }.toList()
+    }
+
+    /**
+     * Apply the IPv6 address + route from the TOML config's tun `addr6`
+     * field (CIDR, e.g. `addr6 = "fdfe:dcba:9876::1/64"`) to the VPN
+     * builder, BEFORE establish().
+     *
+     * Same lightweight-regex approach as [tomlStringArray] — the Kotlin side
+     * only pre-reads the few fields that must be known before establish()
+     * (the Rust engine re-reads the full TOML itself).
+     *
+     * `addRoute("::", 0)` captures the whole v6 space including the ULA
+     * fake-ip pool (fdfe::/8), so apps connecting to a fake AAAA answer
+     * reach the TUN handler and the domain is restored there. Link-local
+     * (fe80::) is managed by the kernel and not affected by VpnService
+     * routes. No-op when addr6 is unset: the VPN stays v4-only and v6 fails
+     * at the OS level instead of leaking.
+     */
+    private fun applyVpnV6Address(builder: Builder, config: String) {
+        val addr6Regex = Regex("""(?m)\baddr6\s*=\s*["']([^"']+)["']""")
+        val cidr = addr6Regex.find(config)?.groupValues?.get(1)?.trim()
+        if (cidr.isNullOrEmpty()) return
+
+        val parts = cidr.split("/")
+        val addr = parts.getOrNull(0)?.trim().orEmpty()
+        val prefix = parts.getOrNull(1)?.trim()?.toIntOrNull()
+        if (addr.isEmpty() || prefix == null || prefix !in 0..128) {
+            Log.w(TAG, "Invalid tun addr6 '$cidr' — IPv6 data plane disabled")
+            return
+        }
+
+        try {
+            builder.addAddress(addr, prefix)
+            builder.addRoute("::", 0)
+            Log.i(TAG, "VPN IPv6 enabled: $addr/$prefix (route ::/0)")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to add VPN IPv6 address $addr/$prefix", e)
+        }
     }
 
     /**
