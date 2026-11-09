@@ -2,12 +2,14 @@
 //!
 //! Intercepts UDP/53 at the TUN inbound, parses the query domain, runs it
 //! through the rule engine, and forwards to either the `direct` upstream
-//! (default 223.5.5.5) or the `remote` upstream (default 8.8.8.8). AAAA
-//! queries follow the fake-ip mode: enabled → empty NOERROR (the fake pool
-//! is v4-only, so a real AAAA would let apps bypass the proxy over v6);
-//! disabled → real resolution through the normal upstream chain, with
-//! upstream AAAA records passed through untouched. Responses are cached in
-//! a small LRU keyed by `{domain}/{qtype}`.
+//! (default 223.5.5.5) or the `remote` upstream (default 8.8.8.8). On
+//! non-direct plans, fake-ip mode answers A with a v4 fake from the
+//! configured CIDR and AAAA with a v6 fake from the fixed ULA pool
+//! `fdfe:dcba:9876::/64` — both addresses restore the same domain in the
+//! TUN handler. Direct plans (and fakeip-filtered domains) resolve for real
+//! through the normal upstream chain, with upstream AAAA records passed
+//! through untouched. Responses are cached in a small LRU keyed by
+//! `{domain}/{qtype}`.
 //!
 //! Sub-modules:
 //! - [`wire`] — DNS wire-format parsing/building (pure functions).
@@ -43,6 +45,7 @@ use crate::inbound::tun::TunWriter;
 use crate::inbound::tun::packet;
 use crate::inbound::tun::reverse_dns::ReverseDnsCache;
 use crate::inbound::tun::reverse_dns::parse_a_records;
+use crate::inbound::tun::reverse_dns::parse_aaaa_records;
 use crate::outbound::OutboundClient;
 use crate::outbound::common::bind_udp_bypass;
 use crate::outbound::common::bind_udp_bypass_fallback;
@@ -97,8 +100,11 @@ pub struct DnsConfig {
     pub direct: Vec<String>,
     #[serde(default = "default_remote", deserialize_with = "de_upstream_list")]
     pub remote: Vec<String>,
-    /// Fake-IP CIDR, e.g. "198.18.0.0/15". Enabled by default for TUN so
-    /// domain information survives IP-only TUN packets.
+    /// Fake-IP v4 CIDR, e.g. "198.18.0.0/15". Enabled by default for TUN so
+    /// domain information survives IP-only TUN packets. A queries answer
+    /// with a v4 fake from this range and AAAA queries with a v6 fake from
+    /// the fixed ULA pool `fdfe:dcba:9876::/64`; both restore the same
+    /// domain in the TUN handler.
     /// Set to `false` to disable FakeIP and use real DNS resolution
     /// (redir-host mode: real IP returned, IP→domain mapping still
     /// maintained via reverse cache for rule matching).
@@ -205,23 +211,32 @@ fn nanos_random(len: usize) -> usize {
         .unwrap_or(0)
 }
 
+/// fake-ip v6 pool: a fixed ULA /64 (sing-box's default `inet6_range`, kept
+/// identical for easier debugging against other fake-ip implementations).
+/// A /64 offers a host space far beyond any realistic table size, so the
+/// counter simply wraps like the v4 pool does. `dns.fakeip` configures only
+/// the v4 CIDR; making the v6 range configurable is ipv6-plan Phase 3.
+const FAKEIP_V6_NET: std::net::Ipv6Addr =
+    std::net::Ipv6Addr::new(0xfdfe, 0xdcba, 0x9876, 0, 0, 0, 0, 0);
+
+/// One domain's fake-ip addresses: A queries answer `v4`, AAAA queries
+/// answer `v6`, and the TUN handler restores both to the same domain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FakeIpPair {
+    v4: std::net::Ipv4Addr,
+    v6: std::net::Ipv6Addr,
+}
+
 #[derive(Clone)]
 struct FakeIpPool {
     base: u32,
     size: u32,
     next: Arc<std::sync::atomic::AtomicU32>,
-    /// Domain → allocated IP mapping, so repeated queries for the same
-    /// domain return the same FakeIP instead of burning a new address.
-    domain_map:
-        Arc<tokio::sync::Mutex<lru::LruCache<String, std::net::Ipv4Addr>>>,
-}
-
-impl FakeIpPool {
-    /// Returns true if `ip` falls within this FakeIP pool's CIDR range.
-    fn contains(&self, ip: std::net::Ipv4Addr) -> bool {
-        let v = u32::from(ip);
-        v >= self.base && v < self.base + self.size
-    }
+    /// Host-part counter for the v6 ULA pool (host bits are the low 64).
+    v6_next: Arc<std::sync::atomic::AtomicU64>,
+    /// Domain → allocated address pair, so repeated queries for the same
+    /// domain return the same FakeIPs instead of burning new addresses.
+    domain_map: Arc<tokio::sync::Mutex<lru::LruCache<String, FakeIpPair>>>,
 }
 
 impl FakeIpPool {
@@ -246,25 +261,53 @@ impl FakeIpPool {
             base: u32::from(ip),
             size,
             next: Arc::new(std::sync::atomic::AtomicU32::new(1)),
+            v6_next: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             domain_map: Arc::new(tokio::sync::Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(4096).unwrap(),
             ))),
         })
     }
 
-    /// Allocate a FakeIP for `domain`. If the domain already has a
-    /// FakeIP allocated, return the existing one (deduplication).
-    async fn allocate(&self, domain: &str) -> std::net::Ipv4Addr {
+    /// True when `ip` falls within this pool's v4 CIDR range.
+    fn contains_v4(&self, ip: std::net::Ipv4Addr) -> bool {
+        let v = u32::from(ip);
+        v >= self.base && v < self.base + self.size
+    }
+
+    /// True when `ip` falls within the v6 pool's /64 (first 64 bits match).
+    fn contains_v6(&self, ip: std::net::Ipv6Addr) -> bool {
+        ip.octets()[..8] == FAKEIP_V6_NET.octets()[..8]
+    }
+
+    /// Allocate the fake-ip pair for `domain`. If the domain already has a
+    /// pair allocated, return the existing one (deduplication), so the A and
+    /// AAAA answers for a domain always point at the same name in the TUN
+    /// restore path.
+    ///
+    /// v6 host parts start at 2: the first address of the /64 is commonly
+    /// used as the TUN interface's own v6 address (`tun.addr6 = ...::1`), and
+    /// a fake-ip equal to the TUN address would be dropped by the handler's
+    /// re-injection guard instead of being proxied.
+    async fn allocate(&self, domain: &str) -> FakeIpPair {
         // Check existing mapping first.
-        if let Some(ip) = self.domain_map.lock().await.get(domain).copied() {
-            return ip;
+        if let Some(pair) = self.domain_map.lock().await.get(domain).copied() {
+            return pair;
         }
-        // Allocate a new IP.
+        // Allocate new addresses (both families together — AAAA often
+        // arrives first under Happy Eyeballs, and the unused v4 half is
+        // harmless).
         let n = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let host = 1 + (n % (self.size - 2));
-        let ip = std::net::Ipv4Addr::from(self.base + host);
-        self.domain_map.lock().await.put(domain.to_string(), ip);
-        ip
+        let v4 = std::net::Ipv4Addr::from(self.base + host);
+        let n6 =
+            self.v6_next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let host6 = 2u64.wrapping_add(n6);
+        let mut octets = FAKEIP_V6_NET.octets();
+        octets[8..].copy_from_slice(&host6.to_be_bytes());
+        let v6 = std::net::Ipv6Addr::from(octets);
+        let pair = FakeIpPair { v4, v6 };
+        self.domain_map.lock().await.put(domain.to_string(), pair);
+        pair
     }
 }
 
@@ -359,16 +402,14 @@ fn proxy_plan_cannot_answer_svcb(qtype: u16, outbound_tag: &str) -> bool {
     qtype == 65 && outbound_tag != "direct"
 }
 
-/// AAAA query policy: under fake-ip mode AAAA is answered with an empty
-/// NOERROR (0 answers) — the fake pool is v4-only, so a real AAAA would
-/// hand applications a routable v6 that bypasses the TUN entirely (Happy
-/// Eyeballs prefers v6); sing-box/clash answer empty AAAA in fake-ip mode
-/// too. With fake-ip off (redir-host) AAAA resolves through the normal
-/// upstream chain like A does; the passthrough paths (DoH / plain UDP /
-/// proxy relay) are raw byte relays, so upstream AAAA records pass through
-/// untouched (only `apply_txn_id` rewrites bytes, record-type agnostic).
-fn aaaa_short_circuit(fakeip_enabled: bool, qtype: u16) -> bool {
-    qtype == 28 && fakeip_enabled
+/// qtypes that get a fake-ip answer on a non-direct plan: A (1) answers
+/// with a v4 fake from the configured CIDR, AAAA (28) with a v6 fake from
+/// the fixed ULA pool — the two addresses restore the same domain in the
+/// TUN handler, so Happy Eyeballs can pick either family and the connection
+/// still reaches the proxy. Every other qtype falls through to the normal
+/// upstream chain.
+fn fakeip_answerable_qtype(qtype: u16) -> bool {
+    qtype == 1 || qtype == 28
 }
 
 /// DNS hijack handler. One instance per TUN inbound, shared by reference.
@@ -413,10 +454,17 @@ pub struct DnsHijack {
 }
 
 impl DnsHijack {
-    /// Returns true if `ip` is a FakeIP address (i.e. falls within the
-    /// configured fakeip CIDR range).
-    pub fn fakeip_contains(&self, ip: std::net::Ipv4Addr) -> bool {
-        self.fakeip.as_ref().is_some_and(|p| p.contains(ip))
+    /// Returns true if `ip` is a FakeIP address: within the configured v4
+    /// CIDR, or within the fixed v6 ULA pool (`fdfe:dcba:9876::/64`).
+    pub fn fakeip_contains(&self, ip: IpAddr) -> bool {
+        match ip {
+            IpAddr::V4(v4) => {
+                self.fakeip.as_ref().is_some_and(|p| p.contains_v4(v4))
+            },
+            IpAddr::V6(v6) => {
+                self.fakeip.as_ref().is_some_and(|p| p.contains_v6(v6))
+            },
+        }
     }
 
     pub fn new(
@@ -604,8 +652,11 @@ impl DnsHijack {
                 return build_a_response(query, ip);
             },
             Some(HostsAnswer::V6(ip)) => {
-                // No reverse-cache insert: the reverse map is v4-keyed and
-                // TUN cannot carry v6 packets yet (ipv6-plan Phase 2).
+                // Insert into the reverse cache so v6 TUN packets restore
+                // the domain (the map is IpAddr-keyed on both families).
+                self.reverse_cache
+                    .insert(IpAddr::V6(ip), q.name.clone())
+                    .await;
                 log::debug!("DNS: {} (type {}) → hosts {}", q.name, q.qtype, ip);
                 return build_aaaa_response(query, ip);
             },
@@ -621,16 +672,11 @@ impl DnsHijack {
             None => {},
         }
 
-        // fake-ip mode answers AAAA empty (see `aaaa_short_circuit` for
-        // why); with fake-ip off the query falls through to the normal
-        // upstream chain below and AAAA records pass through untouched.
-        if aaaa_short_circuit(self.fakeip.is_some(), q.qtype) {
-            log::debug!(
-                "DNS resolve: {} type AAAA -> empty (fake-ip mode)",
-                q.name
-            );
-            return build_empty_response(query);
-        }
+        // AAAA handling follows the plan: on non-direct plans the fake-ip
+        // branch below answers AAAA with a v6 fake (dual-family fake pool);
+        // on direct plans and with fake-ip off the query falls through to
+        // the normal upstream chain and AAAA records pass through untouched
+        // (only `apply_txn_id` rewrites bytes, record-type agnostic).
 
         let cache_key_base = format!("{}/{}", q.name, q.qtype);
 
@@ -659,11 +705,7 @@ impl DnsHijack {
                 .filter(|(ts, _)| ts.elapsed() < CACHE_TTL)
             {
                 drop(guard);
-                for (ip, _domain) in parse_a_records(&cached) {
-                    self.reverse_cache
-                        .insert(IpAddr::V4(ip), q.name.clone())
-                        .await;
-                }
+                self.populate_reverse_cache(&cached, &q.name).await;
                 return Some(apply_txn_id(&cached, txn_id(query)));
             }
         }
@@ -691,7 +733,7 @@ impl DnsHijack {
             return Some(resp);
         }
 
-        if q.qtype == 1
+        if fakeip_answerable_qtype(q.qtype)
             && plan.outbound_tag != "direct"
             && let Some(fakeip) = &self.fakeip
             && !self
@@ -699,20 +741,22 @@ impl DnsHijack {
                 .as_ref()
                 .is_some_and(|f| f.should_skip(&q.name))
         {
-            let ip = fakeip.allocate(&q.name).await;
-            self.reverse_cache
-                .insert(IpAddr::V4(ip), q.name.clone())
-                .await;
-            if let Some(resp) = build_a_response(query, ip) {
+            let pair = fakeip.allocate(&q.name).await;
+            if let Some(resp) = match q.qtype {
+                1 => build_a_response(query, pair.v4),
+                _ => build_aaaa_response(query, pair.v6),
+            } {
+                self.populate_reverse_cache(&resp, &q.name).await;
                 self.cache
                     .lock()
                     .await
                     .put(cache_key, (Instant::now(), resp.clone()));
                 log::debug!(
-                    "DNS: {} (type {}) → fake-ip {} via {}",
+                    "DNS: {} (type {}) → fake-ip {}/{} via {}",
                     q.name,
                     q.qtype,
-                    ip,
+                    pair.v4,
+                    pair.v6,
                     plan.outbound_tag
                 );
                 return Some(resp);
@@ -748,13 +792,25 @@ impl DnsHijack {
             .put(cache_key, (Instant::now(), response.clone()));
 
         // Populate reverse cache so TUN handler can resolve IP → domain.
-        for (ip, _domain) in parse_a_records(&response) {
-            self.reverse_cache
-                .insert(IpAddr::V4(ip), q.name.clone())
-                .await;
-        }
+        self.populate_reverse_cache(&response, &q.name).await;
 
         Some(response)
+    }
+
+    /// Populate the reverse cache (IP → domain) from a DNS response's A and
+    /// AAAA answers so the TUN handler can restore domains from bare-IP
+    /// packets on both families.
+    async fn populate_reverse_cache(&self, response: &[u8], domain: &str) {
+        for (ip, _record_domain) in parse_a_records(response) {
+            self.reverse_cache
+                .insert(IpAddr::V4(ip), domain.to_string())
+                .await;
+        }
+        for (ip, _record_domain) in parse_aaaa_records(response) {
+            self.reverse_cache
+                .insert(IpAddr::V6(ip), domain.to_string())
+                .await;
+        }
     }
 
     /// Resolve a DNS query through a pooled direct UDP socket.
@@ -1296,23 +1352,68 @@ mod tests {
     }
 
     #[test]
-    fn aaaa_queries_short_circuit_only_under_fakeip() {
-        // fake-ip on: AAAA → empty NOERROR (v4-only fake pool; a real AAAA
-        // would bypass the proxy over v6). fake-ip off: AAAA falls through
-        // to the upstream chain. Every other qtype keeps its own path.
-        for (fakeip, qtype, want) in [
-            (true, 28u16, true),
-            (true, 1u16, false),
-            (true, 65u16, false),
-            (false, 28, false),
-            (false, 1, false),
-            (false, 65, false),
-        ] {
-            assert_eq!(
-                aaaa_short_circuit(fakeip, qtype),
-                want,
-                "fakeip={fakeip} qtype={qtype}"
+    fn fakeip_answers_only_address_family_qtypes() {
+        // Non-direct plans answer A with a v4 fake and AAAA with a v6 fake;
+        // every other qtype (SVCB, TXT, …) keeps its upstream path.
+        assert!(fakeip_answerable_qtype(1));
+        assert!(fakeip_answerable_qtype(28));
+        for qtype in [0u16, 2, 5, 12, 16, 65] {
+            assert!(
+                !fakeip_answerable_qtype(qtype),
+                "qtype={qtype} must not be fake-answered"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn fakeip_pool_allocates_stable_dual_family_pairs() {
+        let pool = FakeIpPool::parse("198.18.0.0/15").unwrap();
+
+        let first = pool.allocate("example.com").await;
+        let again = pool.allocate("example.com").await;
+        assert_eq!(first, again, "same domain must dedup to the same pair");
+
+        let other = pool.allocate("other.com").await;
+        assert_ne!(first.v4, other.v4);
+        assert_ne!(first.v6, other.v6);
+
+        // First allocations: the v4 counter starts at 1 so host = base + 2
+        // (198.18.0.2 — base+1 was the historic first skip), and the v6 host
+        // parts start at 2 (::1 is commonly the TUN's own alias in the same
+        // /64 and must never be handed out).
+        assert_eq!(first.v4, std::net::Ipv4Addr::new(198, 18, 0, 2));
+        assert_eq!(
+            first.v6,
+            "fdfe:dcba:9876::2".parse::<std::net::Ipv6Addr>().unwrap()
+        );
+
+        // Both allocated addresses are recognized as fake-ips.
+        assert!(pool.contains_v4(first.v4));
+        assert!(pool.contains_v4(other.v4));
+        assert!(pool.contains_v6(first.v6));
+        assert!(pool.contains_v6(other.v6));
+
+        // Foreign addresses are not fake-ips: a random v4 outside the CIDR
+        // and a global v6 outside the ULA /64 (plus the pool's own net and
+        // the ::1 edge case).
+        assert!(!pool.contains_v4(std::net::Ipv4Addr::new(8, 8, 8, 8)));
+        assert!(!pool.contains_v4(std::net::Ipv4Addr::new(198, 20, 0, 1)));
+        assert!(!pool.contains_v6("2001:4860:4860::8888".parse().unwrap()));
+        assert!(!pool.contains_v6(std::net::Ipv6Addr::UNSPECIFIED));
+        assert_ne!(first.v6, std::net::Ipv6Addr::LOCALHOST);
+    }
+
+    #[tokio::test]
+    async fn fakeip_pool_wraps_within_range_when_exhausted() {
+        // A tiny pool forces the modulo wrap so every allocated v4 stays in
+        // range and every v6 stays inside the /64.
+        let pool = FakeIpPool::parse("198.18.0.0/30").unwrap();
+        let mut v6_seen = std::collections::HashSet::new();
+        for i in 0..100u64 {
+            let pair = pool.allocate(&format!("d{i}.test")).await;
+            assert!(pool.contains_v4(pair.v4));
+            assert!(pool.contains_v6(pair.v6));
+            assert!(v6_seen.insert(pair.v6), "v6 counter must not repeat early");
         }
     }
 

@@ -35,10 +35,10 @@ pub fn build_a_response(
 }
 
 /// Build an AAAA-record response that answers `query` with `ip` (static
-/// hosts table; the fake-ip v6 pool is ipv6-plan Phase 2). Wire-shape
-/// identical to [`build_a_response`] apart from TYPE=28 and a 16-octet
-/// RDATA — upstream passthrough needs no per-record rewriting, so this is
-/// the only AAAA-specific builder.
+/// hosts table and the fake-ip v6 ULA pool). Wire-shape identical to
+/// [`build_a_response`] apart from TYPE=28 and a 16-octet RDATA — upstream
+/// passthrough needs no per-record rewriting, so this is the only
+/// AAAA-specific builder.
 pub fn build_aaaa_response(
     query: &[u8], ip: std::net::Ipv6Addr,
 ) -> Option<Vec<u8>> {

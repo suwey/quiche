@@ -828,7 +828,11 @@ async fn accept_loop(
                             },
                             None => {
                                 let is_fakeip = match &ctx.dns_hijack {
-                                    Some(hj) => hj.fakeip_contains(v4),
+                                    Some(hj) => {
+                                        hj.fakeip_contains(
+                                            session.target_addr.ip(),
+                                        )
+                                    },
                                     None => false,
                                 };
                                 if is_fakeip {

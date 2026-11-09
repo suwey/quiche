@@ -591,7 +591,7 @@ async fn handle_udp_packet(
                     )
                 } else {
                     if let Some(hj) = &ctx.dns_hijack
-                        && hj.fakeip_contains(v4) {
+                        && hj.fakeip_contains(IpAddr::V4(v4)) {
                             log::warn!(
                                 "TUN fake-ip missing reverse mapping: {}:{}",
                                 v4,
