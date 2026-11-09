@@ -1249,6 +1249,89 @@ fn find_utun_by_addr(addr: std::net::IpAddr) -> Option<String> {
 mod tests {
     use super::*;
 
+    /// Build a TunConfig from a minimal TOML inbound stanza.
+    fn tun_config_from(toml_text: &str) -> TunConfig {
+        let cfg: crate::config::InboundConfig =
+            toml::from_str(toml_text).unwrap();
+        TunConfig::from_inbound_config(&cfg).unwrap()
+    }
+
+    #[test]
+    fn tun_addr_defaults_to_v4_cidr_without_v6() {
+        let cfg = tun_config_from("type = \"tun\"");
+        assert_eq!(cfg.addr, IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1)));
+        assert_eq!(cfg.mask_len, 24);
+        // v4-only tunnel: the v6 data plane stays off (default principle).
+        assert_eq!(cfg.v6_addr, None);
+        assert_eq!(cfg.v6_prefix, 64);
+    }
+
+    #[test]
+    fn tun_addr6_adds_dual_stack_address() {
+        let cfg = tun_config_from(
+            "type = \"tun\"\naddr = \"10.0.0.1/24\"\naddr6 = \"fdfe:dcba:9876::1/64\"",
+        );
+        assert_eq!(cfg.addr, IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1)));
+        assert_eq!(
+            cfg.v6_addr,
+            Some("fdfe:dcba:9876::1".parse::<Ipv6Addr>().unwrap())
+        );
+        assert_eq!(cfg.v6_prefix, 64);
+    }
+
+    #[test]
+    fn tun_addr6_caps_prefix_at_128() {
+        let cfg = tun_config_from("type = \"tun\"\naddr6 = \"fdfe:dcba:9876::1/128\"");
+        assert_eq!(cfg.v6_prefix, 128);
+
+        let err = TunConfig::from_inbound_config(
+            &toml::from_str::<crate::config::InboundConfig>(
+                "type = \"tun\"\naddr6 = \"fdfe:dcba:9876::1/129\"",
+            )
+            .unwrap(),
+        )
+        .unwrap_err();
+        assert!(err.contains("invalid addr6 prefix"), "{err}");
+    }
+
+    #[test]
+    fn tun_addr6_empty_string_disables_the_v6_plane() {
+        let cfg = tun_config_from("type = \"tun\"\naddr6 = \"\"");
+        assert_eq!(cfg.v6_addr, None);
+    }
+
+    #[test]
+    fn tun_addr_v6_cidr_becomes_the_primary_address() {
+        // `addr` itself being an IPv6 CIDR makes it the interface's v6
+        // address; /128 is the cap, like addr6.
+        let cfg = tun_config_from("type = \"tun\"\naddr = \"fd00::1/128\"");
+        assert_eq!(cfg.addr, IpAddr::V6("fd00::1".parse().unwrap()));
+        assert_eq!(cfg.v6_addr, Some("fd00::1".parse::<Ipv6Addr>().unwrap()));
+        assert_eq!(cfg.v6_prefix, 128);
+
+        let err = TunConfig::from_inbound_config(
+            &toml::from_str::<crate::config::InboundConfig>(
+                "type = \"tun\"\naddr = \"fd00::1/129\"",
+            )
+            .unwrap(),
+        )
+        .unwrap_err();
+        assert!(err.contains("invalid addr prefix"), "{err}");
+    }
+
+    #[test]
+    fn tun_addr_rejects_v4_prefix_above_32_and_missing_cidr() {
+        for bad in ["type = \"tun\"\naddr = \"10.0.0.1/33\"", "type = \"tun\"\naddr = \"10.0.0.1\""] {
+            assert!(
+                TunConfig::from_inbound_config(
+                    &toml::from_str::<crate::config::InboundConfig>(bad).unwrap()
+                )
+                .is_err(),
+                "{bad} must be rejected"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn shutdown_drains_the_tcp_session_registry() {
         let registry: TcpCancelRegistry = Arc::new(Mutex::new(HashMap::new()));

@@ -8,9 +8,16 @@ tag = "tun-in"
 # include_package = ["com.example.app"]  # 仅这些应用的流量进 VPN
 # exclude_package = ["com.bank.app"]     # 这些应用的流量绕过 VPN 直连
 
+# 双栈隧道（可选）：配置后 VPN 额外接管 v6（addAddress + ::/0 route）；
+# 不配（默认）保持 v4-only。fake-ip AAAA 需要它才可达。
+# addr6 = "fdfe:dcba:9876::1/64"
+
 # DNS 静态 hosts 表（优先于规则/缓存/上游；0.0.0.0 = 屏蔽）：
 # [dns]
 # hosts = { "nas.lan" = "192.168.50.10", "ads.example.com" = "0.0.0.0" }
+# fake-ip v6 池与 AAAA 策略（默认值如下）：
+# fakeip_inet6_range = "fdfe:dcba:9876::/64"
+# domain_strategy = "prefer_ipv4"   # prefer_ipv4 | prefer_ipv6 | ipv4_only
 
 [[outbounds]]
 type = "mless"

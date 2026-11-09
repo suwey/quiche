@@ -1,10 +1,17 @@
 [dns]
 fakeip = "198.18.0.0/15"
+# fake-ip v6 池（AAAA 应答来源，默认 fdfe:dcba:9876::/64）：
+# fakeip_inet6_range = "fdfe:dcba:9876::/64"
+# AAAA/真解析策略：prefer_ipv4（默认，AAAA 照常应答）| prefer_ipv6 | ipv4_only（AAAA 一律空应答）
+# domain_strategy = "ipv4_only"
 
 [[inbounds]]
 type = "tun"
 tag = "tun-in"
 # addr defaults to "10.0.0.1/24"
+# 双栈隧道：配置 addr6 后 TUN 额外获得 v6 地址并接管 ::/1 + 8000::/1；
+# 不配（默认）则保持 v4-only，泄漏防护自动生效。
+# addr6 = "fdfe:dcba:9876::1/64"
 # Linux desktop: set local_direct=false so systemd-resolved/Firefox DNS gets fake-ip.
 # Router default is true.
 local_direct = false

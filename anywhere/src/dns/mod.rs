@@ -4,12 +4,12 @@
 //! through the rule engine, and forwards to either the `direct` upstream
 //! (default 223.5.5.5) or the `remote` upstream (default 8.8.8.8). On
 //! non-direct plans, fake-ip mode answers A with a v4 fake from the
-//! configured CIDR and AAAA with a v6 fake from the fixed ULA pool
-//! `fdfe:dcba:9876::/64` — both addresses restore the same domain in the
-//! TUN handler. Direct plans (and fakeip-filtered domains) resolve for real
-//! through the normal upstream chain, with upstream AAAA records passed
-//! through untouched. Responses are cached in a small LRU keyed by
-//! `{domain}/{qtype}`.
+//! configured CIDR and AAAA with a v6 fake from the pool set by
+//! `fakeip_inet6_range` (default `fdfe:dcba:9876::/64`) — both addresses
+//! restore the same domain in the TUN handler. Direct plans (and
+//! fakeip-filtered domains) resolve for real through the normal upstream
+//! chain, with upstream AAAA records passed through untouched. Responses are
+//! cached in a small LRU keyed by `{domain}/{qtype}`.
 //!
 //! Sub-modules:
 //! - [`wire`] — DNS wire-format parsing/building (pure functions).
@@ -87,6 +87,7 @@ pub const DNS_REDIRECT_PORT: u16 = 1053;
 /// direct = ["https://doh.pub/dns-query", "https://dns.alidns.com/dns-query", "223.5.5.5"]
 /// remote = ["8.8.8.8", "1.1.1.1"]
 /// fakeip = "198.18.0.0/15"
+/// # fakeip_inet6_range = "fdfe:dcba:9876::/64"
 /// ```
 ///
 /// DoH upstreams (entries starting with `https://`) and plain UDP upstreams
@@ -103,13 +104,23 @@ pub struct DnsConfig {
     /// Fake-IP v4 CIDR, e.g. "198.18.0.0/15". Enabled by default for TUN so
     /// domain information survives IP-only TUN packets. A queries answer
     /// with a v4 fake from this range and AAAA queries with a v6 fake from
-    /// the fixed ULA pool `fdfe:dcba:9876::/64`; both restore the same
+    /// the pool set by `fakeip_inet6_range`; both restore the same
     /// domain in the TUN handler.
     /// Set to `false` to disable FakeIP and use real DNS resolution
     /// (redir-host mode: real IP returned, IP→domain mapping still
     /// maintained via reverse cache for rule matching).
     #[serde(default = "default_fakeip", deserialize_with = "de_fakeip")]
     pub fakeip: Option<String>,
+
+    /// Fake-IP v6 pool CIDR for AAAA answers, e.g. "fdfe:dcba:9876::/64".
+    /// Default is that same ULA /64 (sing-box's `inet6_range` convention,
+    /// kept identical for easier debugging against other fake-ip
+    /// implementations). Prefixes from /1 to /126 are accepted; host parts
+    /// start at 2 because `::1` within the pool is commonly the TUN's own
+    /// v6 address (`tun.addr6 = ...::1`) and must never be handed out.
+    /// Only read when `fakeip` is enabled.
+    #[serde(default = "default_fakeip_inet6_range")]
+    pub fakeip_inet6_range: Option<String>,
 
     /// FakeIP filter - domains in this list use real DNS instead of FakeIP.
     /// Supports exact domains (`dns.msftnsci.com`) and wildcards
@@ -137,6 +148,7 @@ impl Default for DnsConfig {
             direct: default_direct(),
             remote: default_remote(),
             fakeip: default_fakeip(),
+            fakeip_inet6_range: default_fakeip_inet6_range(),
             fakeip_filter: None,
             hosts: None,
         }
@@ -157,6 +169,14 @@ fn default_remote() -> Vec<String> {
 }
 fn default_fakeip() -> Option<String> {
     Some("198.18.0.0/15".to_string())
+}
+/// Default fake-ip v6 pool: a fixed ULA /64 (sing-box's `inet6_range`
+/// default, kept identical for easier debugging against other fake-ip
+/// implementations).
+pub(crate) const DEFAULT_FAKEIP_V6_RANGE: &str = "fdfe:dcba:9876::/64";
+
+fn default_fakeip_inet6_range() -> Option<String> {
+    Some(DEFAULT_FAKEIP_V6_RANGE.to_string())
 }
 
 /// Deserialize fakeip field: accept a CIDR string (enabled), `false`
@@ -211,13 +231,22 @@ fn nanos_random(len: usize) -> usize {
         .unwrap_or(0)
 }
 
-/// fake-ip v6 pool: a fixed ULA /64 (sing-box's default `inet6_range`, kept
-/// identical for easier debugging against other fake-ip implementations).
-/// A /64 offers a host space far beyond any realistic table size, so the
-/// counter simply wraps like the v4 pool does. `dns.fakeip` configures only
-/// the v4 CIDR; making the v6 range configurable is ipv6-plan Phase 3.
-const FAKEIP_V6_NET: std::net::Ipv6Addr =
-    std::net::Ipv6Addr::new(0xfdfe, 0xdcba, 0x9876, 0, 0, 0, 0, 0);
+/// Zero out everything past the first `prefix` bits of `ip`. The fake-ip v6
+/// pool compares addresses prefix-masked so any configured CIDR
+/// (`fakeip_inet6_range`) works, not just the default /64.
+fn masked_v6(ip: std::net::Ipv6Addr, prefix: u8) -> std::net::Ipv6Addr {
+    let mut o = ip.octets();
+    for (i, b) in o.iter_mut().enumerate() {
+        let bit_start = (i as u16) * 8;
+        if bit_start >= prefix as u16 {
+            *b = 0;
+        } else if bit_start + 8 > prefix as u16 {
+            let keep = prefix as u16 - bit_start; // 1..7
+            *b &= !((0xffu16 >> keep) as u8);
+        }
+    }
+    std::net::Ipv6Addr::from(o)
+}
 
 /// One domain's fake-ip addresses: A queries answer `v4`, AAAA queries
 /// answer `v6`, and the TUN handler restores both to the same domain.
@@ -231,19 +260,56 @@ struct FakeIpPair {
 struct FakeIpPool {
     base: u32,
     size: u32,
+    /// v6 pool network address, masked to `v6_prefix` (parsed from
+    /// `fakeip_inet6_range`, default `fdfe:dcba:9876::/64`).
+    v6_net: std::net::Ipv6Addr,
+    v6_prefix: u8,
+    /// Size of the v6 host space when it fits in the u64 counter
+    /// (prefix > 64); `None` means prefix <= 64 and the counter wraps
+    /// naturally at 2^64 like the v4 pool does.
+    v6_host_space: Option<u64>,
     next: Arc<std::sync::atomic::AtomicU32>,
-    /// Host-part counter for the v6 ULA pool (host bits are the low 64).
+    /// Host-part counter for the v6 pool (host bits are the low 64).
     v6_next: Arc<std::sync::atomic::AtomicU64>,
     /// Domain → allocated address pair, so repeated queries for the same
     /// domain return the same FakeIPs instead of burning new addresses.
     domain_map: Arc<tokio::sync::Mutex<lru::LruCache<String, FakeIpPair>>>,
 }
 
+/// Parse the fake-ip v6 pool CIDR. Returns the network address masked to the
+/// prefix, the prefix, and the bounded host-space size (`None` when the host
+/// space is ≥ 2^64, i.e. prefix <= 64). Prefixes above /126 are rejected:
+/// host parts start at 2 (skipping `::1`, commonly the TUN's own alias), so
+/// at least 4 host addresses must exist.
+fn parse_v6_pool(cidr: &str) -> Result<(std::net::Ipv6Addr, u8, Option<u64>), String> {
+    let (ip_s, prefix_s) = cidr
+        .split_once('/')
+        .ok_or_else(|| format!("invalid fakeip_inet6_range CIDR '{cidr}'"))?;
+    let ip: std::net::Ipv6Addr = ip_s
+        .trim()
+        .parse()
+        .map_err(|e| format!("invalid fakeip_inet6_range address: {e}"))?;
+    let prefix: u8 = prefix_s
+        .trim()
+        .parse()
+        .map_err(|e| format!("invalid fakeip_inet6_range prefix: {e}"))?;
+    if prefix > 126 {
+        return Err(
+            "fakeip_inet6_range too small (need at least 4 host addresses)"
+                .to_string(),
+        );
+    }
+    let host_bits = 128u16 - u16::from(prefix);
+    let host_space =
+        if host_bits >= 64 { None } else { Some(1u64 << host_bits) };
+    Ok((masked_v6(ip, prefix), prefix, host_space))
+}
+
 impl FakeIpPool {
-    fn parse(cidr: &str) -> Result<Self, String> {
-        let (ip, prefix) = cidr
+    fn parse(v4_cidr: &str, v6_cidr: &str) -> Result<Self, String> {
+        let (ip, prefix) = v4_cidr
             .split_once('/')
-            .ok_or_else(|| format!("invalid fakeip CIDR '{cidr}'"))?;
+            .ok_or_else(|| format!("invalid fakeip CIDR '{v4_cidr}'"))?;
         let ip: std::net::Ipv4Addr = ip
             .parse()
             .map_err(|e| format!("invalid fakeip address: {e}"))?;
@@ -257,9 +323,13 @@ impl FakeIpPool {
         if size <= 2 {
             return Err("fakeip range too small".to_string());
         }
+        let (v6_net, v6_prefix, v6_host_space) = parse_v6_pool(v6_cidr)?;
         Ok(Self {
             base: u32::from(ip),
             size,
+            v6_net,
+            v6_prefix,
+            v6_host_space,
             next: Arc::new(std::sync::atomic::AtomicU32::new(1)),
             v6_next: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             domain_map: Arc::new(tokio::sync::Mutex::new(lru::LruCache::new(
@@ -274,9 +344,10 @@ impl FakeIpPool {
         v >= self.base && v < self.base + self.size
     }
 
-    /// True when `ip` falls within the v6 pool's /64 (first 64 bits match).
+    /// True when `ip` falls within the configured v6 pool (prefix-masked
+    /// comparison against the pool network).
     fn contains_v6(&self, ip: std::net::Ipv6Addr) -> bool {
-        ip.octets()[..8] == FAKEIP_V6_NET.octets()[..8]
+        masked_v6(ip, self.v6_prefix).octets() == self.v6_net.octets()
     }
 
     /// Allocate the fake-ip pair for `domain`. If the domain already has a
@@ -284,7 +355,7 @@ impl FakeIpPool {
     /// AAAA answers for a domain always point at the same name in the TUN
     /// restore path.
     ///
-    /// v6 host parts start at 2: the first address of the /64 is commonly
+    /// v6 host parts start at 2: the first address of the pool is commonly
     /// used as the TUN interface's own v6 address (`tun.addr6 = ...::1`), and
     /// a fake-ip equal to the TUN address would be dropped by the handler's
     /// re-injection guard instead of being proxied.
@@ -301,8 +372,15 @@ impl FakeIpPool {
         let v4 = std::net::Ipv4Addr::from(self.base + host);
         let n6 =
             self.v6_next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let host6 = 2u64.wrapping_add(n6);
-        let mut octets = FAKEIP_V6_NET.octets();
+        let host6 = match self.v6_host_space {
+            // Bounded host space (prefix > 64): wrap inside it, still
+            // starting at 2 so the pool's ::1 stays reserved for the TUN.
+            Some(space) => 2 + (n6 % (space - 2)),
+            // Prefix <= 64: the counter itself is the host part and wraps
+            // naturally at 2^64.
+            None => 2u64.wrapping_add(n6),
+        };
+        let mut octets = self.v6_net.octets();
         octets[8..].copy_from_slice(&host6.to_be_bytes());
         let v6 = std::net::Ipv6Addr::from(octets);
         let pair = FakeIpPair { v4, v6 };
@@ -455,7 +533,8 @@ pub struct DnsHijack {
 
 impl DnsHijack {
     /// Returns true if `ip` is a FakeIP address: within the configured v4
-    /// CIDR, or within the fixed v6 ULA pool (`fdfe:dcba:9876::/64`).
+    /// CIDR, or within the configured v6 pool
+    /// (`fakeip_inet6_range`, default `fdfe:dcba:9876::/64`).
     pub fn fakeip_contains(&self, ip: IpAddr) -> bool {
         match ip {
             IpAddr::V4(v4) => {
@@ -542,7 +621,13 @@ impl DnsHijack {
         let doh = DohClient::new(bootstrap);
 
         let fakeip = match &config.fakeip {
-            Some(cidr) => Some(FakeIpPool::parse(cidr)?),
+            Some(cidr) => {
+                let v6_range = config
+                    .fakeip_inet6_range
+                    .as_deref()
+                    .unwrap_or(DEFAULT_FAKEIP_V6_RANGE);
+                Some(FakeIpPool::parse(cidr, v6_range)?)
+            },
             None => None,
         };
 
@@ -1377,7 +1462,8 @@ mod tests {
 
     #[tokio::test]
     async fn fakeip_pool_allocates_stable_dual_family_pairs() {
-        let pool = FakeIpPool::parse("198.18.0.0/15").unwrap();
+        let pool =
+            FakeIpPool::parse("198.18.0.0/15", DEFAULT_FAKEIP_V6_RANGE).unwrap();
 
         let first = pool.allocate("example.com").await;
         let again = pool.allocate("example.com").await;
@@ -1417,7 +1503,8 @@ mod tests {
     async fn fakeip_pool_wraps_within_range_when_exhausted() {
         // A tiny pool forces the modulo wrap so every allocated v4 stays in
         // range and every v6 stays inside the /64.
-        let pool = FakeIpPool::parse("198.18.0.0/30").unwrap();
+        let pool =
+            FakeIpPool::parse("198.18.0.0/30", DEFAULT_FAKEIP_V6_RANGE).unwrap();
         let mut v6_seen = std::collections::HashSet::new();
         for i in 0..100u64 {
             let pair = pool.allocate(&format!("d{i}.test")).await;
@@ -1425,6 +1512,82 @@ mod tests {
             assert!(pool.contains_v6(pair.v6));
             assert!(v6_seen.insert(pair.v6), "v6 counter must not repeat early");
         }
+    }
+
+    #[test]
+    fn fakeip_inet6_range_config_defaults_and_parses() {
+        // Default: the fixed ULA /64, present even when the key is omitted.
+        let cfg: DnsConfig = toml::from_str("fakeip = \"198.18.0.0/15\"").unwrap();
+        assert_eq!(
+            cfg.fakeip_inet6_range.as_deref(),
+            Some(DEFAULT_FAKEIP_V6_RANGE)
+        );
+
+        // Custom range overrides it; a /64-less value is rejected at parse.
+        let cfg: DnsConfig = toml::from_str(
+            "fakeip = \"198.18.0.0/15\"\nfakeip_inet6_range = \"fd00:1986::/48\"",
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.fakeip_inet6_range.as_deref(),
+            Some("fd00:1986::/48")
+        );
+    }
+
+    #[tokio::test]
+    async fn fakeip_pool_uses_configured_v6_range() {
+        let pool = FakeIpPool::parse("198.18.0.0/15", "fd00:1986::/64").unwrap();
+
+        let pair = pool.allocate("example.com").await;
+        assert_eq!(
+            pair.v6,
+            "fd00:1986::2".parse::<std::net::Ipv6Addr>().unwrap()
+        );
+        assert!(pool.contains_v6(pair.v6));
+        assert!(pool.contains_v6("fd00:1986::dead".parse().unwrap()));
+
+        // Everything outside the configured /64 is not a fake-ip — including
+        // the previous hardcoded ULA pool and the global range.
+        assert!(!pool.contains_v6("fdfe:dcba:9876::2".parse().unwrap()));
+        assert!(!pool.contains_v6("2001:4860:4860::8888".parse().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn fakeip_pool_v6_narrow_prefix_stays_in_range() {
+        // A /112 has a 16-bit host space: allocations must wrap within it
+        // and the prefix-masked contains() must match every allocated host.
+        let pool = FakeIpPool::parse("198.18.0.0/15", "fd00:1986::/112").unwrap();
+        for i in 0..1000u64 {
+            let pair = pool.allocate(&format!("d{i}.test")).await;
+            assert!(pool.contains_v6(pair.v6));
+            let host = u64::from_be_bytes(pair.v6.octets()[8..16].try_into().unwrap());
+            assert!(host >= 2 && host < 0x10000, "host {host} outside /112");
+        }
+    }
+
+    #[tokio::test]
+    async fn fakeip_pool_v6_accepts_unmasked_network_address() {
+        // Configuring the pool with a host address inside the /64 (e.g. the
+        // same ::1 the TUN uses) must behave as the masked network.
+        let pool =
+            FakeIpPool::parse("198.18.0.0/15", "fdfe:dcba:9876::1/64").unwrap();
+        let pair = pool.allocate("example.com").await;
+        assert_eq!(
+            pair.v6,
+            "fdfe:dcba:9876::2".parse::<std::net::Ipv6Addr>().unwrap()
+        );
+        assert!(pool.contains_v6("fdfe:dcba:9876::ffff".parse().unwrap()));
+        assert!(!pool.contains_v6("fdfe:dcba:9877::1".parse().unwrap()));
+    }
+
+    #[test]
+    fn fakeip_pool_v6_rejects_prefixes_without_host_space() {
+        // /127 and /128 cannot skip the reserved ::1 host part.
+        assert!(FakeIpPool::parse("198.18.0.0/15", "fd00::/127").is_err());
+        assert!(FakeIpPool::parse("198.18.0.0/15", "fd00::1/128").is_err());
+        // Missing CIDR suffix and garbage are rejected too.
+        assert!(FakeIpPool::parse("198.18.0.0/15", "fd00::").is_err());
+        assert!(FakeIpPool::parse("198.18.0.0/15", "nonsense/64").is_err());
     }
 
     #[test]
