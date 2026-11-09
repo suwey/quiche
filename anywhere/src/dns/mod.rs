@@ -1055,6 +1055,16 @@ impl DnsHijack {
                 );
                 Self::run_listener(this_lo, addr).await;
             }));
+            // v6 mirror: the ip6tables OUTPUT REDIRECT (only installed for
+            // dual-stack tunnels) rewrites local v6 DNS to ::1:1053.
+            let this_lo6 = this.clone();
+            handles.push(tokio::spawn(async move {
+                let addr = std::net::SocketAddr::new(
+                    std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+                    DNS_REDIRECT_PORT,
+                );
+                Self::run_listener(this_lo6, addr).await;
+            }));
         }
 
         // IPv6 listener (macOS only - pf `rdr inet6` redirects to ::1:1053).
