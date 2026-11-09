@@ -269,6 +269,15 @@ pub fn first_a_record(resp: &[u8]) -> Option<std::net::IpAddr> {
         .map(|(ip, _)| std::net::IpAddr::V4(ip))
 }
 
+/// Extract the first AAAA record IP from a raw DNS response. Used by the
+/// DoH bootstrap under `domain_strategy = prefer_ipv6` (AAAA first, then A).
+pub fn first_aaaa_record(resp: &[u8]) -> Option<std::net::IpAddr> {
+    crate::inbound::tun::reverse_dns::parse_aaaa_records(resp)
+        .into_iter()
+        .next()
+        .map(|(ip, _)| std::net::IpAddr::V6(ip))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -376,5 +385,21 @@ mod tests {
         let cached = vec![0u8, 0, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0];
         let restored = apply_txn_id(&cached, 0x1234);
         assert_eq!(&restored[..2], &[0x12, 0x34]);
+    }
+
+    #[test]
+    fn first_aaaa_record_round_trips() {
+        let ip = std::net::Ipv6Addr::new(0x240e, 0x56, 0x400c, 0x8000, 0, 0, 0, 0x11);
+        let q = make_query("example.org", 28);
+        let r = build_aaaa_response(&q, ip).expect("AAAA response must build");
+        assert_eq!(first_aaaa_record(&r), Some(std::net::IpAddr::V6(ip)));
+
+        // An A-only response carries no AAAA record.
+        let q4 = make_query("example.org", 1);
+        let r4 = build_a_response(&q4, std::net::Ipv4Addr::new(1, 2, 3, 4))
+            .expect("A response must build");
+        assert_eq!(first_aaaa_record(&r4), None);
+        // And a garbage payload yields None instead of panicking.
+        assert_eq!(first_aaaa_record(&[0u8; 4]), None);
     }
 }

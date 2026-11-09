@@ -18,7 +18,7 @@ use tokio::sync::Mutex;
 use tokio::time::timeout;
 
 use crate::dns::upstream::Upstream;
-use crate::dns::wire::{build_a_query, first_a_record};
+use crate::dns::wire::{build_dns_query, first_aaaa_record, first_a_record};
 use crate::inbound::Destination;
 use crate::outbound::common::bind_udp_bypass;
 
@@ -95,9 +95,23 @@ type H2SendRequest = hyper::client::conn::http2::SendRequest<Full<Bytes>>;
 // TCP+TLS connection.  A dead connection is detected via `is_closed()` and
 // evicted so the next query reconnects.
 
+/// The qtypes the DoH bootstrap tries, in order, when resolving the DoH
+/// server's own hostname. `prefer_ipv6` goes AAAA-first and falls back to A;
+/// the other strategies are A-only — `ipv4_only` must never emit an AAAA
+/// query, and `prefer_ipv4` keeps the historic single-A bootstrap.
+fn bootstrap_qtypes(strategy: crate::dns::DomainStrategy) -> &'static [u16] {
+    match strategy {
+        crate::dns::DomainStrategy::PreferIpv6 => &[28, 1],
+        crate::dns::DomainStrategy::PreferIpv4
+        | crate::dns::DomainStrategy::Ipv4Only => &[1],
+    }
+}
+
 /// A single DNS-over-HTTPS client.
 pub struct DohClient {
     bootstrap: Vec<Destination>,
+    /// Family strategy for the bootstrap lookups (from `dns.domain_strategy`).
+    strategy: crate::dns::DomainStrategy,
     hosts: Mutex<HashMap<String, (std::net::IpAddr, Instant)>>,
     /// Pool of reusable h2 `SendRequest` handles keyed by
     /// `"{host}:{ip}:{port}"`.  The canonical entry is kept alive to prevent
@@ -107,9 +121,12 @@ pub struct DohClient {
 }
 
 impl DohClient {
-    pub fn new(bootstrap: Vec<Destination>) -> Self {
+    pub fn new(
+        bootstrap: Vec<Destination>, strategy: crate::dns::DomainStrategy,
+    ) -> Self {
         Self {
             bootstrap,
+            strategy,
             hosts: Mutex::new(HashMap::new()),
             pool: Mutex::new(HashMap::new()),
         }
@@ -234,23 +251,30 @@ impl DohClient {
             }
         }
 
-        let q = build_a_query(host);
         if !self.bootstrap.is_empty() {
             let idx = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_nanos() as usize % self.bootstrap.len())
                 .unwrap_or(0);
             let up = &self.bootstrap[idx];
-            if let Some(ip) = self
-                .bootstrap_via_udp(&q, up)
-                .await
-                .and_then(|resp| first_a_record(&resp))
-            {
-                self.hosts.lock().await.insert(
-                    host.to_string(),
-                    (ip, Instant::now() + BOOTSTRAP_TTL),
-                );
-                return Some(ip);
+            // Strategy-ordered qtypes on the same upstream: AAAA first under
+            // prefer_ipv6, A only otherwise (ipv4_only never emits AAAA).
+            for qtype in bootstrap_qtypes(self.strategy) {
+                let q = build_dns_query(host, *qtype);
+                let parsed = match self.bootstrap_via_udp(&q, up).await {
+                    Some(resp) => match qtype {
+                        28 => first_aaaa_record(&resp),
+                        _ => first_a_record(&resp),
+                    },
+                    None => None,
+                };
+                if let Some(ip) = parsed {
+                    self.hosts.lock().await.insert(
+                        host.to_string(),
+                        (ip, Instant::now() + BOOTSTRAP_TTL),
+                    );
+                    return Some(ip);
+                }
             }
         }
 
@@ -414,5 +438,24 @@ async fn doh_h2_exchange(
         None
     } else {
         Some(bytes.to_vec())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dns::DomainStrategy;
+
+    #[test]
+    fn bootstrap_qtypes_follow_the_domain_strategy() {
+        // prefer_ipv6 resolves the DoH hostname AAAA-first, falling back to A.
+        assert_eq!(
+            bootstrap_qtypes(DomainStrategy::PreferIpv6),
+            &[28u16, 1u16]
+        );
+        // prefer_ipv4 keeps the historic single-A bootstrap; ipv4_only must
+        // never emit an AAAA query either.
+        assert_eq!(bootstrap_qtypes(DomainStrategy::PreferIpv4), &[1u16]);
+        assert_eq!(bootstrap_qtypes(DomainStrategy::Ipv4Only), &[1u16]);
     }
 }

@@ -8,8 +8,13 @@
 //! `fakeip_inet6_range` (default `fdfe:dcba:9876::/64`) — both addresses
 //! restore the same domain in the TUN handler. Direct plans (and
 //! fakeip-filtered domains) resolve for real through the normal upstream
-//! chain, with upstream AAAA records passed through untouched. Responses are
-//! cached in a small LRU keyed by `{domain}/{qtype}`.
+//! chain, with upstream AAAA records passed through untouched. The
+//! `domain_strategy` knob (default `prefer_ipv4`, sing-box's analogue
+//! scoped to this DNS layer) governs AAAA: `ipv4_only` answers every AAAA
+//! with an empty NOERROR before the fake-ip or upstream path and never
+//! emits AAAA for its own lookups; `prefer_ipv6` makes the DNS layer's own
+//! lookups (DoH bootstrap) AAAA-first. Responses are cached in a small LRU
+//! keyed by `{domain}/{qtype}`.
 //!
 //! Sub-modules:
 //! - [`wire`] — DNS wire-format parsing/building (pure functions).
@@ -88,6 +93,7 @@ pub const DNS_REDIRECT_PORT: u16 = 1053;
 /// remote = ["8.8.8.8", "1.1.1.1"]
 /// fakeip = "198.18.0.0/15"
 /// # fakeip_inet6_range = "fdfe:dcba:9876::/64"
+/// # domain_strategy = "ipv4_only"
 /// ```
 ///
 /// DoH upstreams (entries starting with `https://`) and plain UDP upstreams
@@ -122,6 +128,13 @@ pub struct DnsConfig {
     #[serde(default = "default_fakeip_inet6_range")]
     pub fakeip_inet6_range: Option<String>,
 
+    /// Address-family strategy for the DNS layer (sing-box's
+    /// `domain_strategy` analogue). See [`DomainStrategy`] for the exact
+    /// per-query semantics. Default: `prefer_ipv4` — i.e. the behavior this
+    /// module has always had.
+    #[serde(default)]
+    pub domain_strategy: DomainStrategy,
+
     /// FakeIP filter - domains in this list use real DNS instead of FakeIP.
     /// Supports exact domains (`dns.msftnsci.com`) and wildcards
     /// (`+.msftnsci.com` or `*.local`). If empty or omitted, a built-in
@@ -149,10 +162,59 @@ impl Default for DnsConfig {
             remote: default_remote(),
             fakeip: default_fakeip(),
             fakeip_inet6_range: default_fakeip_inet6_range(),
+            domain_strategy: DomainStrategy::default(),
             fakeip_filter: None,
             hosts: None,
         }
     }
+}
+
+/// How the DNS layer treats AAAA (type 28) — sing-box's `domain_strategy`
+/// analogue, scoped to this DNS hijack (ipv6-plan Phase 3). The hijack is
+/// query-driven (the client chooses A or AAAA), so the knob's observable
+/// surface is what happens to a type-28 query and how the DNS layer's own
+/// lookups behave:
+///
+/// - [`DomainStrategy::PreferIpv4`] (default): the behavior this module has
+///   always had — AAAA queries are answered normally (fake-ip answers a v6
+///   fake, upstream passthrough resolves for real), clients keep preferring
+///   v4 under Happy Eyeballs, and the DoH bootstrap stays A-only.
+/// - [`DomainStrategy::PreferIpv6`]: same per-query answers (the fake pool
+///   is already dual-family), but the DNS layer's own lookups (DoH server
+///   hostname bootstrap) try AAAA first and fall back to A.
+/// - [`DomainStrategy::Ipv4Only`]: no AAAA answer ever leaves the DNS layer
+///   — type-28 queries get an empty NOERROR before the fake-ip or upstream
+///   path, and the bootstrap never emits AAAA. Real resolution only ever
+///   queries A, exactly as the name says.
+///
+/// Static `hosts` entries outrank the strategy in every mode: they are the
+/// user's explicit per-name overrides.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DomainStrategy {
+    #[default]
+    PreferIpv4,
+    PreferIpv6,
+    Ipv4Only,
+}
+
+impl DomainStrategy {
+    /// Config-string form, used in logs.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::PreferIpv4 => "prefer_ipv4",
+            Self::PreferIpv6 => "prefer_ipv6",
+            Self::Ipv4Only => "ipv4_only",
+        }
+    }
+}
+
+/// True when the strategy requires a type-28 query to be answered with an
+/// empty NOERROR before any resolution happens (fake-ip or upstream alike).
+/// Only `ipv4_only` suppresses AAAA; `prefer_ipv4`/`prefer_ipv6` answer it
+/// normally.
+fn strategy_suppresses_aaaa(strategy: DomainStrategy, qtype: u16) -> bool {
+    strategy == DomainStrategy::Ipv4Only && qtype == 28
 }
 
 fn default_direct() -> Vec<String> {
@@ -529,6 +591,9 @@ pub struct DnsHijack {
     /// when unset or every entry was invalid. Consulted before rules, cache
     /// and upstreams.
     hosts: Option<HashMap<String, std::net::IpAddr>>,
+    /// AAAA family strategy from `dns.domain_strategy`. Static hosts
+    /// entries outrank it; see [`DomainStrategy`].
+    strategy: DomainStrategy,
 }
 
 impl DnsHijack {
@@ -609,6 +674,10 @@ impl DnsHijack {
                 direct_plain.len()
             );
         }
+        log::info!(
+            "DNS: domain_strategy={} (AAAA suppressed only under ipv4_only)",
+            config.domain_strategy.as_str()
+        );
 
         // Bootstrap upstreams for DoH = plain UDP entries from the direct group.
         let bootstrap: Vec<Destination> = direct_plain
@@ -618,7 +687,7 @@ impl DnsHijack {
                 _ => None,
             })
             .collect();
-        let doh = DohClient::new(bootstrap);
+        let doh = DohClient::new(bootstrap, config.domain_strategy);
 
         let fakeip = match &config.fakeip {
             Some(cidr) => {
@@ -674,6 +743,7 @@ impl DnsHijack {
             socket_pool_cap: 8,
             shutdown,
             hosts,
+            strategy: config.domain_strategy,
         })
     }
 
@@ -755,6 +825,23 @@ impl DnsHijack {
                 return build_empty_response(query);
             },
             None => {},
+        }
+
+        // domain_strategy = ipv4_only: no AAAA answer may leave the DNS
+        // layer — neither a fake-ip v6 nor an upstream passthrough. Empty
+        // NOERROR makes Happy Eyeballs fall back to A immediately. The
+        // static hosts block above still wins: those are explicit
+        // per-name overrides.
+        if strategy_suppresses_aaaa(self.strategy, q.qtype)
+            && let Some(resp) = build_empty_response(query)
+        {
+            log::debug!(
+                "DNS: {} (type {}) → empty (domain_strategy {})",
+                q.name,
+                q.qtype,
+                self.strategy.as_str()
+            );
+            return Some(resp);
         }
 
         // AAAA handling follows the plan: on non-direct plans the fake-ip
@@ -1588,6 +1675,48 @@ mod tests {
         // Missing CIDR suffix and garbage are rejected too.
         assert!(FakeIpPool::parse("198.18.0.0/15", "fd00::").is_err());
         assert!(FakeIpPool::parse("198.18.0.0/15", "nonsense/64").is_err());
+    }
+
+    #[test]
+    fn domain_strategy_defaults_to_prefer_ipv4() {
+        // Omitted → the behavior this module has always had.
+        let cfg: DnsConfig = toml::from_str("remote = \"8.8.8.8\"").unwrap();
+        assert_eq!(cfg.domain_strategy, DomainStrategy::PreferIpv4);
+        assert_eq!(DnsConfig::default().domain_strategy, DomainStrategy::PreferIpv4);
+    }
+
+    #[test]
+    fn domain_strategy_parses_all_values_and_rejects_unknown() {
+        for (text, want) in [
+            ("prefer_ipv4", DomainStrategy::PreferIpv4),
+            ("prefer_ipv6", DomainStrategy::PreferIpv6),
+            ("ipv4_only", DomainStrategy::Ipv4Only),
+        ] {
+            let cfg: DnsConfig =
+                toml::from_str(&format!("domain_strategy = \"{text}\"")).unwrap();
+            assert_eq!(cfg.domain_strategy, want, "{text}");
+            assert_eq!(cfg.domain_strategy.as_str(), text);
+        }
+
+        assert!(toml::from_str::<DnsConfig>("domain_strategy = \"prefer_ipv_4\"")
+            .is_err());
+        assert!(toml::from_str::<DnsConfig>("domain_strategy = 4").is_err());
+    }
+
+    #[test]
+    fn only_ipv4_only_suppresses_aaaa_queries() {
+        // ipv4_only: every AAAA is answered empty before any resolution;
+        // A (and every other qtype) is untouched.
+        assert!(strategy_suppresses_aaaa(DomainStrategy::Ipv4Only, 28));
+        assert!(!strategy_suppresses_aaaa(DomainStrategy::Ipv4Only, 1));
+        assert!(!strategy_suppresses_aaaa(DomainStrategy::Ipv4Only, 65));
+
+        // The default and prefer_ipv6 answer AAAA normally (fake-ip v6 or
+        // upstream passthrough — Phase 2 behavior).
+        for s in [DomainStrategy::PreferIpv4, DomainStrategy::PreferIpv6] {
+            assert!(!strategy_suppresses_aaaa(s, 28), "{s:?} must answer AAAA");
+            assert!(!strategy_suppresses_aaaa(s, 1));
+        }
     }
 
     #[test]

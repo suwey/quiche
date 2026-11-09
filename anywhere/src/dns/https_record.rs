@@ -77,7 +77,9 @@ pub async fn resolve_echconfig(host: &str, dns_direct: &[String]) -> Option<Vec<
             _ => None,
         })
         .collect();
-    let client = DohClient::new(bootstrap);
+    // Default (A-only) bootstrap: the ECH lookup has no DnsConfig access, and
+    // the type-65 query it performs is family-agnostic anyway.
+    let client = DohClient::new(bootstrap, crate::dns::DomainStrategy::default());
 
     for up in &candidates {
         match up {
