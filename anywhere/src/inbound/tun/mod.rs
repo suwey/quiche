@@ -620,6 +620,8 @@ impl TunInbound {
                 handle,
                 link_index,
                 addr,
+                v6_addr,
+                config.v6_prefix,
                 name.clone(),
                 config.auto_hijack,
                 monitor_wan_ifaces,

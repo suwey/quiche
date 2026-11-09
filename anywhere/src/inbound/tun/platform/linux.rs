@@ -1,6 +1,7 @@
 //! Linux-specific TUN route management via rtnetlink.
 
 use std::net::IpAddr;
+use std::net::Ipv6Addr;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -37,7 +38,8 @@ const TUN_IIF_EXCEPTION_PRIO: u32 = 400;
 /// them precisely before this function runs.
 /// When `iface_name` is `None`, interface-specific iptables rules are skipped.
 fn teardown_routing(iface_name: Option<&str>) {
-    // Policy routing rules & bypass.
+    // Policy routing rules & bypass — both families (the v6 deletes fail
+    // harmlessly when the tunnel never had a v6 address).
     if let Err(e) =
         run_ip(&["rule", "del", "priority", &TUN_CATCH_ALL_PRIO.to_string()])
     {
@@ -51,6 +53,24 @@ fn teardown_routing(iface_name: Option<&str>) {
     ]) {
         log::debug!("teardown: del iif exception rule failed: {e}");
     }
+    if let Err(e) = run_ip(&[
+        "-6",
+        "rule",
+        "del",
+        "priority",
+        &TUN_CATCH_ALL_PRIO.to_string(),
+    ]) {
+        log::debug!("teardown: del v6 catch-all rule failed: {e}");
+    }
+    if let Err(e) = run_ip(&[
+        "-6",
+        "rule",
+        "del",
+        "priority",
+        &TUN_IIF_EXCEPTION_PRIO.to_string(),
+    ]) {
+        log::debug!("teardown: del v6 iif exception rule failed: {e}");
+    }
 
     // Bypass fwmark rule & table 200 — only safe when the TUN device is about
     // to be deleted (Drop) or doesn't exist yet (startup cleanup).
@@ -59,10 +79,32 @@ fn teardown_routing(iface_name: Option<&str>) {
     ]) {
         log::debug!("teardown: del fwmark rule failed: {e}");
     }
+    if let Err(e) = run_ip(&[
+        "-6",
+        "rule",
+        "del",
+        "fwmark",
+        "1",
+        "table",
+        "100",
+        "priority",
+        "100",
+    ]) {
+        log::debug!("teardown: del v6 fwmark rule failed: {e}");
+    }
     if let Err(e) =
         run_ip(&["route", "flush", "table", &TUN_ROUTING_TABLE.to_string()])
     {
         log::debug!("teardown: flush table 200 failed: {e}");
+    }
+    if let Err(e) = run_ip(&[
+        "-6",
+        "route",
+        "flush",
+        "table",
+        &TUN_ROUTING_TABLE.to_string(),
+    ]) {
+        log::debug!("teardown: flush v6 table 200 failed: {e}");
     }
 
     // Note: LAN mangle DNAT mark rules are removed by the BypassWatcher on
@@ -81,12 +123,28 @@ fn teardown_routing(iface_name: Option<&str>) {
                     "teardown: iptables -D {chain} -i {name} ACCEPT failed: {e}"
                 );
             }
+            if let Err(e) = run_cmd(
+                "ip6tables",
+                &["-D", chain, "-i", name, "-j", "ACCEPT"],
+            ) {
+                log::debug!(
+                    "teardown: ip6tables -D {chain} -i {name} ACCEPT failed: {e}"
+                );
+            }
         }
         if let Err(e) =
             run_cmd("iptables", &["-D", "FORWARD", "-o", name, "-j", "ACCEPT"])
         {
             log::debug!(
                 "teardown: iptables -D FORWARD -o {name} ACCEPT failed: {e}"
+            );
+        }
+        if let Err(e) = run_cmd(
+            "ip6tables",
+            &["-D", "FORWARD", "-o", name, "-j", "ACCEPT"],
+        ) {
+            log::debug!(
+                "teardown: ip6tables -D FORWARD -o {name} ACCEPT failed: {e}"
             );
         }
         if let Err(e) = run_cmd(
@@ -97,6 +155,11 @@ fn teardown_routing(iface_name: Option<&str>) {
                 "teardown: iptables -t nat -D POSTROUTING -o {name} ACCEPT failed: {e}"
             );
         }
+    }
+
+    // IPv6 DNS REDIRECT rule (OUTPUT — local processes).
+    if let Err(e) = run_cmd_args("ip6tables", &dns_redirect_args6(false)) {
+        log::debug!("teardown: del v6 DNS OUTPUT redirect failed: {e}");
     }
 
     // DNS REDIRECT rules.
@@ -176,6 +239,13 @@ pub struct TunRouteManager {
     pub handle: Handle,
     pub link_index: u32,
     pub tun_addr: IpAddr,
+    /// Secondary IPv6 address (`tun.addr6`, or `tun_addr` itself when it is
+    /// an IPv6 CIDR). `None` keeps the tunnel v4-only — no v6 policy rules,
+    /// so v6 traffic keeps using the main table and cannot leak into a TUN
+    /// that would not carry it.
+    pub v6_addr: Option<Ipv6Addr>,
+    /// Prefix length for `v6_addr`.
+    pub v6_prefix: u8,
     pub iface_name: String,
     /// Whether to install iptables rules and DNS redirect (auto-hijack mode).
     pub auto_hijack: bool,
@@ -195,7 +265,8 @@ pub struct TunRouteManager {
 
 impl TunRouteManager {
     pub fn new(
-        handle: Handle, link_index: u32, tun_addr: IpAddr, iface_name: String,
+        handle: Handle, link_index: u32, tun_addr: IpAddr,
+        v6_addr: Option<Ipv6Addr>, v6_prefix: u8, iface_name: String,
         auto_hijack: bool, monitor_wan_ifaces: Vec<String>,
         bypass_lan_ifaces: Vec<String>,
     ) -> Self {
@@ -203,6 +274,8 @@ impl TunRouteManager {
             handle,
             link_index,
             tun_addr,
+            v6_addr,
+            v6_prefix,
             iface_name,
             auto_hijack,
             monitor_wan_ifaces,
@@ -212,7 +285,7 @@ impl TunRouteManager {
         }
     }
 
-    /// Add the TUN IP address to the interface and bring it up.
+    /// Add the TUN IP address(es) to the interface and bring it up.
     pub async fn setup_interface(
         &self,
     ) -> Result<(), Box<dyn std::error::Error>> {
@@ -224,6 +297,18 @@ impl TunRouteManager {
             .replace()
             .execute()
             .await?;
+
+        // Dual-stack: the v6 address comes from `tun.addr6` and is added as
+        // a second interface address (the kernel then has an on-link route
+        // for the fake-ip v6 pool's /64).
+        if let Some(v6) = self.v6_addr {
+            self.handle
+                .address()
+                .add(self.link_index, IpAddr::V6(v6), self.v6_prefix)
+                .replace()
+                .execute()
+                .await?;
+        }
 
         let msg = rtnetlink::LinkUnspec::new_with_index(self.link_index)
             .up()
@@ -243,12 +328,24 @@ impl TunRouteManager {
         // as the effective value for each interface.
         let _ = std::fs::write("/proc/sys/net/ipv4/conf/all/rp_filter", "2");
 
-        log::info!("TUN interface is up with address {}", self.tun_addr);
+        match self.v6_addr {
+            Some(v6) => {
+                log::info!(
+                    "TUN interface is up with addresses {} and [{v6}]",
+                    self.tun_addr
+                );
+            },
+            None => {
+                log::info!("TUN interface is up with address {}", self.tun_addr);
+            },
+        }
         Ok(())
     }
 
     /// Configure all routing: bypass fwmark, policy routing, and optional
-    /// router-specific iptables hacks.
+    /// router-specific iptables hacks. Both address families when the
+    /// tunnel is dual-stack (`v6_addr` set); policy rules on Linux are
+    /// family-scoped, so every rule exists twice (`ip rule` / `ip -6 rule`).
     ///
     /// When `auto_hijack` is true (default), also:
     ///   - Starts a DNS loopback listener (port 1053, redirected from 53 via
@@ -264,25 +361,41 @@ impl TunRouteManager {
     /// Set `auto_hijack = false` to leave routing completely unmodified
     /// (useful when the user manages routing externally).
     ///
-    /// Rules installed:
+    /// Rules installed (per enabled family):
     ///   priority  match              action
     ///      100    fwmark 0x1         lookup 100  (anywhere's own sockets)
-    ///      150+   from <wan_ip>      lookup main (WAN monitor)
-    ///      150+   from <lan_ip>      lookup main (LAN bypass)
-    ///      200+   to <lan_subnet>    lookup main (LAN bypass)
+    ///      150+   from <wan_ip>      lookup main (WAN monitor, v4 only)
+    ///      150+   from <lan_ip>      lookup main (LAN bypass, v4 only)
+    ///      200+   to <lan_subnet>    lookup main (LAN bypass, v4 only)
     ///      400    iif tun0           lookup main (TUN responses reach LAN)
     ///     3000    from all           lookup 200  (everything else → TUN)
     ///    32766    (built-in)         lookup main
     pub fn setup_routing(
         &mut self, auto_hijack: bool,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        run_ip(&[
-            "rule", "add", "fwmark", "1", "table", "100", "priority", "100",
-        ])?;
+        // v4 half — only meaningful when the tunnel has a v4 address
+        // (`refresh_policy_tables` builds table 200 from the TUN address's
+        // family and would fail on a v6 destination under plain `ip route`).
+        if self.tun_addr.is_ipv4() {
+            run_ip(&[
+                "rule", "add", "fwmark", "1", "table", "100", "priority", "100",
+            ])?;
 
-        refresh_policy_tables(self.tun_addr, &self.iface_name)?;
+            refresh_policy_tables(self.tun_addr, &self.iface_name)?;
 
-        log::info!("Bypass routing configured (fwmark 1 → table 100)");
+            log::info!("Bypass routing configured (fwmark 1 → table 100, v4)");
+        }
+
+        // v6 half — mirror of the v4 policy routing. Only installed when the
+        // tunnel has a v6 address: without it the v6 catch-all rule would
+        // steer v6 traffic into a tunnel that cannot carry it.
+        if let Some(v6) = self.v6_addr {
+            run_ip_args(&v6_rule_args(100, &["fwmark", "1", "table", "100"]))?;
+
+            refresh_v6_policy_tables(v6, self.v6_prefix, &self.iface_name)?;
+
+            log::info!("Bypass routing configured (fwmark 1 → table 100, v6)");
+        }
 
         // --- policy routing: table 200 + rules ---
         log::info!(
@@ -295,25 +408,50 @@ impl TunRouteManager {
 
         // --- router hacks (only when auto_hijack is true) ---
         if auto_hijack {
-            for chain in &["INPUT", "FORWARD"] {
+            // ACCEPT rules for the TUN interface — iptables always, ip6tables
+            // when the tunnel carries v6 (otherwise the rules would never
+            // match and only accumulate).
+            let mut binaries: Vec<&str> = vec!["iptables"];
+            if self.v6_addr.is_some() {
+                binaries.push("ip6tables");
+            }
+            for binary in binaries {
+                for chain in &["INPUT", "FORWARD"] {
+                    if let Err(e) = run_cmd(
+                        binary,
+                        &[
+                            "-I",
+                            chain,
+                            "1",
+                            "-i",
+                            &self.iface_name,
+                            "-j",
+                            "ACCEPT",
+                        ],
+                    ) {
+                        log::error!(
+                            "Failed to add {binary} -I {chain} ACCEPT for TUN interface {}: {e}. TUN traffic may be dropped by firewall.",
+                            self.iface_name
+                        );
+                    }
+                }
                 if let Err(e) = run_cmd(
-                    "iptables",
-                    &["-I", chain, "1", "-i", &self.iface_name, "-j", "ACCEPT"],
+                    binary,
+                    &[
+                        "-I",
+                        "FORWARD",
+                        "1",
+                        "-o",
+                        &self.iface_name,
+                        "-j",
+                        "ACCEPT",
+                    ],
                 ) {
                     log::error!(
-                        "Failed to add iptables -I {chain} ACCEPT for TUN interface {}: {e}. TUN traffic may be dropped by firewall.",
+                        "Failed to add {binary} -I FORWARD -o {} ACCEPT: {e}. TUN outbound traffic may be dropped by firewall.",
                         self.iface_name
                     );
                 }
-            }
-            if let Err(e) = run_cmd(
-                "iptables",
-                &["-I", "FORWARD", "1", "-o", &self.iface_name, "-j", "ACCEPT"],
-            ) {
-                log::error!(
-                    "Failed to add iptables -I FORWARD -o {} ACCEPT: {e}. TUN outbound traffic may be dropped by firewall.",
-                    self.iface_name
-                );
             }
             if let Err(e) = run_cmd(
                 "iptables",
@@ -402,6 +540,34 @@ impl TunRouteManager {
             &TUN_ROUTING_TABLE.to_string(),
         ])?;
 
+        // v6 mirror of the two capture rules — only when the tunnel carries
+        // v6 (otherwise v6 traffic must keep using the main table).
+        if self.v6_addr.is_some() {
+            let _ = run_ip(&[
+                "-6",
+                "rule",
+                "del",
+                "priority",
+                &TUN_IIF_EXCEPTION_PRIO.to_string(),
+            ]);
+            run_ip_args(&v6_rule_args(
+                TUN_IIF_EXCEPTION_PRIO,
+                &["iif", &self.iface_name, "lookup", "main"],
+            ))?;
+
+            let _ = run_ip(&[
+                "-6",
+                "rule",
+                "del",
+                "priority",
+                &TUN_CATCH_ALL_PRIO.to_string(),
+            ]);
+            run_ip_args(&v6_rule_args(
+                TUN_CATCH_ALL_PRIO,
+                &["from", "all", "lookup", &TUN_ROUTING_TABLE.to_string()],
+            ))?;
+        }
+
         if auto_hijack {
             let _ = run_cmd(
                 "iptables",
@@ -452,6 +618,24 @@ impl TunRouteManager {
                     "Failed to redirect local DNS (53→{}): {e}",
                     DNS_REDIRECT_PORT
                 );
+            }
+
+            // v6 mirror of the local DNS redirect. The REDIRECT lands on
+            // ::1:1053, which is where `start_hijack_listener` binds a
+            // dedicated listener on Linux. LAN-client v6 DNS is NOT
+            // redirected (no PREROUTING rule): it flows into the TUN via
+            // the policy rules above and is hijacked there by the
+            // dst_port==53 check — same as queries to public v6 resolvers.
+            if self.v6_addr.is_some() {
+                let _ = run_cmd_args("ip6tables", &dns_redirect_args6(false));
+                if let Err(e) =
+                    run_cmd_args("ip6tables", &dns_redirect_args6(true))
+                {
+                    log::error!(
+                        "Failed to redirect local v6 DNS (53→{}): {e}",
+                        DNS_REDIRECT_PORT
+                    );
+                }
             }
 
             let _ = run_cmd(
@@ -540,6 +724,30 @@ impl TunRouteManager {
             );
         }
 
+        // v6 mirror of the capture-rule deletes (harmless when absent).
+        if let Err(e) = run_ip(&[
+            "-6",
+            "rule",
+            "del",
+            "priority",
+            &TUN_CATCH_ALL_PRIO.to_string(),
+        ]) {
+            log::debug!(
+                "disable_tun_capture: del v6 catch-all rule failed: {e}"
+            );
+        }
+        if let Err(e) = run_ip(&[
+            "-6",
+            "rule",
+            "del",
+            "priority",
+            &TUN_IIF_EXCEPTION_PRIO.to_string(),
+        ]) {
+            log::debug!(
+                "disable_tun_capture: del v6 iif exception rule failed: {e}"
+            );
+        }
+
         // Remove DNS redirect so local processes can resolve directly.
         if let Err(e) = run_cmd(
             "iptables",
@@ -590,6 +798,12 @@ impl TunRouteManager {
         ) {
             log::debug!(
                 "disable_tun_capture: del DNS PREROUTING redirect failed: {e}"
+            );
+        }
+        // v6 mirror of the OUTPUT redirect delete (harmless when absent).
+        if let Err(e) = run_cmd_args("ip6tables", &dns_redirect_args6(false)) {
+            log::debug!(
+                "disable_tun_capture: del v6 DNS OUTPUT redirect failed: {e}"
             );
         }
         self.tun_capture.store(false, Ordering::Release);
@@ -674,7 +888,7 @@ pub(super) fn refresh_policy_tables(
         );
     }
 
-    copy_main_non_default_routes("100")?;
+    copy_main_non_default_routes("100", false)?;
 
     let prefix_len = if tun_addr.is_ipv4() { 24 } else { 64 };
     let tun_net = match tun_addr {
@@ -699,7 +913,7 @@ pub(super) fn refresh_policy_tables(
         &table,
     ])?;
 
-    copy_main_non_default_routes(&table)?;
+    copy_main_non_default_routes(&table, false)?;
 
     run_ip(&[
         "route", "replace", "default", "dev", tun_iface, "table", &table,
@@ -709,11 +923,14 @@ pub(super) fn refresh_policy_tables(
 }
 
 fn copy_main_non_default_routes(
-    table: &str,
+    table: &str, v6: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let output = Command::new("ip")
-        .args(["route", "show", "table", "main"])
-        .output()?;
+    let show_args: Vec<&str> = if v6 {
+        vec!["-6", "route", "show", "table", "main"]
+    } else {
+        vec!["route", "show", "table", "main"]
+    };
+    let output = Command::new("ip").args(&show_args).output()?;
     let stdout = String::from_utf8(output.stdout)?;
     for line in stdout.lines() {
         let line = line.trim();
@@ -731,7 +948,11 @@ fn copy_main_non_default_routes(
         }
         log::debug!("Copying route to table {table}: {line}");
         let tokens: Vec<&str> = line.split_whitespace().collect();
-        let mut args = vec!["route", "replace", "table", table];
+        let mut args: Vec<&str> = if v6 {
+            vec!["-6", "route", "replace", "table", table]
+        } else {
+            vec!["route", "replace", "table", table]
+        };
         args.extend_from_slice(&tokens);
         if let Err(e) = run_ip(&args) {
             log::error!("Failed to copy route to table {table} (non-fatal): {e}");
@@ -758,4 +979,208 @@ fn add_default_route_for_table(
     args.push("default");
     args.extend_from_slice(&tokens);
     run_ip(&args)
+}
+
+/// [`run_ip`] for owned (String) argument lists.
+fn run_ip_args(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    run_ip(&refs)
+}
+
+/// [`super::run_cmd`] for owned (String) argument lists.
+fn run_cmd_args(
+    cmd: &str, args: &[String],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    super::run_cmd(cmd, &refs)
+}
+
+/// `ip -6 rule add ... priority <prio> <spec…>` arguments — Linux policy
+/// rules are family-scoped, so the v6 capture rules mirror the v4 ones with
+/// the `-6` flag. Shared by setup/enable/teardown paths; unit tests pin the
+/// exact shape.
+fn v6_rule_args(priority: u32, spec: &[&str]) -> Vec<String> {
+    let mut args: Vec<String> = vec!["-6".into(), "rule".into(), "add".into()];
+    args.extend(spec.iter().map(|s| s.to_string()));
+    args.push("priority".into());
+    args.push(priority.to_string());
+    args
+}
+
+/// ip6tables arguments for the local-process DNS REDIRECT (OUTPUT: udp/53 →
+/// `DNS_REDIRECT_PORT`, engine sockets excluded via the bypass fwmark).
+/// `insert` picks `-I OUTPUT 1` (install) vs `-D OUTPUT` (remove); shared by
+/// enable/disable paths so the two shapes stay in sync.
+fn dns_redirect_args6(insert: bool) -> Vec<String> {
+    let mut args: Vec<String> = vec!["-t".into(), "nat".into()];
+    if insert {
+        args.extend(["-I".into(), "OUTPUT".into(), "1".into()]);
+    } else {
+        args.extend(["-D".into(), "OUTPUT".into()]);
+    }
+    for token in [
+        "-p", "udp", "--dport", "53", "-m", "mark", "!", "--mark",
+    ] {
+        args.push(token.to_string());
+    }
+    args.push(BYPASS_FWMARK.to_string());
+    args.extend(["-j", "REDIRECT", "--to-port"].iter().map(|s| s.to_string()));
+    args.push(DNS_REDIRECT_PORT.to_string());
+    args
+}
+
+/// v6 mirror of [`refresh_policy_tables`]: table 100 gets the main table's
+/// v6 defaults (for fwmark-bypassed sockets), table 200 gets the TUN subnet,
+/// the main table's non-default v6 routes (so LAN/peer v6 subnets stay
+/// reachable directly) and the default via the TUN device.
+fn refresh_v6_policy_tables(
+    v6_addr: Ipv6Addr, v6_prefix: u8, tun_iface: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let _ = run_ip(&["-6", "route", "flush", "table", "100"]);
+    let _ = run_ip(&[
+        "-6",
+        "route",
+        "flush",
+        "table",
+        &TUN_ROUTING_TABLE.to_string(),
+    ]);
+
+    // Copy v6 default routes into table 100 for bypass.
+    let output =
+        Command::new("ip").args(["-6", "route", "show", "default"]).output()?;
+    let stdout = String::from_utf8(output.stdout)?;
+    let mut found_default = false;
+    for line in stdout.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        found_default = true;
+        let spec = line.strip_prefix("default ").unwrap_or(line);
+        log::info!("Adding v6 bypass route: default {spec} → table 100");
+        let mut args = vec!["-6", "route", "replace", "table", "100"];
+        args.push("default");
+        args.extend(spec.split_whitespace());
+        run_ip(&args)?;
+    }
+    if !found_default {
+        log::warn!(
+            "No v6 default route in main table — v6 bypass routing (table 100) \
+             will NOT work. v6 outbound connections will fail. Ensure the WAN \
+             interface has v6 connectivity before starting anywhere."
+        );
+    }
+
+    copy_main_non_default_routes("100", true)?;
+
+    let net = u128::from(v6_addr) & (!0u128 << (128 - v6_prefix));
+    let tun_net = IpAddr::V6(std::net::Ipv6Addr::from(net));
+
+    let table = TUN_ROUTING_TABLE.to_string();
+    run_ip(&[
+        "-6",
+        "route",
+        "replace",
+        &tun_net.to_string(),
+        "dev",
+        tun_iface,
+        "table",
+        &table,
+    ])?;
+
+    copy_main_non_default_routes(&table, true)?;
+
+    run_ip(&[
+        "-6",
+        "route",
+        "replace",
+        "default",
+        "dev",
+        tun_iface,
+        "table",
+        &table,
+    ])?;
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn v6_rule_args_mirror_the_v4_capture_rules() {
+        // The v6 policy rules are the v4 ones with `-6` prepended; the
+        // priorities must stay identical so teardown by priority works for
+        // both families.
+        assert_eq!(
+            v6_rule_args(
+                TUN_CATCH_ALL_PRIO,
+                &["from", "all", "lookup", &TUN_ROUTING_TABLE.to_string()],
+            ),
+            vec![
+                "-6".to_string(),
+                "rule".to_string(),
+                "add".to_string(),
+                "from".to_string(),
+                "all".to_string(),
+                "lookup".to_string(),
+                "200".to_string(),
+                "priority".to_string(),
+                "3000".to_string(),
+            ]
+        );
+        assert_eq!(
+            v6_rule_args(TUN_IIF_EXCEPTION_PRIO, &["iif", "tun0", "lookup", "main"]),
+            vec![
+                "-6".to_string(),
+                "rule".to_string(),
+                "add".to_string(),
+                "iif".to_string(),
+                "tun0".to_string(),
+                "lookup".to_string(),
+                "main".to_string(),
+                "priority".to_string(),
+                "400".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn v6_dns_redirect_args_are_symmetric_for_install_and_remove() {
+        let install = dns_redirect_args6(true);
+        let remove = dns_redirect_args6(false);
+
+        // Install: ip6tables -t nat -I OUTPUT 1 <match> -j REDIRECT --to-port N
+        // Remove:  ip6tables -t nat -D OUTPUT    <match> -j REDIRECT --to-port N
+        // Identical apart from the operation — the delete must reference the
+        // exact rule the insert created, otherwise stale rules accumulate.
+        assert_eq!(install[2], "-I");
+        assert_eq!(install[3], "OUTPUT");
+        assert_eq!(install[4], "1");
+        assert_eq!(&install[5..], &remove[3..]);
+
+        // The match section mirrors the v4 rule: udp/53, fwmark bypass
+        // excluded, REDIRECT to the loopback DNS port.
+        let match_part = &remove[3..];
+        let expected: Vec<String> = [
+            "-p",
+            "udp",
+            "--dport",
+            "53",
+            "-m",
+            "mark",
+            "!",
+            "--mark",
+            "1",
+            "-j",
+            "REDIRECT",
+            "--to-port",
+            "1053",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert_eq!(match_part, expected);
+    }
 }
