@@ -83,36 +83,100 @@ fn classify_ipv4(buf: &[u8]) -> Option<IpPacket> {
 
 fn classify_ipv6(buf: &[u8]) -> Option<IpPacket> {
     let ip_hdr = Ipv6Header::from_slice(buf).ok()?.0;
-    let l4_offset = 40; // IPv6 fixed header is 40 bytes
     let total_len = (ip_hdr.payload_length as usize) + 40;
 
     let src_ip = IpAddr::V6(ip_hdr.source.into());
     let dst_ip = IpAddr::V6(ip_hdr.destination.into());
 
-    match ip_hdr.next_header.0 {
-        6 /* TCP */ => {
-            let tcp = TcpHeader::from_slice(&buf[l4_offset..]).ok()?.0;
-            Some(IpPacket::Tcp(IpPacketMeta {
-                src_ip,
-                dst_ip,
-                src_port: tcp.source_port,
-                dst_port: tcp.destination_port,
-                l4_offset,
-                total_len,
-            }))
+    // Walk the extension-header chain to find the transport header. The
+    // common case (no options) is handled on the first iteration with the
+    // fixed 40-byte basic header; each recognized extension header advances
+    // `offset` by its declared length. Anything we can't walk (unknown
+    // header, malformed length, non-first fragment) is classified as
+    // `Other` — the handler drops it — so a garbage parse can never reach
+    // the NAT/relay paths.
+    let bound = total_len.min(buf.len());
+    let mut next_header = ip_hdr.next_header.0;
+    let mut offset = 40usize; // IPv6 fixed header is 40 bytes
+    loop {
+        match next_header {
+            6 /* TCP */ => {
+                let tcp = TcpHeader::from_slice(&buf[offset..bound]).ok()?.0;
+                return Some(IpPacket::Tcp(IpPacketMeta {
+                    src_ip,
+                    dst_ip,
+                    src_port: tcp.source_port,
+                    dst_port: tcp.destination_port,
+                    l4_offset: offset,
+                    total_len,
+                }));
+            }
+            17 /* UDP */ => {
+                let udp = UdpHeader::from_slice(&buf[offset..bound]).ok()?.0;
+                return Some(IpPacket::Udp(IpPacketMeta {
+                    src_ip,
+                    dst_ip,
+                    src_port: udp.source_port,
+                    dst_port: udp.destination_port,
+                    l4_offset: offset,
+                    total_len,
+                }));
+            }
+            // hop-by-hop options (0), routing (43), destination options (60):
+            // NextHeader(1) + HdrExtLen(1, in 8-octet units minus the first 8).
+            0 | 43 | 60 => {
+                if offset + 2 > bound {
+                    log::debug!("TUN packet: truncated IPv6 options header");
+                    return Some(IpPacket::Other);
+                }
+                let ext_len = (buf[offset + 1] as usize + 1) * 8;
+                next_header = buf[offset];
+                offset += ext_len;
+            }
+            // Authentication header (51): PayloadLen is in 4-octet units
+            // minus 2 for the fixed first 8 octets.
+            51 => {
+                if offset + 2 > bound {
+                    log::debug!("TUN packet: truncated IPv6 AH header");
+                    return Some(IpPacket::Other);
+                }
+                let ext_len = (buf[offset + 1] as usize + 2) * 4;
+                next_header = buf[offset];
+                offset += ext_len;
+            }
+            // Fragment header (44): fixed 8 bytes. Only first fragments
+            // (offset 0) carry the transport header we need; later
+            // fragments have no port information and are unproxyable.
+            44 => {
+                if offset + 8 > bound {
+                    log::debug!("TUN packet: truncated IPv6 fragment header");
+                    return Some(IpPacket::Other);
+                }
+                let frag_off =
+                    u16::from_be_bytes([buf[offset + 2], buf[offset + 3]])
+                        & 0xFFF8;
+                if frag_off != 0 {
+                    log::debug!(
+                        "TUN packet: non-first IPv6 fragment dropped (no ports)"
+                    );
+                    return Some(IpPacket::Other);
+                }
+                next_header = buf[offset];
+                offset += 8;
+            }
+            proto => {
+                log::debug!(
+                    "TUN packet: IPv6 next-header {proto} not proxied (ICMP or unknown)"
+                );
+                return Some(IpPacket::Other);
+            }
         }
-        17 /* UDP */ => {
-            let udp = UdpHeader::from_slice(&buf[l4_offset..]).ok()?.0;
-            Some(IpPacket::Udp(IpPacketMeta {
-                src_ip,
-                dst_ip,
-                src_port: udp.source_port,
-                dst_port: udp.destination_port,
-                l4_offset,
-                total_len,
-            }))
+        if offset >= bound {
+            log::debug!(
+                "TUN packet: IPv6 extension chain exhausted before transport header"
+            );
+            return Some(IpPacket::Other);
         }
-        _ => Some(IpPacket::Other),
     }
 }
 
@@ -591,5 +655,196 @@ mod tests {
         let eudp = 48 + 40;
         assert_eq!(u16::from_be_bytes([pkt[eudp], pkt[eudp + 1]]), 54321);
         assert_eq!(u16::from_be_bytes([pkt[eudp + 2], pkt[eudp + 3]]), 443);
+    }
+
+    // ------------------------------------------------------------------
+    // IPv6 classification
+    // ------------------------------------------------------------------
+
+    /// Build a minimal IPv6 packet: 40-byte fixed header + TCP or UDP,
+    /// with an optional chain of extension headers before the transport.
+    /// `ext` is the chain in order; each item is `(code, body)` where
+    /// `body` is the header bytes AFTER the first (next-header) byte —
+    /// that byte and the length field are patched here so the wire format
+    /// is realistic:
+    ///   - options (0/43/60): body.len() = full_len - 1, full_len a
+    ///     multiple of 8; body[0] becomes HdrExtLen = full_len/8 - 1.
+    ///   - AH (51): body.len() = full_len - 1, full_len a multiple of 4;
+    ///     body[0] becomes PayloadLen = full_len/4 - 2.
+    ///   - fragment (44): body.len() = 7; body[1..3] hold the fragment
+    ///     offset+flags field.
+    fn build_v6_packet(
+        proto: u8, src_port: u16, dst_port: u16, ext: &[(u8, Vec<u8>)],
+    ) -> Vec<u8> {
+        let mut pkt = vec![0u8; 40];
+        pkt[0] = 0x60; // version 6
+        pkt[6] = match ext.first() {
+            Some((code, _)) => *code, // first extension header, or transport
+            None => proto,
+        };
+        pkt[8..24].copy_from_slice(&[0x20; 16]); // src (dummy 2000::)
+        pkt[24..40].copy_from_slice(&[0x20; 16]); // dst (dummy)
+
+        // Build the headers in reverse so each one's next-header byte points
+        // at the header that follows it.
+        let mut l4 = Vec::new();
+        let mut next = proto;
+        for (code, body) in ext.iter().rev() {
+            let mut hdr = vec![next];
+            hdr.extend_from_slice(body);
+            match code {
+                0 | 43 | 60 => {
+                    let full_len = hdr.len() as u8;
+                    hdr[1] = full_len / 8 - 1;
+                },
+                51 => {
+                    let full_len = hdr.len() as u8;
+                    hdr[1] = full_len / 4 - 2;
+                },
+                _ => {},
+            }
+            l4.splice(0..0, hdr);
+            next = *code;
+        }
+
+        // Transport header.
+        let mut transport = Vec::new();
+        match proto {
+            17 => {
+                transport.extend_from_slice(&src_port.to_be_bytes());
+                transport.extend_from_slice(&dst_port.to_be_bytes());
+                let udp_len = 8u16;
+                transport.extend_from_slice(&udp_len.to_be_bytes());
+                transport.extend_from_slice(&[0, 0]); // checksum
+            },
+            _ => {
+                transport.extend_from_slice(&src_port.to_be_bytes());
+                transport.extend_from_slice(&dst_port.to_be_bytes());
+                transport.extend_from_slice(&[0; 8]); // seq, ack
+                transport.push(0x50); // data offset
+                transport.push(0x02); // SYN
+                transport.extend_from_slice(&[0; 6]);
+            },
+        }
+        l4.extend_from_slice(&transport);
+
+        let payload_len = l4.len() as u16;
+        pkt[4..6].copy_from_slice(&payload_len.to_be_bytes());
+        pkt.extend_from_slice(&l4);
+        pkt
+    }
+
+    #[test]
+    fn test_classify_ipv6_tcp_udp_without_extension_headers() {
+        let pkt = build_v6_packet(17, 54321, 53, &[]);
+        match classify(&pkt).unwrap() {
+            IpPacket::Udp(meta) => {
+                assert_eq!(meta.src_port, 54321);
+                assert_eq!(meta.dst_port, 53);
+                assert_eq!(meta.l4_offset, 40);
+                assert_eq!(meta.total_len, 40 + 8);
+                assert!(matches!(meta.src_ip, IpAddr::V6(_)));
+            },
+            _ => panic!("expected UDP"),
+        }
+
+        let tcp = build_v6_packet(6, 12345, 443, &[]);
+        match classify(&tcp).unwrap() {
+            IpPacket::Tcp(meta) => {
+                assert_eq!(meta.dst_port, 443);
+                assert!(is_syn_only(&meta, &tcp));
+            },
+            _ => panic!("expected TCP"),
+        }
+    }
+
+    #[test]
+    fn test_classify_ipv6_with_hop_by_hop_extension_header() {
+        // 8-byte hop-by-hop header (next=UDP, HdrExtLen=0) before UDP.
+        let pkt = build_v6_packet(17, 51000, 443, &[(0, vec![0u8; 7])]);
+        match classify(&pkt).unwrap() {
+            IpPacket::Udp(meta) => {
+                assert_eq!(meta.dst_port, 443);
+                assert_eq!(meta.l4_offset, 40 + 8);
+                assert_eq!(meta.total_len, 40 + 8 + 8);
+            },
+            _ => panic!("expected UDP"),
+        }
+    }
+
+    #[test]
+    fn test_classify_ipv6_with_routing_then_dest_options_chain() {
+        // routing (43): 8-byte header; destination options (60): 16-byte
+        // header; then UDP.
+        let pkt = build_v6_packet(
+            17,
+            51001,
+            53,
+            &[(43, vec![0u8; 7]), (60, vec![0u8; 15])],
+        );
+        match classify(&pkt).unwrap() {
+            IpPacket::Udp(meta) => {
+                assert_eq!(meta.dst_port, 53);
+                assert_eq!(meta.l4_offset, 40 + 8 + 16);
+            },
+            _ => panic!("expected UDP"),
+        }
+    }
+
+    #[test]
+    fn test_classify_ipv6_with_authentication_header() {
+        // AH: 12 bytes (fixed 8 + 4 ICV) → PayloadLen = 12/4 - 2 = 1.
+        let pkt = build_v6_packet(6, 51002, 443, &[(51, vec![0u8; 11])]);
+        match classify(&pkt).unwrap() {
+            IpPacket::Tcp(meta) => {
+                assert_eq!(meta.dst_port, 443);
+                assert_eq!(meta.l4_offset, 40 + 12);
+            },
+            _ => panic!("expected TCP"),
+        }
+    }
+
+    #[test]
+    fn test_classify_ipv6_first_fragment_is_parsed() {
+        // Fragment header (44): next=UDP patched by the helper, reserved,
+        // frag offset=0, ident — body is the 7 bytes after next.
+        let pkt = build_v6_packet(17, 51003, 53, &[(44, vec![0u8; 7])]);
+        match classify(&pkt).unwrap() {
+            IpPacket::Udp(meta) => {
+                assert_eq!(meta.dst_port, 53);
+                assert_eq!(meta.l4_offset, 40 + 8);
+            },
+            _ => panic!("expected UDP"),
+        }
+    }
+
+    #[test]
+    fn test_classify_ipv6_non_first_fragment_is_other() {
+        // Fragment header with a non-zero offset: no ports available.
+        // body = [reserved, offset_hi, offset_lo, ident×4].
+        let mut frag = vec![0u8; 7];
+        frag[2] = 0x08; // fragment offset field → 8 bytes (nonzero, 0xFFF8 mask)
+        let pkt = build_v6_packet(17, 51004, 53, &[(44, frag)]);
+        assert!(matches!(classify(&pkt), Some(IpPacket::Other)));
+    }
+
+    #[test]
+    fn test_classify_ipv6_icmp_and_unknown_are_other() {
+        // ICMPv6 (58) is not proxied.
+        let pkt = build_v6_packet(58, 0, 0, &[]);
+        assert!(matches!(classify(&pkt), Some(IpPacket::Other)));
+
+        // A next-header value nobody uses is dropped too.
+        let pkt = build_v6_packet(254, 0, 0, &[]);
+        assert!(matches!(classify(&pkt), Some(IpPacket::Other)));
+    }
+
+    #[test]
+    fn test_classify_ipv6_truncated_extension_chain_is_other() {
+        // Hop-by-hop header present, but the packet is cut mid-header.
+        let mut pkt = build_v6_packet(17, 51005, 53, &[(0, vec![0u8; 7])]);
+        pkt.truncate(40 + 4);
+        pkt[4..6].copy_from_slice(&(4u16).to_be_bytes()); // plausible payload len
+        assert!(matches!(classify(&pkt), Some(IpPacket::Other)));
     }
 }

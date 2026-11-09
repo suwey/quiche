@@ -28,6 +28,7 @@ use std::net::IpAddr;
     target_os = "windows"
 ))]
 use std::net::Ipv4Addr;
+use std::net::Ipv6Addr;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -91,6 +92,13 @@ type TcpCancelRegistry = Arc<Mutex<HashMap<u16, CancellationToken>>>;
 pub struct TunConfig {
     pub addr: IpAddr,
     pub mask_len: u8,
+    /// Secondary IPv6 interface address (from `tun.addr6`, or the address
+    /// itself when `tun.addr` is an IPv6 CIDR). `None` keeps the tunnel
+    /// v4-only: the v6 data plane is off and the IPv6 leak guard contains
+    /// any physical-network v6.
+    pub v6_addr: Option<Ipv6Addr>,
+    /// Prefix length for `v6_addr` (64 for a ULA-style `addr6` CIDR).
+    pub v6_prefix: u8,
     pub mtu: u16,
     pub name: String,
     /// Automatically manage routing and iptables. True for router environments.
@@ -146,6 +154,37 @@ impl TunConfig {
         if mask_len > max_prefix {
             return Err(format!("invalid addr prefix: {mask_len}"));
         }
+
+        // IPv6 data plane: `addr` itself being an IPv6 CIDR makes it the
+        // interface's v6 address; otherwise an explicit `addr6` adds a
+        // second (dual-stack) address to a v4-primary tunnel.
+        let (v6_addr, v6_prefix) = match addr {
+            IpAddr::V6(v6) => (Some(v6), mask_len),
+            IpAddr::V4(_) => match cfg.addr6.as_deref() {
+                None | Some("") => (None, 64),
+                Some(cidr) => {
+                    let (v6_s, prefix_s) = cidr
+                        .split_once('/')
+                        .ok_or_else(|| {
+                            "invalid addr6: expected CIDR like \
+                             fdfe:dcba:9876::1/64"
+                                .to_string()
+                        })?;
+                    let v6: Ipv6Addr = v6_s
+                        .trim()
+                        .parse()
+                        .map_err(|e| format!("invalid addr6: {e}"))?;
+                    let prefix: u8 = prefix_s
+                        .trim()
+                        .parse()
+                        .map_err(|e| format!("invalid addr6 prefix: {e}"))?;
+                    if prefix > 128 {
+                        return Err(format!("invalid addr6 prefix: {prefix}"));
+                    }
+                    (Some(v6), prefix)
+                },
+            },
+        };
         let auto_route = cfg.auto_route;
 
         // Per-app VPN filtering is applied by the Android shell
@@ -174,6 +213,8 @@ impl TunConfig {
         Ok(Self {
             addr,
             mask_len,
+            v6_addr,
+            v6_prefix,
             mtu,
             name,
             auto_hijack,
@@ -514,11 +555,22 @@ impl TunInbound {
 
         log::info!("TUN device {name} created at {addr}");
 
-        // 2. Bind TCP listener on the TUN address.
-        let listener =
-            tokio::net::TcpListener::bind(SocketAddr::new(addr, 0)).await?;
-        let listener_port = listener.local_addr()?.port();
-        // 3. Initialize NAT table.
+        // IPv6 data-plane address. Windows has no v6 wiring in this phase —
+        // keep its behavior strictly v4-only.
+        #[cfg(target_os = "windows")]
+        let v6_addr: Option<Ipv6Addr> = {
+            if config.v6_addr.is_some() {
+                log::warn!(
+                    "tun: addr6 is set but the Windows data plane is v4-only \
+                     in this phase — ignoring it"
+                );
+            }
+            None
+        };
+        #[cfg(not(target_os = "windows"))]
+        let v6_addr = config.v6_addr;
+
+        // 2. Initialize NAT table.
         let nat = Arc::new(Mutex::new(TCPNat::new(TUN_TCP_NAT_TIMEOUT)));
 
         // Create the reverse DNS cache (TUN-owned lifecycle).
@@ -681,7 +733,35 @@ impl TunInbound {
         )))]
         let guard = TunGuard { _inner: () };
 
-        // 5. Create channels.
+        // 5. Bind TCP listener(s) on the TUN address. Deliberately after the
+        // platform setup above: on a dual-stack tunnel the v6 address is
+        // only configured on the interface there (Linux rtnetlink / macOS
+        // ifconfig alias), and binding to an unassigned address fails.
+        //
+        // Both families must share ONE port: the TCP NAT rewrites every
+        // connection's destination port to `listener_port`, so the reverse
+        // path (src_port == listener_port) works regardless of family.
+        let listener =
+            tokio::net::TcpListener::bind(SocketAddr::new(addr, 0)).await?;
+        let listener_port = listener.local_addr()?.port();
+        let listener_v6 = match (addr, v6_addr) {
+            (IpAddr::V4(_), Some(v6)) => {
+                let l = tokio::net::TcpListener::bind(SocketAddr::new(
+                    IpAddr::V6(v6),
+                    listener_port,
+                ))
+                .await?;
+                log::info!(
+                    "TUN TCP listener (v6) bound to [{v6}]:{listener_port}"
+                );
+                Some(l)
+            },
+            // The primary address is already the v6 interface address; no
+            // second listener needed. A v4-only tunnel binds nothing extra.
+            _ => None,
+        };
+
+        // 6. Create channels.
         let (conn_tx, conn_rx) = mpsc::channel::<InboundConn>(1024);
 
         // Shared TCP session registry: nat_port -> relay cancel token. The
@@ -691,7 +771,7 @@ impl TunInbound {
         let cancel_registry: TcpCancelRegistry =
             Arc::new(Mutex::new(HashMap::new()));
 
-        // 6. Spawn the TUN I/O handler.
+        // 7. Spawn the TUN I/O handler.
         let tun_clone = device.clone();
         let nat_clone = nat.clone();
         let relay_ctx = handler::TunRelayCtx {
@@ -700,11 +780,19 @@ impl TunInbound {
             dns_hijack: dns_hijack.clone(),
         };
         let relay_ctx_accept = relay_ctx.clone();
+        let relay_ctx_accept6 = relay_ctx.clone();
         let shutdown_handler = shutdown.clone();
+        let tun_addrs = handler::TunAddrs {
+            v4: match addr {
+                IpAddr::V4(v4) => Some(v4),
+                IpAddr::V6(_) => None,
+            },
+            v6: v6_addr,
+        };
         tun_handles.push(tokio::spawn(async move {
             handler::run_tun_handler(
                 tun_clone,
-                addr,
+                tun_addrs,
                 nat_clone,
                 listener_port,
                 relay_ctx,
@@ -713,7 +801,9 @@ impl TunInbound {
             .await;
         }));
 
-        // 7. Spawn the accept loop.
+        // 8. Spawn the accept loops — one per family listener. Both share
+        // the NAT table and session registry; a v6 accept is indistinguishable
+        // from a v4 one at this layer (the NAT entry carries SocketAddrs).
         let nat_accept = nat.clone();
         let cancel_accept = cancel_registry.clone();
         let sniff_enabled = config.sniff;
@@ -729,6 +819,23 @@ impl TunInbound {
             )
             .await;
         }));
+
+        if let Some(listener_v6) = listener_v6 {
+            let nat_accept6 = nat.clone();
+            let cancel_accept6 = cancel_registry.clone();
+            let shutdown_accept6 = shutdown.clone();
+            tun_handles.push(tokio::spawn(async move {
+                accept_loop(
+                    listener_v6,
+                    nat_accept6,
+                    cancel_accept6,
+                    relay_ctx_accept6,
+                    sniff_enabled,
+                    shutdown_accept6,
+                )
+                .await;
+            }));
+        }
 
         let nat_cleanup = nat.clone();
         let cancel_cleanup = cancel_registry.clone();
@@ -848,8 +955,34 @@ async fn accept_loop(
                     },
                     (std::net::IpAddr::V6(v6), Some(rev)) => {
                         match rev.lookup_ipv6(v6).await {
-                            Some(domain) => Address::Domain(domain),
-                            None => ip_to_addr(session.target_addr.ip()),
+                            Some(domain) => {
+                                log::debug!(
+                                    "TUN restore domain: {}:{} -> {}:{}",
+                                    v6,
+                                    session.target_addr.port(),
+                                    domain,
+                                    session.target_addr.port(),
+                                );
+                                Address::Domain(domain)
+                            },
+                            None => {
+                                let is_fakeip = match &ctx.dns_hijack {
+                                    Some(hj) => {
+                                        hj.fakeip_contains(
+                                            session.target_addr.ip(),
+                                        )
+                                    },
+                                    None => false,
+                                };
+                                if is_fakeip {
+                                    log::warn!(
+                                        "TUN fake-ip missing reverse mapping: {}:{}",
+                                        v6,
+                                        session.target_addr.port(),
+                                    );
+                                }
+                                ip_to_addr(session.target_addr.ip())
+                            },
                         }
                     },
                     _ => ip_to_addr(session.target_addr.ip()),

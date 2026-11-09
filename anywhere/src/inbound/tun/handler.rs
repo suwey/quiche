@@ -134,6 +134,39 @@ pub(crate) struct TunRelayCtx {
     pub(crate) dns_hijack: Option<Arc<DnsHijack>>,
 }
 
+/// Addresses assigned to the TUN interface, per family. IPv4-only tunnels
+/// leave `v6` as `None` (the leak guard then rejects v6 at the routing
+/// layer); a dual-stack tunnel (`tun.addr` + `tun.addr6`) carries both.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct TunAddrs {
+    pub v4: Option<Ipv4Addr>,
+    pub v6: Option<Ipv6Addr>,
+}
+
+impl TunAddrs {
+    /// True when `ip` is one of the TUN interface's own addresses. Used to
+    /// recognize the interface's own packets (reverse-path detection and the
+    /// re-injection guards that stop response loops).
+    fn is_local(&self, ip: IpAddr) -> bool {
+        match ip {
+            IpAddr::V4(v4) => self.v4 == Some(v4),
+            IpAddr::V6(v6) => self.v6 == Some(v6),
+        }
+    }
+
+    /// The gateway-style "next" address (tun_addr + 1) for `ip`'s family —
+    /// the source address used in packets rewritten back onto the TUN so
+    /// the kernel routes responses into the NAT listener. `None` when the
+    /// tunnel has no address for that family (packet dropped, matching the
+    /// v4-only behavior for v6 packets before Phase 2).
+    fn next_hop_for(&self, ip: IpAddr) -> Option<IpAddr> {
+        match ip {
+            IpAddr::V4(_) => self.v4.map(|a| IpAddr::V4(next_addr_v4(a))),
+            IpAddr::V6(_) => self.v6.map(|a| IpAddr::V6(next_addr_v6(a))),
+        }
+    }
+}
+
 /// Run the TUN I/O handler loop.
 ///
 /// Reads packets from the TUN device, applies NAT/un-NAT for TCP,
@@ -141,7 +174,7 @@ pub(crate) struct TunRelayCtx {
 /// All `tun.send()` calls go through a dedicated writer task so the
 /// reader never blocks.
 pub async fn run_tun_handler(
-    tun: Arc<AsyncDevice>, tun_addr: IpAddr, nat: Arc<Mutex<TCPNat>>,
+    tun: Arc<AsyncDevice>, addrs: TunAddrs, nat: Arc<Mutex<TCPNat>>,
     listener_port: u16, ctx: TunRelayCtx, shutdown: CancellationToken,
 ) {
     let writer = TunWriter::new(tun.clone());
@@ -160,7 +193,7 @@ pub async fn run_tun_handler(
     const BACKOFF_STEP: Duration = TUN_BACKPRESSURE_STEP;
 
     log::info!(
-        "TUN handler started on {tun_addr}, listener port {listener_port}"
+        "TUN handler started on {addrs:?}, listener port {listener_port}"
     );
 
     loop {
@@ -196,7 +229,7 @@ pub async fn run_tun_handler(
                 handle_tcp_packet(
                     &mut buf[..n],
                     &meta,
-                    &tun_addr,
+                    &addrs,
                     listener_port,
                     &nat,
                     &tun,
@@ -243,7 +276,7 @@ pub async fn run_tun_handler(
                 let dropped = handle_udp_packet(
                     &buf[..n],
                     &meta,
-                    &tun_addr,
+                    &addrs,
                     &ctx,
                     &writer,
                     &mut udp_sessions,
@@ -282,7 +315,7 @@ pub async fn run_tun_handler(
 
 /// Handle a TCP packet: apply NAT (forward) or un-NAT (reverse).
 async fn handle_tcp_packet(
-    buf: &mut [u8], meta: &IpPacketMeta, tun_addr: &IpAddr, listener_port: u16,
+    buf: &mut [u8], meta: &IpPacketMeta, addrs: &TunAddrs, listener_port: u16,
     nat: &Arc<Mutex<TCPNat>>, tun: &AsyncDevice,
 ) {
     // Extract TCP flags for diagnostic logging.
@@ -313,16 +346,10 @@ async fn handle_tcp_packet(
     };
 
     // Check if this is a reverse-path packet (kernel sending data back
-    // through TUN after NAT).
-    let is_reverse = match (tun_addr, meta.src_ip) {
-        (IpAddr::V4(tun), IpAddr::V4(src)) => {
-            tun == &src && meta.src_port == listener_port
-        },
-        (IpAddr::V6(tun), IpAddr::V6(src)) => {
-            tun == &src && meta.src_port == listener_port
-        },
-        _ => false,
-    };
+    // through TUN after NAT): the source must be one of the TUN interface's
+    // own addresses on the NAT listener port, per address family.
+    let is_reverse =
+        meta.src_port == listener_port && addrs.is_local(meta.src_ip);
 
     if is_reverse {
         // Reverse path: un-NAT and write back to TUN.
@@ -347,21 +374,29 @@ async fn handle_tcp_packet(
             }
 
             // We need to set source = original target, dest = original client
-            let IpAddr::V4(orig_target_ip) = session.target_addr.ip() else {
-                return;
-            };
-            let IpAddr::V4(orig_client_ip) = session.client_addr.ip() else {
-                return;
-            };
-
-            packet::rewrite_tcp_ipv4(
-                buf,
-                meta,
-                orig_target_ip,
-                session.target_addr.port(),
-                orig_client_ip,
-                session.client_addr.port(),
-            );
+            match (session.target_addr, session.client_addr) {
+                (SocketAddr::V4(target), SocketAddr::V4(client)) => {
+                    packet::rewrite_tcp_ipv4(
+                        buf,
+                        meta,
+                        *target.ip(),
+                        target.port(),
+                        *client.ip(),
+                        client.port(),
+                    );
+                },
+                (SocketAddr::V6(target), SocketAddr::V6(client)) => {
+                    packet::rewrite_tcp_ipv6(
+                        buf,
+                        meta,
+                        *target.ip(),
+                        target.port(),
+                        *client.ip(),
+                        client.port(),
+                    );
+                },
+                _ => return, // Mismatched address families
+            }
 
             if let Err(e) = tun.send(&buf[..meta.total_len]).await {
                 log::debug!("TUN write error (reverse TCP): {e}");
@@ -373,10 +408,10 @@ async fn handle_tcp_packet(
         return;
     }
 
-    // Guard: if destination is the TUN address itself (and not the NAT
-    // listener), this packet is a response to a local process that was
-    // just written back to TUN by the reverse path.
-    if meta.dst_ip == *tun_addr && meta.dst_port != listener_port {
+    // Guard: if destination is one of the TUN interface's own addresses
+    // (and not the NAT listener), this packet is a response to a local
+    // process that was just written back to TUN by the reverse path.
+    if addrs.is_local(meta.dst_ip) && meta.dst_port != listener_port {
         log::debug!(
             "TUN TCP REINJECT [{tcp_flags}] {src}:{sp} -> {dst}:{dp} - dropped (local response)",
             src = meta.src_ip,
@@ -392,9 +427,8 @@ async fn handle_tcp_packet(
 
     // Guard: packets aimed at our TUN listener must be the synthetic
     // `tun_next:nat_port -> tun_addr:listener_port` packets created below.
-    if meta.dst_ip == *tun_addr && meta.dst_port == listener_port {
-        let tun_next = next_addr(*tun_addr);
-        if meta.src_ip == tun_next {
+    if addrs.is_local(meta.dst_ip) && meta.dst_port == listener_port {
+        if addrs.next_hop_for(meta.src_ip) == Some(meta.src_ip) {
             let guard = nat.lock().await;
             if guard.contains_port(meta.src_port) {
                 return; // Valid NAT'd packet, already handled by listener
@@ -448,12 +482,22 @@ async fn handle_tcp_packet(
 
     // Calculate the "next" address for the TUN interface (used as the
     // source IP in rewritten packets so the kernel routes responses back
-    // through TUN).
-    let tun_next = next_addr(*tun_addr);
+    // through TUN). Missing for a family the tunnel doesn't carry — e.g. a
+    // v6 packet arriving on a v4-only tunnel — which drops the packet.
+    let Some(tun_next) = addrs.next_hop_for(meta.src_ip) else {
+        log::debug!(
+            "TUN TCP FWD [{tcp_flags}] {src}:{sp} -> {dst}:{dp} - dropped (no local address for family)",
+            src = meta.src_ip,
+            sp = meta.src_port,
+            dst = meta.dst_ip,
+            dp = meta.dst_port,
+        );
+        return;
+    };
 
     match (tun_next, meta.src_ip, meta.dst_ip) {
         (IpAddr::V4(tun_next_v4), IpAddr::V4(_), IpAddr::V4(_)) => {
-            let IpAddr::V4(tun_v4) = *tun_addr else {
+            let Some(tun_v4) = addrs.v4 else {
                 return;
             };
 
@@ -467,7 +511,7 @@ async fn handle_tcp_packet(
             );
         },
         (IpAddr::V6(tun_next_v6), IpAddr::V6(_), IpAddr::V6(_)) => {
-            let IpAddr::V6(tun_v6) = *tun_addr else {
+            let Some(tun_v6) = addrs.v6 else {
                 return;
             };
 
@@ -519,7 +563,7 @@ fn is_non_routable(ip: IpAddr) -> bool {
 /// Returns `true` if the packet was dropped (channel full / system under
 /// load), `false` if it was successfully dispatched.
 async fn handle_udp_packet(
-    buf: &[u8], meta: &IpPacketMeta, tun_addr: &IpAddr, ctx: &TunRelayCtx,
+    buf: &[u8], meta: &IpPacketMeta, addrs: &TunAddrs, ctx: &TunRelayCtx,
     writer: &TunWriter, sessions: &mut UdpSessionTable,
 ) -> bool {
     // Drop broadcast / multicast / link-local packets early — these are
@@ -538,13 +582,13 @@ async fn handle_udp_packet(
         return false; // Malformed UDP packet
     };
 
-    // Guard: if destination is the TUN address itself, this packet is a
-    // response to a local process (e.g. NTP reply, DNS reply) that was
-    // just written back to TUN by TunUdpSessionRelay::write_packet.
-    // The kernel has already delivered it via `iif tun0 lookup main`.
-    // Processing it again would create a new relay and outbound connection,
-    // causing a self-sustaining loop.
-    if meta.dst_ip == *tun_addr {
+    // Guard: if destination is one of the TUN interface's own addresses,
+    // this packet is a response to a local process (e.g. NTP reply, DNS
+    // reply) that was just written back to TUN by
+    // TunUdpSessionRelay::write_packet. The kernel has already delivered it
+    // via `iif tun0 lookup main`. Processing it again would create a new
+    // relay and outbound connection, causing a self-sustaining loop.
+    if addrs.is_local(meta.dst_ip) {
         log::error!(
             "TUN re-injection (UDP): dst={}:{} (local process response) — dropped",
             meta.dst_ip,
@@ -609,6 +653,18 @@ async fn handle_udp_packet(
                         meta.dst_ip,
                     )
                 } else {
+                    // A v6 fake-ip without a reverse mapping means the DNS
+                    // answer was evicted from the LRU — same diagnostic as
+                    // the v4 path.
+                    if let Some(hj) = &ctx.dns_hijack
+                        && hj.fakeip_contains(meta.dst_ip)
+                    {
+                        log::warn!(
+                            "TUN fake-ip missing reverse mapping: {}:{}",
+                            v6,
+                            meta.dst_port,
+                        );
+                    }
                     Destination::new(ip_to_address(meta.dst_ip), meta.dst_port)
                 }
             },
@@ -642,32 +698,25 @@ async fn handle_udp_packet(
     }
 }
 
-/// Get the next address in the subnet (tun_addr + 1).
-fn next_addr(addr: IpAddr) -> IpAddr {
-    match addr {
-        IpAddr::V4(v4) => {
-            let octets = v4.octets();
-            IpAddr::V4(Ipv4Addr::new(
-                octets[0],
-                octets[1],
-                octets[2],
-                octets[3].wrapping_add(1),
-            ))
-        },
-        IpAddr::V6(v6) => {
-            let octets = v6.octets();
-            let mut new_octets = octets;
-            // Add 1 to the last byte.
-            for i in (0..16).rev() {
-                let (val, overflow) = new_octets[i].overflowing_add(1);
-                new_octets[i] = val;
-                if !overflow {
-                    break;
-                }
-            }
-            IpAddr::V6(Ipv6Addr::from(new_octets))
-        },
+/// Get the next address in the subnet (tun_addr + 1) for IPv4.
+fn next_addr_v4(addr: Ipv4Addr) -> Ipv4Addr {
+    let octets = addr.octets();
+    Ipv4Addr::new(octets[0], octets[1], octets[2], octets[3].wrapping_add(1))
+}
+
+/// Get the next address in the subnet (tun_addr + 1) for IPv6.
+fn next_addr_v6(addr: Ipv6Addr) -> Ipv6Addr {
+    let octets = addr.octets();
+    let mut new_octets = octets;
+    // Add 1 to the last byte.
+    for i in (0..16).rev() {
+        let (val, overflow) = new_octets[i].overflowing_add(1);
+        new_octets[i] = val;
+        if !overflow {
+            break;
+        }
     }
+    Ipv6Addr::from(new_octets)
 }
 
 fn ip_to_address(ip: IpAddr) -> Address {
@@ -843,5 +892,75 @@ mod tests {
 
     fn new_nat() -> Arc<Mutex<TCPNat>> {
         Arc::new(Mutex::new(TCPNat::new(Duration::from_secs(30))))
+    }
+
+    #[test]
+    fn tun_addrs_recognize_local_addresses_per_family() {
+        let dual = TunAddrs {
+            v4: Some(Ipv4Addr::new(10, 0, 0, 1)),
+            v6: Some("fdfe:dcba:9876::1".parse().unwrap()),
+        };
+        assert!(dual.is_local(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))));
+        assert!(dual.is_local(IpAddr::V6("fdfe:dcba:9876::1".parse().unwrap())));
+        assert!(!dual.is_local(IpAddr::V4(Ipv4Addr::new(198, 18, 0, 1))));
+        assert!(!dual.is_local(IpAddr::V6("fdfe:dcba:9876::2".parse().unwrap())));
+
+        // v4-only tunnel: no v6 address is local.
+        let v4_only = TunAddrs {
+            v4: Some(Ipv4Addr::new(10, 0, 0, 1)),
+            v6: None,
+        };
+        assert!(
+            !v4_only.is_local(IpAddr::V6("fdfe:dcba:9876::1".parse().unwrap()))
+        );
+    }
+
+    #[test]
+    fn tun_addrs_next_hop_is_per_family_plus_one() {
+        let dual = TunAddrs {
+            v4: Some(Ipv4Addr::new(10, 0, 0, 1)),
+            v6: Some("fdfe:dcba:9876::1".parse().unwrap()),
+        };
+        assert_eq!(
+            dual.next_hop_for(IpAddr::V4(Ipv4Addr::new(198, 18, 0, 1))),
+            Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)))
+        );
+        assert_eq!(
+            dual.next_hop_for(IpAddr::V6("2001:db8::1".parse().unwrap())),
+            Some(IpAddr::V6("fdfe:dcba:9876::2".parse().unwrap()))
+        );
+
+        // v4-only tunnel has no v6 next hop — v6 packets are dropped with a
+        // diagnostic instead of being rewritten with a mismatched family.
+        let v4_only = TunAddrs {
+            v4: Some(Ipv4Addr::new(10, 0, 0, 1)),
+            v6: None,
+        };
+        assert_eq!(
+            v4_only.next_hop_for(IpAddr::V6("2001:db8::1".parse().unwrap())),
+            None
+        );
+    }
+
+    #[test]
+    fn next_addr_wraps_within_its_family() {
+        assert_eq!(
+            next_addr_v4(Ipv4Addr::new(10, 0, 0, 255)),
+            Ipv4Addr::new(10, 0, 0, 0)
+        );
+        // Adding 1 carries across hextets (::ffff + 1 = ::1:0)...
+        assert_eq!(
+            next_addr_v6("fdfe:dcba:9876::ffff".parse().unwrap()),
+            "fdfe:dcba:9876::1:0".parse::<Ipv6Addr>().unwrap()
+        );
+        // ...and wraps at the end of the 128-bit space.
+        assert_eq!(
+            next_addr_v6(
+                "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff"
+                    .parse::<Ipv6Addr>()
+                    .unwrap()
+            ),
+            Ipv6Addr::UNSPECIFIED
+        );
     }
 }

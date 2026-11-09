@@ -106,6 +106,15 @@ pub struct InboundConfig {
     #[serde(default)]
     pub ipv6_leak_guard: Option<bool>,
 
+    /// Secondary TUN interface IPv6 address in CIDR form, e.g.
+    /// "fdfe:dcba:9876::1/64". Enables the IPv6 data plane: the interface
+    /// gets the v6 address, `::/1` + `8000::/1` point at the TUN, and
+    /// fake-ip AAAA answers become reachable. Leave unset (default) for a
+    /// v4-only tunnel — behavior is then identical to pre-IPv6 releases and
+    /// the leak guard contains v6.
+    #[serde(default)]
+    pub addr6: Option<String>,
+
     /// Android per-app VPN filter: when non-empty, ONLY these packages'
     /// traffic enters the TUN (`VpnService.addAllowedApplication`). The
     /// excluded-by-omission apps keep using the physical network directly.
