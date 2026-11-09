@@ -67,15 +67,16 @@ fake-ip；hosts 配 v6 值时 AAAA 返回该值。
    mask_len 上限）；dns fakeip v6 池段可配。
 2. `domain_strategy` 等价物（DNS 层即可）：prefer_ipv4 / prefer_ipv6 /
    ipv4_only —— 控制真解析路径与 fake-ip 模式是否响应 AAAA。
-3. **docker v6 集成测试**：`--ipv6` 桥接网（fd00:1986::/64）+ 目的地容器 +
-   DNS 容器 + anywhere 容器（NET_ADMIN + /dev/net/tun），接进
-   `anywhere/harness`；CI 可跑。
+3. **docker v6 环境方案——只写文档，暂不接入 harness**（2026-11-09 决定）：
+   把配方写进本文档或独立手册页：`--ipv6` 桥接网（fd00:1986::/64）+ 目的地
+   容器 + DNS 容器 + anywhere 容器（NET_ADMIN + /dev/net/tun）。何时接入
+   `anywhere/harness` 与 CI 另行决策。
 4. macOS 本机验证脚本扩展：`scripts/test_v6_leak_guard.sh` 增加"模拟全球
    v6 下 fake-ip v6 端到端"小节。
 5. 文档：`docs/ipv6-plan.md` 勾掉完成项；`config` 示例补 v6 字段注释。
 
-**验收**：docker-compose 一键起 v6 环境，harness 全过；无 v6 环境时默认行为
-与 Phase 0 完全一致。
+**验收**：无 v6 环境时默认行为与 Phase 0 完全一致；docker 配方在文档中完整
+可复现（手工按配方执行通过即可，不做自动化）。
 
 ## 执行纪律
 
