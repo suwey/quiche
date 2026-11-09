@@ -4,6 +4,8 @@
 //! Unlike Linux's rtnetlink approach, macOS keeps it simple with shell commands.
 
 use std::net::IpAddr;
+use std::net::Ipv4Addr;
+use std::net::Ipv6Addr;
 use std::net::SocketAddr;
 use std::process::Command;
 use std::process::Stdio;
@@ -13,12 +15,28 @@ use tokio::io::AsyncBufReadExt;
 
 const ROUTE_ECHO_SUPPRESSION: Duration = Duration::from_secs(10);
 /// IPv6 prefixes covered by the leak guard: ::/1 + 8000::/1 = the entire
-/// IPv6 unicast space.
+/// IPv6 unicast space. The same pair doubles as the split-default capture
+/// for a dual-stack tunnel — reject routes when the tunnel is v4-only,
+/// regular TUN routes when the tunnel has a v6 address.
 const V6_GUARD_ROUTES: [&str; 2] = ["::/1", "8000::/1"];
 static RECENT_ROUTE_COMMAND_PIDS: std::sync::Mutex<Vec<(u32, Instant)>> =
     std::sync::Mutex::new(Vec::new());
 static NETWORK_DIAGNOSTICS_LAST: std::sync::Mutex<Option<Instant>> =
     std::sync::Mutex::new(None);
+
+/// `route` arguments (without the `route` binary and operation prefix) for
+/// the v6 split-default pair via `tun_v6` — the TUN's own v6 address, which
+/// plays the gateway role because utun is point-to-point. Shared by
+/// setup / reconcile / cleanup so the add and delete shapes stay symmetric;
+/// unit tests pin the exact arguments. Callers prepend the family flag
+/// (`-inet6`) plus the operation (`-n add` / `-n delete`), mirroring the
+/// proven leak-guard command shape.
+fn v6_split_route_args(tun_v6: &str) -> Vec<Vec<String>> {
+    V6_GUARD_ROUTES
+        .iter()
+        .map(|dest| vec![dest.to_string(), tun_v6.to_string()])
+        .collect()
+}
 
 /// Route manager for macOS TUN interface.
 ///
@@ -29,12 +47,21 @@ static NETWORK_DIAGNOSTICS_LAST: std::sync::Mutex<Option<Instant>> =
 pub struct MacosTunManager {
     pub iface_name: String,
     pub tun_addr: IpAddr,
+    /// Secondary IPv6 interface address (`tun.addr6`, or `tun_addr` itself
+    /// when it is an IPv6 CIDR). `None` keeps the tunnel v4-only and lets
+    /// the leak guard reject v6 at the routing layer.
+    v6_addr: Option<Ipv6Addr>,
+    /// Prefix length for `v6_addr`.
+    v6_prefix: u8,
     /// Whether we installed pf bypass rules (for cleanup).
     pf_bypass_installed: bool,
     /// Whether we installed pf DNS hijack rules (for cleanup).
     pf_rules_installed: bool,
     /// Whether we installed routes.
     routes_installed: bool,
+    /// Whether the v6 split-default routes (TUN capture, not leak-guard
+    /// reject) are installed.
+    v6_routes_installed: bool,
     /// Original default gateway (if captured).
     original_gateway: Option<IpAddr>,
     /// Original physical interface (en0/en1/…, if captured).
@@ -62,9 +89,12 @@ impl MacosTunManager {
         Self {
             iface_name,
             tun_addr,
+            v6_addr: None,
+            v6_prefix: 64,
             pf_bypass_installed: false,
             pf_rules_installed: false,
             routes_installed: false,
+            v6_routes_installed: false,
             original_gateway: None,
             physical_iface: None,
             auto_hijack,
@@ -89,6 +119,23 @@ impl MacosTunManager {
     /// Set whether the IPv6 leak guard is enabled (default on).
     pub fn set_ipv6_leak_guard(&mut self, enabled: bool) {
         self.ipv6_leak_guard = enabled;
+    }
+
+    /// Set the tunnel's IPv6 address (`tun.addr6`). When set, the TUN
+    /// interface gets the address as an inet6 alias in `setup_interface`
+    /// and `::/1` + `8000::/1` point at the TUN instead of the leak guard's
+    /// reject routes.
+    pub fn set_v6_addr(&mut self, v6: Option<Ipv6Addr>, prefix: u8) {
+        self.v6_addr = v6;
+        self.v6_prefix = prefix;
+    }
+
+    /// The interface's IPv4 address, when the tunnel is v4-capable.
+    fn v4_addr(&self) -> Option<Ipv4Addr> {
+        match self.tun_addr {
+            IpAddr::V4(v4) => Some(v4),
+            IpAddr::V6(_) => None,
+        }
     }
 
     /// Install the IPv6 leak-guard reject routes.
@@ -128,14 +175,31 @@ impl MacosTunManager {
     }
 
     /// Set up the TUN interface address and MTU.
-    /// The `tun` crate already configures address/netmask on creation
-    /// (via `set_alias`), so this is mostly a no-op. We just log.
+    /// The `tun` crate already configures the (v4) address/netmask on
+    /// creation (via `set_alias`), so the v4 part is a no-op. A dual-stack
+    /// tunnel additionally needs the IPv6 alias: without it the v6 split
+    /// routes in `setup_routing` would have no on-link gateway. Re-adding an
+    /// existing alias errors ("File exists") — tolerated so restarts and the
+    /// route watcher stay idempotent.
     pub fn setup_interface(&self) -> Result<(), String> {
         log::info!(
             "macOS TUN interface {} configured at {}",
             self.iface_name,
             self.tun_addr
         );
+        if let Some(v6) = self.v6_addr
+            && let Err(e) = run_ifconfig_cmd(&[
+                &self.iface_name,
+                "inet6",
+                &format!("{}/{}", v6, self.v6_prefix),
+                "alias",
+            ])
+        {
+            log::info!(
+                "macOS TUN inet6 alias {v6}/{:}: {e} (may already exist)",
+                self.v6_prefix
+            );
+        }
         Ok(())
     }
 
@@ -144,7 +208,9 @@ impl MacosTunManager {
     /// Uses the split-default-route trick: install two /1 routes
     /// (0.0.0.0/1 and 128.0.0.0/1) that are more specific than the
     /// default 0.0.0.0/0 route, so all traffic goes through TUN without
-    /// touching the original default route.
+    /// touching the original default route. A dual-stack tunnel does the
+    /// same for IPv6 (::/1 + 8000::/1); a v4-only tunnel installs reject
+    /// routes there instead (the leak guard).
     pub fn setup_routing(
         &mut self, auto_hijack: bool, _bypass_ips: &[String],
     ) -> Result<(), String> {
@@ -156,33 +222,43 @@ impl MacosTunManager {
         let tun_iface = find_tun_interface_name();
         log::info!("TUN interface for ifscope: {tun_iface}");
 
-        // Install split default routes for IPv4.
+        // Install split default routes for IPv4 — only when the tunnel is
+        // v4-capable (a v6 `tun.addr` has no v4 gateway to point at).
         // NO -ifscope: scoped routes are only used for IP_BOUND_IF traffic,
         // general traffic would bypass TUN entirely. Instead, rely on the
         // host route for TUN address (below) to make IP_BOUND_IF work:
         // the host route makes the gateway (10.0.0.1) resolve to utun4,
         // so IP_BOUND_IF=en0 ignores split routes (output=utun4).
-        let tun_addr_str = self.tun_addr.to_string();
-        run_route_cmd(&["-n", "add", "-net", "0.0.0.0/1", &tun_addr_str])?;
+        if let Some(v4) = self.v4_addr() {
+            let tun_addr_str = v4.to_string();
+            run_route_cmd(&["-n", "add", "-net", "0.0.0.0/1", &tun_addr_str])?;
 
-        run_route_cmd(&["-n", "add", "-net", "128.0.0.0/1", &tun_addr_str])?;
+            run_route_cmd(&["-n", "add", "-net", "128.0.0.0/1", &tun_addr_str])?;
+        }
 
-        // IPv6 split routes (if applicable).
-        if self.tun_addr.is_ipv6() {
-            run_route_cmd(&["-n", "add", "-net", "::/1", &tun_addr_str])?;
-            run_route_cmd(&["-n", "add", "-net", "8000::/1", &tun_addr_str])?;
-        } else {
-            // IPv4-only tunnel: make IPv6 fail fast instead of leaking.
-            //
-            // The TUN only covers IPv4 (split routes above), so any IPv6 the
-            // host has connectivity for bypasses the proxy entirely — and
-            // Happy Eyeballs makes clients PREFER it the moment the physical
-            // interface holds a global address. Reject routes (::/1 +
-            // 8000::/1, RTF_REJECT) answer with ICMPv6 unreachable so clients
-            // fall back to IPv4 immediately instead of timing out.
-            if self.ipv6_leak_guard && physical_iface_global_v6() {
-                self.install_v6_guard_routes();
+        // IPv6 half. With a tunnel v6 address, ::/1 + 8000::/1 point into
+        // the TUN (the v6 analog of the v4 split trick) so fake-ip v6
+        // answers are reachable and v6 traffic is proxied. Without one, the
+        // tunnel is v4-only: make IPv6 fail fast instead of leaking.
+        //
+        // The leak-guard case: the TUN only covers IPv4, so any IPv6 the
+        // host has connectivity for bypasses the proxy entirely — and
+        // Happy Eyeballs makes clients PREFER it the moment the physical
+        // interface holds a global address. Reject routes (::/1 +
+        // 8000::/1, RTF_REJECT) answer with ICMPv6 unreachable so clients
+        // fall back to IPv4 immediately instead of timing out.
+        if let Some(v6) = self.v6_addr {
+            let v6_str = v6.to_string();
+            for args in v6_split_route_args(&v6_str) {
+                run_route_args(&["-n", "add", "-inet6"], &args)?;
             }
+            self.v6_routes_installed = true;
+            log::info!(
+                "macOS TUN v6 split routes installed ({} + 8000::/1 via {v6})",
+                V6_GUARD_ROUTES[0]
+            );
+        } else if self.ipv6_leak_guard && physical_iface_global_v6() {
+            self.install_v6_guard_routes();
         }
 
         // Bypass routes for private networks so LAN traffic doesn't
@@ -655,42 +731,39 @@ impl MacosTunManager {
         }
 
         if self.routes_installed {
-            let tun_addr_str = self.tun_addr.to_string();
-
-            // Delete split routes.
-            let _ = run_route_cmd(&[
-                "-n",
-                "delete",
-                "-net",
-                "0.0.0.0/1",
-                &tun_addr_str,
-            ]);
-            let _ = run_route_cmd(&[
-                "-n",
-                "delete",
-                "-net",
-                "128.0.0.0/1",
-                &tun_addr_str,
-            ]);
-
-            if self.tun_addr.is_ipv6() {
+            // Delete v4 split routes — only ever installed for a
+            // v4-capable tunnel.
+            if let Some(v4) = self.v4_addr() {
+                let tun_addr_str = v4.to_string();
                 let _ = run_route_cmd(&[
                     "-n",
                     "delete",
                     "-net",
-                    "::/1",
+                    "0.0.0.0/1",
                     &tun_addr_str,
                 ]);
                 let _ = run_route_cmd(&[
                     "-n",
                     "delete",
                     "-net",
-                    "8000::/1",
+                    "128.0.0.0/1",
                     &tun_addr_str,
                 ]);
             }
 
+            // Delete v6 split routes (symmetric shape with the install).
+            if self.v6_routes_installed {
+                if let Some(v6) = self.v6_addr {
+                    for args in v6_split_route_args(&v6.to_string()) {
+                        let _ =
+                            run_route_args(&["-n", "delete", "-inet6"], &args);
+                    }
+                }
+                self.v6_routes_installed = false;
+            }
+
             // Delete host route for TUN address.
+            let tun_addr_str = self.tun_addr.to_string();
             let _ = run_route_cmd(&["-n", "delete", "-host", &tun_addr_str]);
 
             // Delete physical-interface-scoped default routes (added for
@@ -797,29 +870,34 @@ impl MacosTunManager {
         self.physical_iface = Some(iface.clone());
 
         let tun_iface = find_tun_interface_name();
-        let tun_addr = self.tun_addr.to_string();
         let gateway_s = gateway.to_string();
 
-        if replace_route(&["-net", "0.0.0.0/1", &tun_addr]).is_err() {
-            return false;
-        }
-        if replace_route(&["-net", "128.0.0.0/1", &tun_addr]).is_err() {
-            return false;
-        }
-
-        if self.tun_addr.is_ipv6() {
-            if replace_route(&["-net", "::/1", &tun_addr]).is_err() {
+        // v4 split routes, only for a v4-capable tunnel.
+        if let Some(v4) = self.v4_addr() {
+            let tun_addr = v4.to_string();
+            if replace_route(&["-net", "0.0.0.0/1", &tun_addr]).is_err() {
                 return false;
             }
-            if replace_route(&["-net", "8000::/1", &tun_addr]).is_err() {
+            if replace_route(&["-net", "128.0.0.0/1", &tun_addr]).is_err() {
                 return false;
+            }
+        }
+
+        // v6 split routes, only for a tunnel with a v6 address (otherwise
+        // the leak guard below owns those prefixes).
+        if let Some(v6) = self.v6_addr {
+            for args in v6_split_route_args(&v6.to_string()) {
+                if replace_route_args(&args, "-inet6").is_err() {
+                    return false;
+                }
             }
         }
 
         // Re-evaluate the v6 leak guard: a global v6 address can appear
         // mid-session (router RA after TUN start — RTM_NEWADDR triggers this
-        // reconcile) or disappear again.
-        if !self.tun_addr.is_ipv6() {
+        // reconcile) or disappear again. Never runs for a dual-stack tunnel:
+        // there the guard prefixes are the TUN's own capture routes.
+        if self.v6_addr.is_none() {
             if self.ipv6_leak_guard {
                 match (self.v6_guard_installed, physical_iface_global_v6()) {
                     (false, true) => self.install_v6_guard_routes(),
@@ -846,7 +924,16 @@ impl MacosTunManager {
             }
         }
 
-        if replace_route(&["-host", &tun_addr, "-interface", &tun_iface]).is_err()
+        // Host route for the TUN address (keeps IP_BOUND_IF effective —
+        // see setup_routing). Only meaningful for the v4 primary.
+        if let Some(v4) = self.v4_addr()
+            && replace_route(&[
+                "-host",
+                &v4.to_string(),
+                "-interface",
+                &tun_iface,
+            ])
+            .is_err()
         {
             return false;
         }
@@ -1113,6 +1200,36 @@ fn replace_route(route_args: &[&str]) -> Result<(), String> {
     Ok(())
 }
 
+/// [`run_route_cmd`] for owned (String) argument lists.
+fn run_route_args(prefix: &[&str], args: &[String]) -> Result<(), String> {
+    let mut argv: Vec<&str> = prefix.to_vec();
+    argv.extend(args.iter().map(String::as_str));
+    run_route_cmd(&argv)
+}
+
+/// [`replace_route`] for owned (String) argument lists.
+fn replace_route_args(route_args: &[String], family: &str) -> Result<(), String> {
+    let mut refs: Vec<&str> = vec![family];
+    refs.extend(route_args.iter().map(String::as_str));
+    replace_route(&refs)
+}
+
+/// Run an `ifconfig` command, returning an error on non-zero exit.
+/// Same posix_spawn rationale as [`run_route_cmd`].
+fn run_ifconfig_cmd(args: &[&str]) -> Result<(), String> {
+    log::debug!("ifconfig {}", args.join(" "));
+    let status =
+        Command::new("ifconfig").args(args).status().map_err(|e| e.to_string())?;
+    if !status.success() {
+        return Err(format!(
+            "ifconfig {} failed (exit {})",
+            args.join(" "),
+            status.code().unwrap_or(-1)
+        ));
+    }
+    Ok(())
+}
+
 fn recreate_scoped_route(route_args: &[&str]) -> Result<(), String> {
     let mut delete_args = vec!["-n", "delete"];
     delete_args.extend_from_slice(route_args);
@@ -1348,6 +1465,29 @@ mod tests {
     use super::interface_output_is_ready;
     use super::route_event_pid;
     use super::route_event_requires_reconciliation;
+    use super::v6_split_route_args;
+
+    #[test]
+    fn v6_split_route_args_cover_the_whole_v6_space() {
+        let args = v6_split_route_args("fdfe:dcba:9876::1");
+        assert_eq!(args.len(), 2);
+
+        // Same destinations as the leak guard, but as TUN capture: each is
+        // `dest gateway` (utun plays the gateway role, point-to-point).
+        assert_eq!(
+            args[0],
+            vec!["::/1".to_string(), "fdfe:dcba:9876::1".to_string()]
+        );
+        assert_eq!(
+            args[1],
+            vec!["8000::/1".to_string(), "fdfe:dcba:9876::1".to_string()]
+        );
+
+        // The two halves must tile the v6 space exactly (no gap, no overlap):
+        // ::/1 = 0000::..7fff:, 8000::/1 = 8000::..ffff:.
+        let joined = format!("{} {}", args[0][0], args[1][0]);
+        assert_eq!(joined, "::/1 8000::/1");
+    }
 
     #[test]
     fn global_v6_on_physical_iface_is_detected() {

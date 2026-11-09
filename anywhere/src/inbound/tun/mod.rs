@@ -664,6 +664,7 @@ impl TunInbound {
                 MacosTunManager::new(name.clone(), addr, config.auto_hijack);
             mgr.set_fakeip_enabled(config.fakeip_enabled);
             mgr.set_ipv6_leak_guard(config.ipv6_leak_guard);
+            mgr.set_v6_addr(v6_addr, config.v6_prefix);
 
             if let Err(e) = mgr.setup_interface() {
                 log::warn!("Failed to setup TUN interface: {e}");
