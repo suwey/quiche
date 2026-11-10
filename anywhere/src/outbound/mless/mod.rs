@@ -62,6 +62,11 @@ pub struct MlessOutboundClient {
     crypto_factory: Arc<dyn CryptoFactory>,
     /// Direct outbound used for UDP ports that mless can't tunnel (e.g. NTP).
     direct_fallback: DirectOutboundClient,
+    /// Handle of the pool keepalive task, spawned by `from_config` itself
+    /// and exposed via `OutboundClient::background_handles` — the registry
+    /// collects it generically, so construction is self-contained on both
+    /// the startup and the deferred-retry paths.
+    pool_keepalive: std::sync::OnceLock<tokio::task::AbortHandle>,
 }
 
 /// One slot in the mless connection pool.
@@ -115,7 +120,7 @@ impl Drop for ReconnectGuard {
 impl MlessOutboundClient {
     pub async fn from_config(
         configs: Vec<&OutboundConfig>,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
+    ) -> Result<Arc<Self>, Box<dyn std::error::Error>> {
         let cfg = configs
             .into_iter()
             .next()
@@ -327,7 +332,7 @@ impl MlessOutboundClient {
             })
             .collect();
 
-        Ok(Self {
+        let client = Arc::new(Self {
             wiring,
             pool: tokio::sync::Mutex::new(slots),
             next: AtomicUsize::new(0),
@@ -336,7 +341,19 @@ impl MlessOutboundClient {
             uuid_str,
             crypto_factory,
             direct_fallback: DirectOutboundClient::default(),
-        })
+            pool_keepalive: std::sync::OnceLock::new(),
+        });
+        // The pool keepalive is part of construction: both the startup path
+        // and the deferred-retry path get one, and the registry collects the
+        // handle generically via `OutboundClient::background_handles`.
+        let keepalive = Self::spawn_pool_keepalive(Arc::clone(&client));
+        // Invariant: the client was built above and nothing else touches
+        // the slot yet.
+        client
+            .pool_keepalive
+            .set(keepalive.abort_handle())
+            .expect("pool keepalive handle set exactly once");
+        Ok(client)
     }
 
     async fn try_register_stream(
@@ -458,7 +475,7 @@ impl MlessOutboundClient {
     /// Goes through `claim_dead_slot`, so it cannot double-reconnect a slot
     /// the dial path is already reviving, and `reconnect_slot` keeps its
     /// exponential backoff when the server itself is down.
-    pub fn spawn_pool_keepalive(
+    fn spawn_pool_keepalive(
         client: Arc<Self>,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
@@ -608,6 +625,10 @@ impl MlessOutboundClient {
 
 #[async_trait]
 impl OutboundClient for MlessOutboundClient {
+    fn background_abort_handles(&self) -> Vec<tokio::task::AbortHandle> {
+        self.pool_keepalive.get().cloned().into_iter().collect()
+    }
+
     async fn dial(
         &self, dest: &Destination,
     ) -> Result<Box<dyn StreamRelay>, Box<dyn std::error::Error>> {
@@ -998,6 +1019,7 @@ mod tests {
             uuid_str: String::new(),
             crypto_factory: Arc::new(TestCryptoFactory),
             direct_fallback: DirectOutboundClient::default(),
+            pool_keepalive: std::sync::OnceLock::new(),
         })
     }
 

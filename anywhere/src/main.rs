@@ -14,9 +14,15 @@ use clap::Parser;
 #[derive(Parser)]
 #[command(
     name = "anywhere",
-    version = concat!("v", env!("CARGO_PKG_VERSION"))
+    // clap's `version` attribute only takes plain literals and can't carry
+    // the build hash — the custom -V flag below prints anywhere::VERSION.
+    disable_version_flag = true
 )]
 struct Args {
+    /// Print the build identity (crate version + git hash) and exit.
+    #[arg(short = 'V', long = "version")]
+    print_version: bool,
+
     /// Path to the configuration file
     #[arg(short = 'c', long = "config", default_value = "config.toml")]
     config: String,
@@ -51,6 +57,13 @@ struct Args {
     /// If unset, the process re-executes itself via execve.
     #[arg(short = 's', long = "start-cmd")]
     start_cmd: Option<String>,
+
+    /// Validate a configuration file and exit (0 = ok, 1 = error), then
+    /// print the reason on failure. Optional value: path to the config —
+    /// omitted, the `-c` path is used (default: `config.toml` in the
+    /// working directory).
+    #[arg(short = 't', long = "test-config", num_args = 0..=1)]
+    test_config: Option<Option<String>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -136,6 +149,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     raise_fd_limit();
 
     let args = Args::parse();
+
+    // -V: build identity (crate version + git hash, -dirty when the tree
+    // had uncommitted changes).
+    if args.print_version {
+        println!("anywhere v{}", anywhere::VERSION);
+        return Ok(());
+    }
+
+    // One-shot config check (-t): parse + the registry-level validation the
+    // engine runs at startup, print the reason on failure. Checked before
+    // the import modes so it is always a pure check that never touches the
+    // network.
+    // -t present: with a value, check that path; bare -t, check the -c
+    // path (which itself defaults to config.toml in the working dir).
+    if let Some(path) =
+        args.test_config.clone().map(|p| p.unwrap_or(args.config.clone()))
+    {
+        return match anywhere::runner::check_config(&path) {
+            Ok(()) => {
+                println!("config OK: {path}");
+                Ok(())
+            },
+            Err(e) => {
+                eprintln!("config error: {e}");
+                std::process::exit(1);
+            },
+        };
+    }
 
     // Handle one-shot import modes (subscription / OpenRung directory).
     let plan = match resolve_import_plan(

@@ -85,6 +85,20 @@ pub struct RunOptions {
     pub start_cmd: Option<String>,
 }
 
+/// `-t` (config check): parse the config and run the same registry-level
+/// validation the engine runs at startup — TOML parse, outbound tags
+/// (present + unique), urltest child references. No network, no client
+/// construction, no engine start; runtime-only failures (a server that
+/// resolves but is down) are out of scope by design. Returns Err with the
+/// reason on failure.
+pub fn check_config(path: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| format!("cannot read config file: {e}"))?;
+    let config = crate::config::Config::from_string(&content)?;
+    crate::outbound::registry::OutboundRegistry::validate_config_refs(&config)?;
+    Ok(())
+}
+
 
 /// Core engine entry point.
 ///
@@ -297,7 +311,21 @@ pub async fn run(opts: RunOptions) -> Result<(), Box<dyn std::error::Error>> {
         log::info!("Detected system timezone: UTC{tz_str}");
     }
 
-    let registry = Arc::new(OutboundRegistry::from_config(&config).await?);
+    let registry = Arc::new(
+        OutboundRegistry::from_config(&config)
+            .await
+            .map_err(|e| {
+                // Surface the reason in engine_status.json — on Android the
+                // app's error banner reads it, and without this a config
+                // contradiction just looks like a silent dead VPN.
+                sink.emit(cache::StatusEvent::Notice {
+                    level: cache::NoticeLevel::Error,
+                    msg: format!("Failed to initialize outbounds: {e}"),
+                });
+                log::error!("Failed to initialize outbounds: {e}");
+                e
+            })?,
+    );
 
     // Determine cache directory.
     // Priority: RunOptions.cache_dir (Android JNI) > config [common].cache_dir > CWD.

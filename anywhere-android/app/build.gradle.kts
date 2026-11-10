@@ -28,7 +28,13 @@ android {
         versionCode = semver[0].toInt() * 10000 +
             semver.getOrElse(1) { "0" }.toInt() * 100 +
             semver.getOrElse(2) { "0" }.toInt()
-        versionName = anywhereVersion
+        // Build identity: the git hash the embedded Rust engine was built
+        // from. Same source tree as the cargo build the packaging script
+        // runs just before gradle, so the two hashes agree.
+        val anywhereGitHash = providers.exec {
+            commandLine("git", "rev-parse", "--short=8", "HEAD")
+        }.standardOutput.asText.get().trim()
+        versionName = "$anywhereVersion+$anywhereGitHash"
     }
 
     buildFeatures {

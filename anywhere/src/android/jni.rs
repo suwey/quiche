@@ -250,12 +250,25 @@ pub extern "C" fn Java_com_anywhere_android_EngineBridge_stopEngine(
     0
 }
 
+/// Clear a pending restart request. Kotlin calls this when the user stops
+/// the VPN explicitly, so a stale web-UI save request can't auto-restart
+/// the engine right after an intentional stop (the JNI task consumes the
+/// flag whenever the engine exits, whatever triggered the exit).
+#[unsafe(no_mangle)]
+pub extern "C" fn Java_com_anywhere_android_EngineBridge_clearRestartFlag(
+    _env: EnvUnowned, _class: JClass,
+) -> jint {
+    crate::runner::RESTART_REQUESTED.store(false, Ordering::SeqCst);
+    log::info!("Pending restart request cleared (user stop)");
+    0
+}
+
 /// Get the engine version string.
 #[unsafe(no_mangle)]
 pub extern "C" fn Java_com_anywhere_android_EngineBridge_engineVersion(
     mut env: EnvUnowned, _class: JClass,
 ) -> jstring {
-    let version = format!("anywhere v{}", env!("CARGO_PKG_VERSION"));
+    let version = format!("anywhere v{}", crate::VERSION);
     match env
         .with_env(|e| -> jni::errors::Result<jstring> {
             Ok(e.new_string(version)?.into_raw())

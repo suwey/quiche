@@ -247,7 +247,7 @@ class MainActivity : ComponentActivity() {
         return try {
             val configFile = java.io.File(filesDir, "anywhere.toml")
             if (!configFile.exists()) return 9090
-            val content = configFile.readText()
+            val content = stripTomlComments(configFile.readText())
             val listenRegex = Regex("""listen\s*=\s*["']?[\d.]+:(\d+)"""")
             listenRegex.find(content)?.groupValues?.get(1)?.toIntOrNull() ?: 9090
         } catch (_: Exception) {

@@ -60,6 +60,15 @@ class ProxyVpnService : VpnService() {
             }
             ACTION_STOP -> {
                 setShouldRun(false)
+                // Drop any pending web-UI restart request first: the JNI task
+                // consumes the flag whenever the engine exits, and without
+                // this an earlier save would auto-restart the VPN right
+                // after this explicit stop.
+                try {
+                    EngineBridge.clearRestartFlag()
+                } catch (e: Throwable) {
+                    Log.w(TAG, "clearRestartFlag failed (engine not loaded?)", e)
+                }
                 stopVpn()
                 stopSelf()
             }
@@ -242,7 +251,7 @@ class ProxyVpnService : VpnService() {
     private fun getConfig(): String {
         val configFile = java.io.File(filesDir, "anywhere.toml")
         return if (configFile.exists()) {
-            val content = configFile.readText()
+            val content = stripTomlComments(configFile.readText())
             // Parse UI port from config for notification display
             val listenRegex = Regex("""listen\s*=\s*["']?[\d.]+:(\d+)"""")
             uiPort = listenRegex.find(content)?.groupValues?.get(1)?.toIntOrNull() ?: 9090
@@ -603,7 +612,7 @@ class ProxyVpnService : VpnService() {
         var copied = 0
 
         // Map asset dir names to output dir names (handle AAPT excluding '_' prefix)
-        val dirRename = mapOf("nuxt" to "_nuxt", "fonts" to "_fonts")
+        val dirRename = mapOf("nuxt" to "_nuxt")
 
         fun copyTree(assetPrefix: String, outDir: java.io.File) {
             val children = assets.list(assetPrefix) ?: return
@@ -637,4 +646,66 @@ class ProxyVpnService : VpnService() {
             Log.e(TAG, "copyUiAssets failed: ${e.message}")
         }
     }
+}
+
+/**
+ * Strip TOML comments (`#` to end of line, outside quoted strings).
+ *
+ * The Kotlin side parses config values with lightweight regexes
+ * ([tomlStringArray], the addr6/geo_url/listen matchers) which cannot
+ * understand comments themselves — the bundled default config ships
+ * commented-out examples (`# include_package = [...]`,
+ * `# addr6 = "fdfe:..."`), and those examples used to poison the matchers:
+ * the paired include/exclude comment examples tripped the mutual-exclusion
+ * check and aborted startup, and the commented addr6 silently enabled the
+ * v6 data plane. Run every regex parse over this function's output.
+ *
+ * Quote-aware: `#` inside `"..."`, `'...'` (incl. triple-quoted) or after a
+ * backslash escape is preserved. Unterminated strings consume the rest of
+ * the input (malformed TOML anyway).
+ */
+internal fun stripTomlComments(config: String): String {
+    val out = StringBuilder(config.length)
+    var i = 0
+    val n = config.length
+    while (i < n) {
+        val c = config[i]
+        when {
+            c == '"' || c == '\'' -> {
+                val triple = i + 2 < n && config[i + 1] == c && config[i + 2] == c
+                val runLen = if (triple) 3 else 1
+                out.append(config, i, i + runLen)
+                i += runLen
+                while (i < n) {
+                    if (c == '"' && config[i] == '\\' && i + 1 < n) {
+                        out.append(config, i, i + 2)
+                        i += 2
+                        continue
+                    }
+                    if (config[i] == c) {
+                        if (!triple) {
+                            out.append(c)
+                            i++
+                            break
+                        }
+                        if (i + 2 < n && config[i + 1] == c && config[i + 2] == c) {
+                            out.append(config, i, i + 3)
+                            i += 3
+                            break
+                        }
+                    }
+                    out.append(config[i])
+                    i++
+                }
+            }
+            c == '#' -> {
+                while (i < n && config[i] != '\n') i++
+            }
+            else -> {
+                out.append(c)
+                i++
+            }
+        }
+    }
+    return out.toString()
 }

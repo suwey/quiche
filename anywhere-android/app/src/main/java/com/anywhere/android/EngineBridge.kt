@@ -37,6 +37,14 @@ object EngineBridge {
     external fun stopEngine(): Int
 
     /**
+     * Clear a pending engine restart request. Call before a user-initiated
+     * stop so a stale web-UI save can't auto-restart the engine afterwards.
+     *
+     * @return 0 on success
+     */
+    external fun clearRestartFlag(): Int
+
+    /**
      * Get the engine version string.
      */
     external fun engineVersion(): String

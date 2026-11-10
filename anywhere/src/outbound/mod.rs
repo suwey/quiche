@@ -18,6 +18,14 @@ pub mod vless;
 #[allow(clippy::double_must_use)] // async_trait expands to a must_use impl over an already-must_use Result
 #[async_trait]
 pub trait OutboundClient: Send + Sync {
+    /// Abort handles for the background loops this client spawned (mless
+    /// pool keepalive). The registry collects them after construction — on
+    /// the startup path and on the deferred-retry path alike — and aborts
+    /// them on in-process reload. Default: no background tasks.
+    fn background_abort_handles(&self) -> Vec<tokio::task::AbortHandle> {
+        Vec::new()
+    }
+
     /// TCP-style dial. Returns a byte-stream relay.
     async fn dial(
         &self, dest: &Destination,

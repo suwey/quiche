@@ -1,3 +1,10 @@
+/// Full build identity: crate version + the git hash the binary was built
+/// from (captured at compile time by build.rs, `-dirty` when the tree had
+/// uncommitted changes). Same value as `-V`, the engine's /version endpoint,
+/// and the Android versionName.
+pub const VERSION: &str =
+    concat!(env!("CARGO_PKG_VERSION"), "+", env!("ANYWHERE_GIT_HASH"));
+
 pub mod android;
 pub mod cache;
 pub mod command;

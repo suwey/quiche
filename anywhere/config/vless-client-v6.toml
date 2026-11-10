@@ -1,0 +1,52 @@
+# anywhere 双栈（IPv4+IPv6）示例配置。
+# 与 vless-client.toml 的差异只在 v6 相关字段；v4 部分完全一致。
+# 使用前填入 vless 的 server/password。
+
+[dns]
+fakeip = "198.18.0.0/15"
+# fake-ip v6 池：AAAA 应答来源。默认 fdfe:dcba:9876::/64，与 addr6 同段时
+# ::1 保留给 TUN 自身，分配从 ::2 开始。窄前缀（最小 /126）可配，分配循环使用。
+fakeip_inet6_range = "fdfe:dcba:9876::/64"
+# 真解析/fake-ip 应答策略：
+#   prefer_ipv4（默认）  AAAA 照常应答，客户端 Happy Eyeballs 自行优先 v4
+#   prefer_ipv6          DoH 引导解析 AAAA 优先
+#   ipv4_only            AAAA 一律空应答（上游只查 A）
+# domain_strategy = "prefer_ipv4"
+# 静态 hosts（双族都支持，优先于规则/缓存/上游；0.0.0.0 / :: = 屏蔽）：
+# hosts = { "nas.lan" = "192.168.50.10", "v6host.lan" = "fd00::10", "ads.x.com" = "0.0.0.0" }
+
+[[inbounds]]
+type = "tun"
+tag = "tun-in"
+# v4 侧地址（默认 10.0.0.1/24）。
+addr = "10.0.0.1/24"
+# 双栈开关：配置 addr6 后 TUN 额外获得 v6 地址并接管 ::/1 + 8000::/1，
+# fake-ip AAAA 开始应答 v6 fake。不配（默认）则 v4-only，
+# 此时物理网口若出现全球 v6 会自动装 reject 路由防泄漏（ipv6_leak_guard）。
+addr6 = "fdfe:dcba:9876::1/64"
+# v6 泄漏防护（仅 v4-only 隧道下生效，双栈时自动让位；默认 true）。
+# ipv6_leak_guard = true
+# Linux desktop: set local_direct=false so systemd-resolved/Firefox DNS gets fake-ip.
+# Router default is true.
+local_direct = false
+
+[[inbounds]]
+type = "socks5"
+listen = "127.0.0.1:1080"
+
+[[outbounds]]
+type = "vless"
+tag = "vl"
+server = "1.9.5.1:2096"
+password = ""
+sni = "k.p.d"
+
+[outbounds.transport]
+type = "ws"
+
+[outbounds.transport.ws]
+path = "/"
+headers = { Host = "k.p.d" }
+
+[[rules]]
+outbound = "vl"

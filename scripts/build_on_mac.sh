@@ -484,17 +484,14 @@ if [[ "$PACK" == "true" ]]; then
     fi
 
     # Web UI, taken from the Android assets. AAPT forbids '_'-prefixed asset
-    # dirs, so the repo stores nuxt/ and fonts/ — rename them back to
-    # _nuxt/_fonts (same mapping as Kotlin's copyUiAssets) for serving.
+    # dirs, so the repo stores nuxt/ — rename it back to _nuxt (same mapping
+    # as Kotlin's copyUiAssets) for serving.
     UI_SRC="$ANDROID_PROJECT/app/src/main/assets/ui"
     if [[ -d "$UI_SRC" ]]; then
         rm -rf "$STAGE/ui"
         cp -R "$UI_SRC" "$STAGE/ui"
         if [[ -d "$STAGE/ui/nuxt" ]]; then
             mv "$STAGE/ui/nuxt" "$STAGE/ui/_nuxt"
-        fi
-        if [[ -d "$STAGE/ui/fonts" ]]; then
-            mv "$STAGE/ui/fonts" "$STAGE/ui/_fonts"
         fi
         COPYFILE_DISABLE=1 tar --exclude='._*' -czf "$REL_DIR/anywhere-v${VERSION}-ui.tgz" -C "$STAGE" ui
         rm -rf "$STAGE/ui"

@@ -158,7 +158,7 @@ async fn auth_middleware(
 
 async fn version_handler() -> Json<serde_json::Value> {
     Json(serde_json::json!({
-        "version": concat!("v", env!("CARGO_PKG_VERSION"))
+        "version": format!("v{}", crate::VERSION)
     }))
 }
 
@@ -171,6 +171,20 @@ struct TunPatch {
 struct PatchConfigs {
     mode: Option<String>,
     tun: Option<TunPatch>,
+}
+
+/// JSON error body for the UI: a stable `error` key the multilingual
+/// frontend maps to a localized message, plus a server-side English
+/// `detail` fallback. See `OutboundRegistry::ConfigError` for the
+/// validation keys.
+fn config_error_response(
+    status: StatusCode, key: &'static str, detail: String,
+) -> axum::response::Response {
+    (
+        status,
+        axum::Json(serde_json::json!({ "error": key, "detail": detail })),
+    )
+        .into_response()
 }
 
 async fn configs_handler(
@@ -204,15 +218,18 @@ async fn config_file_handler(
                 .into_response(),
             Err(e) => {
                 ::log::error!("Failed to read config file {path}: {e}");
-                (
+                config_error_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    "failed to read config file",
+                    "config_read_error",
+                    e.to_string(),
                 )
-                    .into_response()
             },
         },
-        None => (StatusCode::INTERNAL_SERVER_ERROR, "no config path set")
-            .into_response(),
+        None => config_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "no_config_path",
+            "no config path set".to_string(),
+        ),
     }
 }
 
@@ -343,11 +360,27 @@ fn trigger_restart(state: &AppContext) -> StatusCode {
 /// run() with the (potentially updated) config file. No process exit -
 /// ports/TUN are released via drop guards before the next run() iteration.
 fn trigger_reload(state: &AppContext) -> StatusCode {
-    ::log::info!("Reload requested via in-process restart");
-    crate::runner::RESTART_REQUESTED
-        .store(true, std::sync::atomic::Ordering::SeqCst);
-    state.shutdown_signal.notify_waiters();
-    StatusCode::NO_CONTENT
+    // Android: run() has no shutdown_signal listener (an in-process reload
+    // could not re-establish the VpnService TUN fd anyway) — notify_waiters
+    // would hit nobody and the engine would silently keep running the OLD
+    // config while a RESTART_REQUESTED flag dangles until the next manual
+    // stop. Route the reload through the JNI restart path instead: the
+    // engine shuts down and Kotlin's onEngineRestart() re-starts it, which
+    // re-reads the updated config file.
+    #[cfg(target_os = "android")]
+    {
+        let _ = state;
+        crate::android::jni::request_restart();
+        StatusCode::NO_CONTENT
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        ::log::info!("Reload requested via in-process restart");
+        crate::runner::RESTART_REQUESTED
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        state.shutdown_signal.notify_waiters();
+        StatusCode::NO_CONTENT
+    }
 }
 
 /// Re-execute the current binary, replacing the process image.
@@ -394,17 +427,47 @@ async fn put_configs_handler(
 ) -> impl IntoResponse {
     // Only process when force=true.
     if query.force != Some(true) {
-        return (StatusCode::BAD_REQUEST, "force=true is required");
+        return config_error_response(
+            StatusCode::BAD_REQUEST,
+            "force_required",
+            "force=true is required".to_string(),
+        );
     }
 
     // If payload is provided, write it to the config file.
     if let Some(ref payload) = body.payload
         && !payload.is_empty() {
+            // Reject a config that would fail engine startup BEFORE
+            // committing it: a broken save would take the engine down (and
+            // this UI with it — on Android there is no other editor),
+            // leaving nothing to fix the config with. The old config stays
+            // live and the editor shows the reason instead.
+            let config = match crate::config::Config::from_string(payload) {
+                Ok(c) => c,
+                Err(e) => {
+                    return config_error_response(
+                        StatusCode::BAD_REQUEST,
+                        "config_parse_error",
+                        e.to_string(),
+                    );
+                },
+            };
+            if let Err(e) =
+                crate::outbound::registry::OutboundRegistry::validate_config_refs(&config)
+            {
+                // ConfigError: stable key + parameterized detail.
+                return config_error_response(StatusCode::BAD_REQUEST, e.key, e.detail);
+            }
+
             let config_path = match &state.ctx.config_path {
                 Some(p) => p.clone(),
                 None => {
                     ::log::error!("Cannot write config: no config_path set");
-                    return (StatusCode::INTERNAL_SERVER_ERROR, "no config path");
+                    return config_error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "no_config_path",
+                        "no config path set".to_string(),
+                    );
                 },
             };
 
@@ -414,9 +477,10 @@ async fn put_configs_handler(
                 },
                 Err(e) => {
                     ::log::error!("Failed to write config file: {e}");
-                    return (
+                    return config_error_response(
                         StatusCode::INTERNAL_SERVER_ERROR,
-                        "failed to write config",
+                        "config_write_error",
+                        e.to_string(),
                     );
                 },
             }
@@ -424,7 +488,12 @@ async fn put_configs_handler(
 
     // Trigger in-process reload with the (potentially updated) config file.
     let status = trigger_reload(&state.ctx);
-    (status, "")
+    if status == StatusCode::NO_CONTENT {
+        (StatusCode::OK, axum::Json(serde_json::json!({ "ok": true })))
+            .into_response()
+    } else {
+        config_error_response(status, "restart_failed", "restart failed".to_string())
+    }
 }
 
 async fn rules_handler(
